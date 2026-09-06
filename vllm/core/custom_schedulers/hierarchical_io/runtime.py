@@ -21,7 +21,7 @@ from .residency import PrefetchResidencyDirectory
 
 
 SubmitCallback = Callable[[AsyncKVTransferRequest, Any], AsyncKVTransferEvent]
-PollCallback = Callable[[AsyncKVTransferRequest, Any], AsyncKVTransferEvent]
+PollCallback = Callable[[AsyncKVTransferRequest], AsyncKVTransferEvent]
 
 
 @dataclass(frozen=True)
@@ -79,7 +79,7 @@ class RollingPrefetchRuntime:
         mapping: Any,
         submit: SubmitCallback,
     ) -> Tuple[AsyncKVTransferEvent, ...]:
-        """登记 unit；首批 unit 立即 submit，其余只保存 descriptor template。"""
+        """登记 unit；首批 unit 立即 submit，其余只保存在 Worker。"""
         plan_id, unit_index = self._identity(request)
         plan_key = (virtual_engine, plan_id)
         plan = self._plans.setdefault(
@@ -358,7 +358,7 @@ class RollingPrefetchRuntime:
             for unit in plan.units.values():
                 if not unit.active or unit.terminal is not None:
                     continue
-                event = poll(unit.request, unit.mapping)
+                event = poll(unit.request)
                 if event.state == AsyncKVTransferState.PENDING:
                     continue
                 self._finish(unit, event)

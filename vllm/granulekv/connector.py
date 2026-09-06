@@ -225,10 +225,11 @@ class GranuleKVConnector:
         layer_range: Optional[Tuple[int, int]] = None,
         prefetch_plan_id: Optional[str] = None,
     ) -> GranuleKVTransferStatus:
-        """Submit one ordinary or prefetched transfer.
+        """Submit one ordinary or legacy prefetched transfer.
 
-        This is the canonical asynchronous entry point. A prefetched unit is
-        the same request type with an already staged ``prefetch_plan_id``.
+        This is the canonical asynchronous entry point. The current layerwise
+        path submits active windows without ``prefetch_plan_id``; the optional
+        staged branch remains only for compatibility with older callers.
         """
         if not request_id:
             raise ValueError("request_id must not be empty")
@@ -247,6 +248,10 @@ class GranuleKVConnector:
                 raise RuntimeError(
                     f"unknown staged prefetch unit: {request_id}")
             spec = template[1]
+            if not self._mapping_matches_spec(src_to_dst, spec):
+                raise RuntimeError(
+                    f"staged prefetch mapping changed after staging: "
+                    f"{request_id}")
             if spec.operation != operation or spec.layer_range != layer_range:
                 raise RuntimeError(
                     f"staged prefetch unit changed after staging: {request_id}")
@@ -340,6 +345,7 @@ class GranuleKVConnector:
         units: Sequence[tuple[str, torch.Tensor, str,
                               Optional[Tuple[int, int]]]],
     ) -> None:
+        """Register a legacy staged template without starting I/O."""
         staged: dict[str, tuple[dict[str, Any], str]] = {}
         for request_id, mapping_tensor, operation, layer_range in units:
             if operation not in ("read", "write"):
@@ -366,6 +372,7 @@ class GranuleKVConnector:
             raise
 
     def cancel_staged_units(self, scheduler_request_ids: Sequence[str]) -> None:
+        """Cancel templates created through the legacy staged API."""
         by_plan: dict[str, list[str]] = {}
         for request_id in scheduler_request_ids:
             template = self._prefetch_templates.get(request_id)
@@ -440,6 +447,23 @@ class GranuleKVConnector:
             layer_range=layer_range,
             gpu_region_start=gpu_region_start,
         )
+
+    @staticmethod
+    def _mapping_matches_spec(src_to_dst: torch.Tensor,
+                              spec: GranuleKVRequestSpec) -> bool:
+        """Check a legacy staged mapping without rebuilding its request spec."""
+        mappings = tuple(
+            (int(source), int(destination))
+            for source, destination in src_to_dst.to(
+                device="cpu", dtype=torch.int64).tolist())
+        if spec.operation == "read":
+            storage_ids = tuple(mapping[0] for mapping in mappings)
+            gpu_ids = tuple(mapping[1] for mapping in mappings)
+        else:
+            gpu_ids = tuple(mapping[0] for mapping in mappings)
+            storage_ids = tuple(mapping[1] for mapping in mappings)
+        return (gpu_ids == spec.gpu_block_ids
+                and storage_ids == spec.storage_block_ids)
 
     def _validate_layer_range(
         self, layer_range: Optional[Tuple[int, int]]

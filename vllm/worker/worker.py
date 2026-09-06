@@ -65,11 +65,10 @@ class Worker(LocalOrDistributedWorkerBase):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        # 新异步调度路径使用独立控制表保存跨 engine iteration 的 mapping。
-        # key 中包含 virtual_engine，多个 request slot 的 mapping 可以跨
-        # engine iteration 同时存活；completion 不依赖提交顺序。
-        self._async_kv_transfer_mappings: Dict[
-            Tuple[int, str], torch.Tensor] = {}
+        # 普通异步 transfer 只需要在跨 engine iteration 期间保留 request
+        # identity；mapping 已经在 submit 时交给 CacheEngine，poll 不再依赖
+        # 或复制它。prefetch unit 则由下面的 Worker-local runtime 持有。
+        self._async_kv_transfer_ids: Set[Tuple[int, str]] = set()
         # layer-window 和未来 sparse unit 共用一个 plan runtime。Scheduler
         # 仍是 block/reservation 的唯一所有者；这里仅保存预授权 mapping，
         # 根据 model progress 激活 GranuleKV handle，并缓存 completion event。
@@ -496,37 +495,27 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> List[AsyncKVTransferEvent]:
         """批量提交 Scheduler 本轮激活的异步 KV read/write。
 
-        该 RPC 只执行非阻塞 submit。mapping 转成 CPU int64 tensor 后保存在
-        Worker 内，后续 poll 必须使用完全相同的 tensor 内容。后端容量由
-        scheduler policy 与 GranuleKV request table 共同限制。
+        该 RPC 只执行非阻塞 submit。mapping 在 Worker 侧转换一次；普通
+        request 只记录 request identity，layerwise unit 则保存到
+        ``RollingPrefetchRuntime``，并在真实 model progress 到达时激活。
+        后端容量由 scheduler policy 与 GranuleKV request table 共同限制。
         """
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
         prepared: list[tuple[AsyncKVTransferRequest, torch.Tensor]] = []
+        seen_ids: Set[Tuple[int, str]] = set()
         for request in requests:
             key = (virtual_engine, request.request_id)
-            if key in self._async_kv_transfer_mappings:
+            if key in self._async_kv_transfer_ids or key in seen_ids:
                 raise RuntimeError(
                     f"duplicate async KV submit: {request.request_id}")
+            seen_ids.add(key)
             mapping = torch.tensor(
                 request.block_mapping,
                 device="cpu",
                 dtype=torch.int64,
             ).view(-1, 2)
             prepared.append((request, mapping))
-
-        # stage 是 plan 级动作：所有 descriptor template 一次下沉到 GranuleKV
-        # connector，但只有 activate_on_submit=True 的首批 unit 会占 slot。
-        plans: dict[str, list[tuple[str, torch.Tensor,
-                                    AsyncKVTransferOperation,
-                                    Optional[Tuple[int, int]]]]] = {}
-        for request, mapping in prepared:
-            if request.prefetch_plan_id is not None:
-                plans.setdefault(request.prefetch_plan_id, []).append(
-                    (request.request_id, mapping, request.operation,
-                     request.layer_range))
-        for plan_id, units in plans.items():
-            cache_engine.stage_async_kv_prefetch_plan(plan_id, units)
 
         for request, mapping in prepared:
             key = (virtual_engine, request.request_id)
@@ -540,8 +529,7 @@ class Worker(LocalOrDistributedWorkerBase):
                         unit.request_id,
                         unit.operation,
                         unit_mapping,
-                        layer_range=unit.layer_range,
-                        prefetch_plan_id=unit.prefetch_plan_id),
+                        layer_range=unit.layer_range),
                 ))
                 continue
 
@@ -552,7 +540,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 layer_range=request.layer_range)
             events.append(event)
             if event.state == AsyncKVTransferState.PENDING:
-                self._async_kv_transfer_mappings[key] = mapping
+                self._async_kv_transfer_ids.add(key)
         return events
 
     def poll_async_kv_transfers(
@@ -561,20 +549,18 @@ class Worker(LocalOrDistributedWorkerBase):
         cache_engine = self.cache_engine[virtual_engine]
         events = list(self._prefetch_runtime.poll_units(
             virtual_engine,
-            lambda unit, mapping: cache_engine.poll_async_kv_transfer(
-                unit.request_id, mapping),
+            lambda unit: cache_engine.poll_async_kv_transfer(unit.request_id),
         ))
         keys = [
-            key for key in self._async_kv_transfer_mappings
+            key for key in self._async_kv_transfer_ids
             if key[0] == virtual_engine
         ]
         for key in keys:
             _, request_id = key
-            mapping = self._async_kv_transfer_mappings[key]
-            event = cache_engine.poll_async_kv_transfer(request_id, mapping)
+            event = cache_engine.poll_async_kv_transfer(request_id)
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
-                del self._async_kv_transfer_mappings[key]
+                self._async_kv_transfer_ids.remove(key)
         self._log_prefetch_runtime_traces()
         return events
 
@@ -585,8 +571,6 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> None:
         """清理取消 plan 中从未激活的 Worker descriptor templates。"""
         self._prefetch_runtime.discard_units(virtual_engine, request_ids)
-        self.cache_engine[virtual_engine].discard_staged_async_kv_prefetch_units(
-            request_ids)
 
     def activate_hierarchical_layer_barrier(
             self, virtual_engine: int,
@@ -632,10 +616,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 unit.request_id,
                 unit.operation,
                 mapping,
-                layer_range=unit.layer_range,
-                prefetch_plan_id=unit.prefetch_plan_id),
-            lambda unit, mapping: cache_engine.poll_async_kv_transfer(
-                unit.request_id, mapping),
+                layer_range=unit.layer_range),
+            lambda unit: cache_engine.poll_async_kv_transfer(unit.request_id),
             max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
         )
             # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block

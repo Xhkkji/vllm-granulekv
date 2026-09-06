@@ -29,8 +29,10 @@ or write synthetic metrics.
 
 ## Backend boundary
 
-The adapters may call the existing `stage_plan`, `submit_request`,
-`query_request`, `complete_request`, and `cancel_request` integration from the
-production path. They must not add a native protocol, MPS mechanism,
-completion path, or parallel transfer state machine. Blockers belong in
-`common/open_issues.md` and the affected strategy is skipped.
+The adapters use the existing `submit_request`, `query_request`,
+`complete_request`, and `cancel_request` integration from the production path.
+The old `stage_plan` entry remains only as a compatibility surface; current
+layerwise experiments keep plans in the scheduler/worker and submit a window
+only when it becomes active. Adapters must not add a native protocol, MPS
+mechanism, completion path, or parallel transfer state machine. Blockers belong
+in `common/open_issues.md` and the affected strategy is skipped.

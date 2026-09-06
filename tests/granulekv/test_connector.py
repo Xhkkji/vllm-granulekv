@@ -97,6 +97,22 @@ def test_swap_in_delegates_to_canonical_request_lifecycle():
     assert not connector._pending_transfers
 
 
+def test_active_layer_window_uses_normal_request_without_staging():
+    connector = _connector()
+    mapping = torch.tensor([[20, 2]], dtype=torch.int64)
+
+    connector.submit_request(
+        "window-0", mapping, operation="read", layer_range=(1, 2))
+    connector.complete_request("window-0")
+
+    assert not connector.client.staged
+    payload, operation, kwargs, _ = connector.client.submitted[0]
+    assert payload["layer_start"] == 1
+    assert payload["layer_end"] == 2
+    assert operation == "read"
+    assert kwargs == {}
+
+
 def test_staged_request_reuses_the_same_logical_spec():
     connector = _connector()
     mapping = torch.tensor([[20, 2], [21, 3]], dtype=torch.int64)
@@ -119,6 +135,25 @@ def test_staged_request_reuses_the_same_logical_spec():
         "prefetch_unit_id": "unit-1",
     }
     assert connector.client.released == ["plan-1"]
+
+
+def test_staged_request_rejects_changed_mapping():
+    connector = _connector()
+    connector.stage_plan(
+        "plan-1",
+        [("unit-1", torch.tensor([[20, 2]], dtype=torch.int64), "read",
+          (2, 4))],
+    )
+
+    with pytest.raises(RuntimeError, match="mapping changed"):
+        connector.submit_request(
+            "unit-1",
+            torch.tensor([[21, 2]], dtype=torch.int64),
+            operation="read",
+            layer_range=(2, 4),
+            prefetch_plan_id="plan-1",
+        )
+    assert not connector.client.submitted
 
 
 def test_layer_window_sets_working_set_region_without_changing_descriptor_protocol():

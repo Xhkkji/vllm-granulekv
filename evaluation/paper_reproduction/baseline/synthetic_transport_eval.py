@@ -178,11 +178,6 @@ def run_async(engine: CacheEngine, args: argparse.Namespace,
     compute_intervals: list[tuple[float, float]] = []
     io_intervals: list[tuple[float, float]] = []
 
-    staged_units = tuple(
-        (f"paper-reproduction-read-{index}", mapping, "read",
-         unit.layer_range) for index, unit in enumerate(plan.units))
-    connector.stage_plan(plan.plan_id, staged_units)
-
     def submit(index: int) -> None:
         unit = plan.units[index]
         request_id = f"paper-reproduction-read-{index}"
@@ -191,7 +186,6 @@ def run_async(engine: CacheEngine, args: argparse.Namespace,
             mapping,
             operation="read",
             layer_range=unit.layer_range,
-            prefetch_plan_id=plan.plan_id,
         )
         submitted[index] = time.perf_counter()
         if status.ready:
@@ -235,11 +229,6 @@ def run_async(engine: CacheEngine, args: argparse.Namespace,
                     connector.cancel_request(request_id)
                 except Exception:
                     pass
-        unsubmitted = tuple(
-            f"paper-reproduction-read-{index}"
-            for index in range(windows) if index not in submitted)
-        if unsubmitted:
-            connector.cancel_staged_units(unsubmitted)
         raise
     total_ms = (time.perf_counter() - started) * 1000.0
     io_ms = sum((end - begin) * 1000.0 for begin, end in io_intervals)

@@ -26,6 +26,7 @@ class _AsyncKVTrace:
     """一笔 transfer 的观测时间线；不参与 I/O 正确性判断。"""
 
     operation: AsyncKVTransferOperation
+    num_mappings: int
     started_at: float
     submitted_at_ns: int
     first_poll_at_ns: int | None = None
@@ -108,11 +109,16 @@ class CacheEngine:
 
     def _log_swap_event(self, op_name: str, src_to_dst: torch.Tensor,
                         elapsed_s: float) -> None:
-        """记录一次 swap 的核心信息，便于观察 block 粒度和耗时。"""
+        """记录一次 tensor mapping swap 的核心信息。"""
+        self._log_swap_event_count(op_name, int(src_to_dst.shape[0]),
+                                   elapsed_s)
+
+    def _log_swap_event_count(self, op_name: str, num_mappings: int,
+                              elapsed_s: float) -> None:
+        """记录不再持有原始 mapping 的异步 transfer。"""
         if not self.swap_trace_enabled:
             return
 
-        num_mappings = src_to_dst.shape[0]
         block_bytes = self.get_cache_block_size(self.cache_config,
                                                 self.model_config,
                                                 self.parallel_config)
@@ -205,7 +211,7 @@ class CacheEngine:
         self._log_swap_event("swap_in", src_to_dst, time.perf_counter() - start)
 
     def swap_in_async(self, src_to_dst: torch.Tensor) -> bool:
-        """推进 resident GranuleKV swap-in，未完成时由 engine defer 当前 batch。
+        """推进 legacy resident GranuleKV swap-in，未完成时 defer 当前 batch。
 
         该接口只服务 GranuleKV direct 路径。目标 GPU block 在返回 True 前不能被
         attention 消费；SSD completion 和数据可见性由 daemon 内的常驻 GPU CQ
@@ -245,6 +251,9 @@ class CacheEngine:
         该方法只负责控制面提交，不等待 SSD 数据完成。目标 GPU block 已经
         由 AsyncKVScheduler 预留，因此从提交开始到 READY 之前都禁止
         attention 使用这些 block。
+
+        ``prefetch_plan_id`` 仅为旧调用者保留；当前 layerwise runtime 在
+        Worker 侧保存 plan，激活后的 window 统一走普通 request 路径。
         """
         if self.granulekv_connector is None:
             raise RuntimeError(
@@ -252,6 +261,7 @@ class CacheEngine:
         if request_id in self._granulekv_async_kv_traces:
             raise RuntimeError(f"duplicate async KV transfer: {request_id}")
         trace = _AsyncKVTrace(operation=operation,
+                              num_mappings=int(src_to_dst.shape[0]),
                               started_at=time.perf_counter(),
                               submitted_at_ns=time.monotonic_ns())
         self._granulekv_async_kv_traces[request_id] = trace
@@ -267,6 +277,8 @@ class CacheEngine:
                 layer_range,
             )
         try:
+            # Layerwise runtime owns the plan and mappings. Once a unit is
+            # activated it is indistinguishable from an ordinary request.
             if prefetch_plan_id is None:
                 status = self.granulekv_connector.submit_request(
                     request_id,
@@ -274,6 +286,8 @@ class CacheEngine:
                     operation=operation.value,
                     layer_range=layer_range)
             else:
+                # Preserve the old staged API for callers outside the current
+                # layerwise path; new callers leave this unset.
                 status = self.granulekv_connector.submit_request(
                     request_id,
                     src_to_dst,
@@ -286,7 +300,7 @@ class CacheEngine:
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
         if status.ready:
-            self._finish_async_kv_transfer_trace(request_id, src_to_dst)
+            self._finish_async_kv_transfer_trace(request_id)
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.READY)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
@@ -297,7 +311,7 @@ class CacheEngine:
         units: Sequence[tuple[str, torch.Tensor, AsyncKVTransferOperation,
                               Optional[Tuple[int, int]]]],
     ) -> None:
-        """把完整 plan 下沉为 GranuleKV 模板；此时不创建 trace 或 GranuleKV handle。"""
+        """兼容旧调用者的 staged 入口；新的 layerwise 路径不调用它。"""
         if self.granulekv_connector is None:
             raise RuntimeError(
                 "prefetch plan requires the resident GranuleKV connector")
@@ -309,14 +323,14 @@ class CacheEngine:
 
     def discard_staged_async_kv_prefetch_units(
             self, request_ids: Sequence[str]) -> None:
+        """兼容旧 staged 生命周期；新的 layerwise 路径由 Worker 清理。"""
         if self.granulekv_connector is None:
             raise RuntimeError(
                 "prefetch plan requires the resident GranuleKV connector")
         self.granulekv_connector.cancel_staged_units(request_ids)
 
     def poll_async_kv_transfer(
-            self, request_id: str,
-            src_to_dst: torch.Tensor) -> AsyncKVTransferEvent:
+            self, request_id: str) -> AsyncKVTransferEvent:
         """非阻塞查询一个已经提交的 GranuleKV read/write。"""
         if self.granulekv_connector is None:
             raise RuntimeError(
@@ -366,11 +380,10 @@ class CacheEngine:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
-        self._finish_async_kv_transfer_trace(request_id, src_to_dst)
+        self._finish_async_kv_transfer_trace(request_id)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY)
 
-    def _finish_async_kv_transfer_trace(self, request_id: str,
-                                        src_to_dst: torch.Tensor) -> None:
+    def _finish_async_kv_transfer_trace(self, request_id: str) -> None:
         """在异步 read/write 完成后记录耗时并删除对应 trace。"""
         trace = self._granulekv_async_kv_traces.pop(request_id, None)
         if trace is None:
@@ -390,9 +403,9 @@ class CacheEngine:
                 ready_ns,
                 (ready_ns - trace.submitted_at_ns) / 1.0e6,
             )
-        self._log_swap_event(
+        self._log_swap_event_count(
             "swap_in" if trace.operation == AsyncKVTransferOperation.READ else
-            "swap_out", src_to_dst, elapsed_s)
+            "swap_out", trace.num_mappings, elapsed_s)
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         """把 scheduler 的 GPU->storage block mapping 写出。

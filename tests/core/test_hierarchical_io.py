@@ -217,7 +217,7 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
         return AsyncKVTransferEvent(request.request_id,
                                     AsyncKVTransferState.PENDING)
 
-    def poll(request, _mapping):
+    def poll(request):
         state = (AsyncKVTransferState.READY
                  if request.request_id in ready else
                  AsyncKVTransferState.PENDING)
@@ -259,7 +259,7 @@ def test_working_set_unit_is_rejected_after_consumption():
                               working_set_enabled=True))
     request = _prefetch_request(0, activate=True)
 
-    def ready(current, _mapping):
+    def ready(current, *_args):
         return AsyncKVTransferEvent(current.request_id,
                                     AsyncKVTransferState.READY)
 
@@ -276,7 +276,7 @@ def test_sparse_residency_is_checked_before_layer_consumption():
 
     runtime.submit_or_stage(
         0, request, "mapping",
-        lambda _request, _mapping: AsyncKVTransferEvent(
+        lambda _request, *_args: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.PENDING))
     with pytest.raises(RuntimeError, match="not ready"):
         runtime.require_resident_layer(("seq-sparse", ), 0)
@@ -285,9 +285,9 @@ def test_sparse_residency_is_checked_before_layer_consumption():
         0,
         ("seq-sparse", ),
         0,
-        lambda _request, _mapping: AsyncKVTransferEvent(
+        lambda _request, *_args: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.PENDING),
-        lambda _request, _mapping: AsyncKVTransferEvent(
+        lambda _request: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.READY),
         max_active=1,
     )
