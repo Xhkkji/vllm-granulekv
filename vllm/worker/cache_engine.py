@@ -244,7 +244,6 @@ class CacheEngine:
         operation: AsyncKVTransferOperation,
         src_to_dst: torch.Tensor,
         layer_range: Optional[Tuple[int, int]] = None,
-        prefetch_plan_id: Optional[str] = None,
     ) -> AsyncKVTransferEvent:
         """把 Scheduler 的异步 read/write 提交给 resident GranuleKV。
 
@@ -252,8 +251,6 @@ class CacheEngine:
         由 AsyncKVScheduler 预留，因此从提交开始到 READY 之前都禁止
         attention 使用这些 block。
 
-        ``prefetch_plan_id`` 仅为旧调用者保留；当前 layerwise runtime 在
-        Worker 侧保存 plan，激活后的 window 统一走普通 request 路径。
         """
         if self.granulekv_connector is None:
             raise RuntimeError(
@@ -279,21 +276,11 @@ class CacheEngine:
         try:
             # Layerwise runtime owns the plan and mappings. Once a unit is
             # activated it is indistinguishable from an ordinary request.
-            if prefetch_plan_id is None:
-                status = self.granulekv_connector.submit_request(
-                    request_id,
-                    src_to_dst,
-                    operation=operation.value,
-                    layer_range=layer_range)
-            else:
-                # Preserve the old staged API for callers outside the current
-                # layerwise path; new callers leave this unset.
-                status = self.granulekv_connector.submit_request(
-                    request_id,
-                    src_to_dst,
-                    operation=operation.value,
-                    layer_range=layer_range,
-                    prefetch_plan_id=prefetch_plan_id)
+            status = self.granulekv_connector.submit_request(
+                request_id,
+                src_to_dst,
+                operation=operation.value,
+                layer_range=layer_range)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,

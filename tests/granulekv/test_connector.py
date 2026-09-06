@@ -22,8 +22,6 @@ class _FakeClient:
         self.timeout_seconds = 1.0
         self.submitted = []
         self.completed = []
-        self.staged = []
-        self.released = []
         self.status_state = GranuleKVTransferState.READY
 
     def submit(self, payload, *, operation, **kwargs):
@@ -42,15 +40,6 @@ class _FakeClient:
         self.completed.append(handle)
         return 17
 
-    def stage_plan(self, plan_id, units):
-        self.staged.append((plan_id, units))
-
-    def cancel_staged_units(self, plan_id, unit_ids):
-        pass
-
-    def release_plan(self, plan_id):
-        self.released.append(plan_id)
-
     def close(self):
         pass
 
@@ -60,7 +49,6 @@ def _connector():
     connector.layout = _FakeLayout()
     connector.client = _FakeClient()
     connector._pending_transfers = {}
-    connector._prefetch_templates = {}
     return connector
 
 
@@ -105,55 +93,11 @@ def test_active_layer_window_uses_normal_request_without_staging():
         "window-0", mapping, operation="read", layer_range=(1, 2))
     connector.complete_request("window-0")
 
-    assert not connector.client.staged
     payload, operation, kwargs, _ = connector.client.submitted[0]
     assert payload["layer_start"] == 1
     assert payload["layer_end"] == 2
     assert operation == "read"
     assert kwargs == {}
-
-
-def test_staged_request_reuses_the_same_logical_spec():
-    connector = _connector()
-    mapping = torch.tensor([[20, 2], [21, 3]], dtype=torch.int64)
-
-    connector.stage_plan("plan-1", [("unit-1", mapping, "read", (2, 4))])
-    connector._request_spec = lambda *args, **kwargs: pytest.fail(
-        "staged submit rebuilt its request spec")
-    connector.submit_request(
-        "unit-1", mapping, operation="read", layer_range=(2, 4),
-        prefetch_plan_id="plan-1")
-    connector.complete_request("unit-1")
-
-    staged_payload, staged_operation = connector.client.staged[0][1]["unit-1"]
-    submitted_payload, submitted_operation, kwargs, _ = (
-        connector.client.submitted[0])
-    assert staged_payload == submitted_payload
-    assert staged_operation == submitted_operation == "read"
-    assert kwargs == {
-        "prefetch_plan_id": "plan-1",
-        "prefetch_unit_id": "unit-1",
-    }
-    assert connector.client.released == ["plan-1"]
-
-
-def test_staged_request_rejects_changed_mapping():
-    connector = _connector()
-    connector.stage_plan(
-        "plan-1",
-        [("unit-1", torch.tensor([[20, 2]], dtype=torch.int64), "read",
-          (2, 4))],
-    )
-
-    with pytest.raises(RuntimeError, match="mapping changed"):
-        connector.submit_request(
-            "unit-1",
-            torch.tensor([[21, 2]], dtype=torch.int64),
-            operation="read",
-            layer_range=(2, 4),
-            prefetch_plan_id="plan-1",
-        )
-    assert not connector.client.submitted
 
 
 def test_layer_window_sets_working_set_region_without_changing_descriptor_protocol():

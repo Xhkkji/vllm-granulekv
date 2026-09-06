@@ -53,7 +53,6 @@ class _PendingTransfer:
     handle: object
     spec: GranuleKVRequestSpec
     submitted_at_ns: int
-    prefetch_plan_id: Optional[str] = None
 
 
 class GranuleKVTransferState(str, Enum):
@@ -72,7 +71,6 @@ class GranuleKVTransferStatus:
     request_id: str
     state: GranuleKVTransferState
     operation: str
-    prefetch_plan_id: Optional[str] = None
     io_elapsed_ns: int = 0
     error: Optional[str] = None
 
@@ -128,8 +126,6 @@ class GranuleKVConnector:
         self.max_in_flight = 0
         self.gpu_cache: list[torch.Tensor] = []
         self._pending_transfers: dict[str, _PendingTransfer] = {}
-        self._prefetch_templates: dict[
-            str, tuple[str, GranuleKVRequestSpec]] = {}
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -201,13 +197,10 @@ class GranuleKVConnector:
         logger.info("[GRANULEKV] resident async service enabled after model warmup")
 
     def close(self) -> None:
-        """Close only after all logical requests and plans are retired."""
+        """Close only after all logical requests are retired."""
         if self._pending_transfers:
             raise RuntimeError(
                 "cannot close GranuleKV connector with active requests")
-        if self._prefetch_templates:
-            raise RuntimeError(
-                "cannot close GranuleKV connector with staged plans")
         self.client.close()
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
@@ -223,78 +216,32 @@ class GranuleKVConnector:
         *,
         operation: str,
         layer_range: Optional[Tuple[int, int]] = None,
-        prefetch_plan_id: Optional[str] = None,
     ) -> GranuleKVTransferStatus:
-        """Submit one ordinary or legacy prefetched transfer.
-
-        This is the canonical asynchronous entry point. The current layerwise
-        path submits active windows without ``prefetch_plan_id``; the optional
-        staged branch remains only for compatibility with older callers.
-        """
+        """Submit one active request through the canonical lifecycle."""
         if not request_id:
             raise ValueError("request_id must not be empty")
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported GranuleKV operation: {operation}")
         layer_range = self._validate_layer_range(layer_range)
-        if prefetch_plan_id is None:
-            if src_to_dst.numel() == 0:
-                return GranuleKVTransferStatus(
-                    request_id, GranuleKVTransferState.READY, operation)
-            spec = self._request_spec(
-                src_to_dst, operation=operation, layer_range=layer_range)
-        else:
-            template = self._prefetch_templates.get(request_id)
-            if template is None or template[0] != prefetch_plan_id:
-                raise RuntimeError(
-                    f"unknown staged prefetch unit: {request_id}")
-            spec = template[1]
-            if not self._mapping_matches_spec(src_to_dst, spec):
-                raise RuntimeError(
-                    f"staged prefetch mapping changed after staging: "
-                    f"{request_id}")
-            if spec.operation != operation or spec.layer_range != layer_range:
-                raise RuntimeError(
-                    f"staged prefetch unit changed after staging: {request_id}")
-            if not spec.gpu_block_ids:
-                self.client.cancel_staged_units(
-                    prefetch_plan_id, (request_id,))
-                del self._prefetch_templates[request_id]
-                self._maybe_release_prefetch_plan(prefetch_plan_id)
-                return GranuleKVTransferStatus(
-                    request_id, GranuleKVTransferState.READY, operation,
-                    prefetch_plan_id=prefetch_plan_id)
+        if src_to_dst.numel() == 0:
+            return GranuleKVTransferStatus(
+                request_id, GranuleKVTransferState.READY, operation)
+        spec = self._request_spec(
+            src_to_dst, operation=operation, layer_range=layer_range)
 
         pending = self._pending_transfers.get(request_id)
         if pending is not None:
-            if (spec != pending.spec
-                    or prefetch_plan_id != pending.prefetch_plan_id):
+            if spec != pending.spec:
                 raise RuntimeError("GranuleKV transfer changed while in flight")
             return self.query_request(request_id)
 
         payload = spec.to_payload()
-        try:
-            if prefetch_plan_id is None:
-                handle = self.client.submit(payload, operation=operation)
-            else:
-                handle = self.client.submit(
-                    payload,
-                    operation=operation,
-                    prefetch_plan_id=prefetch_plan_id,
-                    prefetch_unit_id=request_id,
-                )
-        except Exception:
-            if prefetch_plan_id is not None:
-                self.client.cancel_staged_units(
-                    prefetch_plan_id, (request_id,))
-                self._prefetch_templates.pop(request_id, None)
-                self._maybe_release_prefetch_plan(prefetch_plan_id)
-            raise
+        handle = self.client.submit(payload, operation=operation)
         self._pending_transfers[request_id] = _PendingTransfer(
             handle=handle, spec=spec, submitted_at_ns=time.monotonic_ns(),
-            prefetch_plan_id=prefetch_plan_id)
+        )
         return GranuleKVTransferStatus(
-            request_id, GranuleKVTransferState.SUBMITTED, operation,
-            prefetch_plan_id=prefetch_plan_id)
+            request_id, GranuleKVTransferState.SUBMITTED, operation)
 
     def query_request(self, request_id: str) -> GranuleKVTransferStatus:
         """Observe one request without completing or releasing its slot."""
@@ -308,7 +255,6 @@ class GranuleKVConnector:
                  f"GranuleKV request failed: error={client_status.error_code}")
         return GranuleKVTransferStatus(
             request_id, state, pending.spec.operation,
-            prefetch_plan_id=pending.prefetch_plan_id,
             io_elapsed_ns=client_status.io_elapsed_ns,
             error=error)
 
@@ -324,9 +270,6 @@ class GranuleKVConnector:
             raise RuntimeError("GranuleKV transfer is not complete")
         self.client.complete(pending.handle)
         del self._pending_transfers[request_id]
-        if pending.prefetch_plan_id is not None:
-            self._prefetch_templates.pop(request_id, None)
-            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
         return status
 
     def cancel_request(self, request_id: str) -> None:
@@ -335,61 +278,6 @@ class GranuleKVConnector:
         if pending is None:
             raise RuntimeError(f"unknown GranuleKV transfer: {request_id}")
         self.client.cancel(pending.handle)
-        if pending.prefetch_plan_id is not None:
-            self._prefetch_templates.pop(request_id, None)
-            self._maybe_release_prefetch_plan(pending.prefetch_plan_id)
-
-    def stage_plan(
-        self,
-        plan_id: str,
-        units: Sequence[tuple[str, torch.Tensor, str,
-                              Optional[Tuple[int, int]]]],
-    ) -> None:
-        """Register a legacy staged template without starting I/O."""
-        staged: dict[str, tuple[dict[str, Any], str]] = {}
-        for request_id, mapping_tensor, operation, layer_range in units:
-            if operation not in ("read", "write"):
-                raise ValueError(f"unsupported GranuleKV operation: {operation}")
-            layer_range = self._validate_layer_range(layer_range)
-            spec = self._request_spec(
-                mapping_tensor, operation=operation, layer_range=layer_range)
-            previous = self._prefetch_templates.get(request_id)
-            if previous is not None:
-                previous_plan, previous_spec = previous
-                if previous_plan != plan_id or previous_spec != spec:
-                    raise RuntimeError(
-                        f"staged prefetch unit changed after staging: {request_id}")
-                continue
-            staged[request_id] = (spec.to_payload(), operation)
-            self._prefetch_templates[request_id] = (plan_id, spec)
-        if not staged:
-            return
-        try:
-            self.client.stage_plan(plan_id, staged)
-        except Exception:
-            for request_id in staged:
-                self._prefetch_templates.pop(request_id, None)
-            raise
-
-    def cancel_staged_units(self, scheduler_request_ids: Sequence[str]) -> None:
-        """Cancel templates created through the legacy staged API."""
-        by_plan: dict[str, list[str]] = {}
-        for request_id in scheduler_request_ids:
-            template = self._prefetch_templates.get(request_id)
-            if template is None:
-                raise RuntimeError(f"unknown staged prefetch unit: {request_id}")
-            by_plan.setdefault(template[0], []).append(request_id)
-        for plan_id, request_ids in by_plan.items():
-            self.client.cancel_staged_units(plan_id, tuple(request_ids))
-            for request_id in request_ids:
-                del self._prefetch_templates[request_id]
-            self._maybe_release_prefetch_plan(plan_id)
-
-    def _maybe_release_prefetch_plan(self, plan_id: str) -> None:
-        if any(template[0] == plan_id
-               for template in self._prefetch_templates.values()):
-            return
-        self.client.release_plan(plan_id)
 
     def _run_sync_request(self, src_to_dst: torch.Tensor, *, operation: str) -> None:
         """Run the compatibility swap API through the canonical lifecycle."""
@@ -447,23 +335,6 @@ class GranuleKVConnector:
             layer_range=layer_range,
             gpu_region_start=gpu_region_start,
         )
-
-    @staticmethod
-    def _mapping_matches_spec(src_to_dst: torch.Tensor,
-                              spec: GranuleKVRequestSpec) -> bool:
-        """Check a legacy staged mapping without rebuilding its request spec."""
-        mappings = tuple(
-            (int(source), int(destination))
-            for source, destination in src_to_dst.to(
-                device="cpu", dtype=torch.int64).tolist())
-        if spec.operation == "read":
-            storage_ids = tuple(mapping[0] for mapping in mappings)
-            gpu_ids = tuple(mapping[1] for mapping in mappings)
-        else:
-            gpu_ids = tuple(mapping[0] for mapping in mappings)
-            storage_ids = tuple(mapping[1] for mapping in mappings)
-        return (gpu_ids == spec.gpu_block_ids
-                and storage_ids == spec.storage_block_ids)
 
     def _validate_layer_range(
         self, layer_range: Optional[Tuple[int, int]]
