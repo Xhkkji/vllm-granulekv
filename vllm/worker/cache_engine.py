@@ -305,30 +305,6 @@ class CacheEngine:
                                         AsyncKVTransferState.READY)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
 
-    def stage_async_kv_prefetch_plan(
-        self,
-        plan_id: str,
-        units: Sequence[tuple[str, torch.Tensor, AsyncKVTransferOperation,
-                              Optional[Tuple[int, int]]]],
-    ) -> None:
-        """兼容旧调用者的 staged 入口；新的 layerwise 路径不调用它。"""
-        if self.granulekv_connector is None:
-            raise RuntimeError(
-                "prefetch plan requires the resident GranuleKV connector")
-        self.granulekv_connector.stage_plan(
-            plan_id,
-            tuple((request_id, mapping, operation.value, layer_range)
-                  for request_id, mapping, operation, layer_range in units),
-        )
-
-    def discard_staged_async_kv_prefetch_units(
-            self, request_ids: Sequence[str]) -> None:
-        """兼容旧 staged 生命周期；新的 layerwise 路径由 Worker 清理。"""
-        if self.granulekv_connector is None:
-            raise RuntimeError(
-                "prefetch plan requires the resident GranuleKV connector")
-        self.granulekv_connector.cancel_staged_units(request_ids)
-
     def poll_async_kv_transfer(
             self, request_id: str) -> AsyncKVTransferEvent:
         """非阻塞查询一个已经提交的 GranuleKV read/write。"""
