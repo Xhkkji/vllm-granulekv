@@ -20,7 +20,9 @@ from typing import Any, Optional
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", choices=("dense", "quest"), required=True)
+    parser.add_argument("--mode",
+                        choices=("dense", "quest", "solidattention"),
+                        required=True)
     parser.add_argument("--context-length", type=int, required=True)
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument("--page-size", type=int, default=16)
@@ -41,12 +43,18 @@ def _configure(args: argparse.Namespace, block_budget: int) -> None:
     os.environ["VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE"] = (
-        "1" if args.mode == "quest" else "0")
+        "1" if args.mode != "dense" else "0")
     os.environ["VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET"] = str(block_budget)
-    if args.mode == "quest":
+    if args.mode != "dense":
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "1"
-        os.environ["VLLM_GRANULEKV_SPARSE_POLICY_MODULE"] = (
-            "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy")
+        policy_modules = {
+            "quest": "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy",
+            "solidattention": (
+                "evaluation.paper_reproduction.solidattention.adapter:"
+                "SolidAttentionPolicy"),
+        }
+        os.environ["VLLM_GRANULEKV_SPARSE_POLICY_MODULE"] = policy_modules[
+            args.mode]
     else:
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "0"
         os.environ.pop("VLLM_GRANULEKV_SPARSE_POLICY_MODULE", None)
@@ -91,7 +99,7 @@ def main() -> None:
         raise ValueError("context-length and decode-tokens must be positive")
     if args.page_size <= 0 or args.context_length % args.page_size != 0:
         raise ValueError("context-length must be divisible by positive page-size")
-    if args.mode == "quest" and args.block_budget <= 0:
+    if args.mode != "dense" and args.block_budget <= 0:
         if args.token_budget <= 0:
             raise ValueError("Quest mode requires token-budget or block-budget")
         args.block_budget = (args.token_budget + args.page_size - 1) // args.page_size
@@ -127,7 +135,7 @@ def main() -> None:
 
     for _ in range(args.warmup):
         llm.generate([prompt], sampling, use_tqdm=False)
-    if args.mode == "quest":
+    if args.mode != "dense":
         llm.collective_rpc("get_sparse_kv_stats", kwargs={"reset": True})
 
     samples = []
@@ -140,7 +148,7 @@ def main() -> None:
         samples.append(_request_stats(result, elapsed_ms, args.decode_tokens))
 
     sparse_stats = None
-    if args.mode == "quest":
+    if args.mode != "dense":
         worker_stats = llm.collective_rpc("get_sparse_kv_stats")
         # Tensor-parallel workers execute the same layer set. Count one
         # worker's logical attention calls, rather than multiplying by TP.
@@ -169,7 +177,7 @@ def main() -> None:
                    if sparse_stats is not None else
                    full_blocks_per_run * max(1, len(decode_samples)))
     payload = {
-        "strategy": "quest_resident_attention",
+        "strategy": f"{args.mode}_resident_attention",
         "model": args.model,
         "backend": os.getenv("VLLM_ATTENTION_BACKEND", "auto"),
         "mode": args.mode,

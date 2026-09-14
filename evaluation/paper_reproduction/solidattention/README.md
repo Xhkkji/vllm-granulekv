@@ -4,6 +4,13 @@ This boundary exposes init/local/dynamic choices as an access plan. A future
 runner may attach prior-iteration history and correction statistics, but no
 second transfer state machine or replacement attention runtime is introduced.
 
+The current adapter provides a resident-only `SolidAttentionPolicy`. It keeps
+initial blocks and recent local blocks, scores the remaining immutable prefix
+on the GPU, and returns logical block indices through the shared
+`select_blocks_device()` bridge. The current implementation uses the existing
+attention consumer and is a block-level approximation, not the paper's
+attention-inner CUDA runtime.
+
 ## Prediction Miss and Correction
 
 SolidAttention-style speculative access can be expressed with the existing

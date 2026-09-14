@@ -1,3 +1,3 @@
-from .solidattention import SolidAttentionSelector
+from .solidattention import SolidAttentionPolicy, SolidAttentionSelector
 
-__all__ = ["SolidAttentionSelector"]
+__all__ = ["SolidAttentionSelector", "SolidAttentionPolicy"]

@@ -5,7 +5,8 @@ import torch
 
 from evaluation.paper_reproduction.common.plans import LayerWisePrefetcher
 from evaluation.paper_reproduction.quest.adapter import (
-    QuestDecodeOnlyConsumer, QuestSelector, build_page_representatives,
+    QuestDecodeOnlyConsumer, QuestPageSelector, QuestSelector,
+    build_page_representatives,
     dense_attention,
     evaluate_selection, exact_page_scores, quest_page_scores,
     selected_attention, union_topk_pages)
