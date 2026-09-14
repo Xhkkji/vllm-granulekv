@@ -1,0 +1,15 @@
+{
+  "model": "/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct",
+  "backend": "XFORMERS_ON_V100",
+  "batch_size": 1,
+  "decode_tokens": 16,
+  "num_layers": 28,
+  "window_layers": 4,
+  "page_size_from_vllm_block_size": true,
+  "consumer_enabled": true,
+  "cuda_graph": false,
+  "fp8_kv_cache": false,
+  "status": "consumer_e2e_ready_dynamic_ssd_restore_producer_pending",
+  "validated_scope": "dense_granulekv_restore_plus_quest_sparse_decode_consumer",
+  "not_yet_validated": "previous_query_driven_sparse_ssd_restore"
+}

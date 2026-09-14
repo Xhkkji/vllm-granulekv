@@ -27,6 +27,12 @@ from vllm.attention.backends.utils import (
     is_all_cross_attn_metadata_set, is_all_encoder_attn_metadata_set)
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
+from vllm.attention.ops.sparse_kv import (
+    build_selected_decode_block_table, select_and_compact_decode_blocks)
+from vllm.core.custom_schedulers.hierarchical_io import (
+    get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    get_sparse_kv_policy, register_sparse_page_representatives,
+    select_sparse_blocks)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -1195,6 +1201,87 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 block_tables_arg,
             ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
 
+            block_size = value_cache.shape[3]
+            sequence_length = int(max_seq_len_arg)
+            active_sparse_blocks = get_active_sparse_kv_blocks()
+            if (active_sparse_blocks is None
+                    and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):
+                if block_tables_arg is None:
+                    raise RuntimeError(
+                        "resident sparse decode requires a block table")
+                active_sparse_blocks = tuple(
+                    range((int(sequence_length) + block_size - 1) // block_size))
+            if active_sparse_blocks is not None:
+                if attn_type != AttentionType.DECODER:
+                    raise RuntimeError(
+                        "sparse KV decode is only supported for decoder "
+                        "self-attention")
+                if attn_metadata.num_prefill_tokens != 0:
+                    raise RuntimeError(
+                        "sparse KV decode does not support mixed prefill/decode")
+                if (decode_query.shape[0] != 1 or block_tables_arg is None
+                        or block_tables_arg.shape[0] != 1):
+                    raise RuntimeError(
+                        "sparse KV decode requires batch size one")
+                if decode_meta.use_cuda_graph:
+                    raise RuntimeError(
+                        "sparse KV decode does not support CUDA graph capture")
+                if self.kv_cache_dtype.startswith("fp8"):
+                    raise RuntimeError(
+                        "sparse KV decode does not support FP8 KV cache")
+                if (envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET > 0
+                        and get_sparse_kv_policy() is not None):
+                    layer_name = getattr(layer, "layer_name", "")
+                    layer_index = self._layer_index_from_name(layer_name)
+                    request_ids = get_active_layer_request_ids()
+                    if layer_index is None or len(request_ids) > 1:
+                        raise RuntimeError(
+                            "sparse policy selection requires one named layer "
+                            "request")
+                    request_id = (request_ids[0] if request_ids else "default")
+                    policy = get_sparse_kv_policy()
+                    gpu_selector = None
+                    if (envs.VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE
+                            and not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                            and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
+                            and policy is not None):
+                        gpu_selector = getattr(policy, "select_blocks_device", None)
+                    block_tables_arg, selected_seq_len, active_sparse_blocks = (
+                        select_and_compact_decode_blocks(
+                            block_table=block_tables_arg,
+                            key_cache=key_cache,
+                            query=decode_query,
+                            sequence_length=sequence_length,
+                            block_size=block_size,
+                            request_id=request_id,
+                            layer_index=layer_index,
+                            block_budget=envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+                            select_blocks=select_sparse_blocks,
+                            register_page_representatives=(
+                                register_sparse_page_representatives),
+                            select_blocks_device=gpu_selector,
+                            resident_blocks=active_sparse_blocks,
+                            selected_blocks_override=(
+                                active_sparse_blocks
+                                if (envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                                    and active_sparse_blocks is not None) else
+                                None),
+                        ))
+                else:
+                    block_tables_arg, selected_seq_len = (
+                        build_selected_decode_block_table(
+                            block_tables_arg,
+                            active_sparse_blocks,
+                            sequence_length,
+                            block_size,
+                        ))
+                seq_lens_arg = torch.tensor(
+                    [selected_seq_len],
+                    dtype=seq_lens_arg.dtype,
+                    device=seq_lens_arg.device,
+                )
+                max_seq_len_arg = selected_seq_len
+
             output[num_prefill_query_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
@@ -1212,6 +1299,14 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    @staticmethod
+    def _layer_index_from_name(layer_name: str) -> Optional[int]:
+        parts = layer_name.split(".")
+        for index, part in enumerate(parts[:-1]):
+            if part == "layers" and parts[index + 1].isdigit():
+                return int(parts[index + 1])
+        return None
 
     def _run_prefix_attention_fallback(
         self,

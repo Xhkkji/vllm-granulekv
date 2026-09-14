@@ -13,7 +13,8 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
     activate_layer_barrier, activate_sparse_kv_blocks,
-    build_layer_restore_plan, get_active_sparse_kv_blocks,
+    build_layer_restore_plan, get_active_layer_sequence_lengths,
+    get_active_sparse_kv_blocks,
     get_layer_working_set_regions, release_local_layer,
     select_prefetch_unit_blocks,
     wait_for_local_layer)
@@ -115,6 +116,56 @@ def test_sparse_access_plan_keeps_per_layer_selection_and_window_union():
     assert plan.consumer_blocks_for_layer(0) == (0, 2)
     assert plan.consumer_blocks_for_layer(1) == (1, 2)
     assert plan.units[1].block_indices == (4, 7)
+
+
+def test_sparse_access_plan_normalizes_dynamic_policy_output():
+    access = SparseKVAccessPlan.from_layer_selections(
+        num_blocks=6,
+        block_indices_by_layer=((4, 1, 1), (2, 5)),
+        source="quest_dynamic",
+    )
+    assert access.block_indices_by_layer == ((1, 4), (2, 5))
+    with pytest.raises(ValueError, match="outside"):
+        SparseKVAccessPlan.from_layer_selections(
+            num_blocks=4,
+            block_indices_by_layer=((0, 4), ),
+        )
+
+
+def test_sparse_consumer_mode_is_explicit_and_preserves_profiling_default():
+    access = SparseKVAccessPlan(
+        num_layers=2,
+        num_blocks=4,
+        block_indices_by_layer=((0, 3), (1, 3)),
+        source="quest_query_aware",
+    )
+    profiling = build_layer_restore_plan(
+        plan_id="sparse-profiling",
+        num_layers=2,
+        window_layers=1,
+        access_plan=access,
+    )
+    assert profiling.profiling_only
+    assert not profiling.consumer_enabled
+
+    consumer = build_layer_restore_plan(
+        plan_id="sparse-consumer",
+        num_layers=2,
+        window_layers=1,
+        access_plan=access,
+        consumer_enabled=True,
+    )
+    assert consumer.profiling_only
+    assert consumer.consumer_enabled
+
+    dense_consumer = build_layer_restore_plan(
+        plan_id="dense-warmup-consumer",
+        num_layers=2,
+        window_layers=1,
+        consumer_enabled=True,
+    )
+    assert dense_consumer.consumer_enabled
+    assert not dense_consumer.profiling_only
 
 
 def test_sparse_mapping_projects_logical_indices_not_mapping_offsets():
@@ -298,6 +349,81 @@ def test_sparse_residency_is_checked_before_layer_consumption():
     assert runtime.require_resident_layer(("seq-sparse", ), 0) is None
 
 
+def test_sparse_residency_does_not_expand_selected_unit_to_all_blocks():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = AsyncKVTransferRequest(
+        request_id="sparse-subset",
+        seq_group_id="seq-subset",
+        reservation_id="plan-subset",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((10, 20), ),
+        logical_blocks=(LogicalBlockKey(4, 1), ),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 1),
+        prefetch_plan_id="plan-subset",
+        prefetch_unit_index=0,
+        consumer_block_indices=(1, ),
+        consumer_blocks_by_layer=((1, ), ),
+        consumer_num_blocks=4,
+    )
+
+    runtime.submit_or_stage(
+        0, request, "mapping",
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING))
+    runtime.wait_ready(
+        0,
+        ("seq-subset", ),
+        0,
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING),
+        lambda _request: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.READY),
+        max_active=1,
+    )
+    assert runtime.require_resident_layer(("seq-subset", ), 0) == (1, )
+
+
+def test_sparse_residency_adds_live_suffix_blocks_from_current_length():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    prefix_blocks = tuple(range(16))
+    request = AsyncKVTransferRequest(
+        request_id="sparse-suffix",
+        seq_group_id="seq-suffix",
+        reservation_id="plan-suffix",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=tuple((index, index + 100) for index in prefix_blocks),
+        logical_blocks=tuple(LogicalBlockKey(4, index)
+                             for index in prefix_blocks),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 1),
+        prefetch_plan_id="plan-suffix",
+        prefetch_unit_index=0,
+        consumer_block_indices=prefix_blocks,
+        consumer_blocks_by_layer=(prefix_blocks, ),
+        consumer_num_blocks=18,
+        consumer_local_block_start=16,
+    )
+
+    runtime.submit_or_stage(
+        0, request, "mapping",
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING))
+    runtime.wait_ready(
+        0,
+        ("seq-suffix", ),
+        0,
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING),
+        lambda _request: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.READY),
+        max_active=1,
+    )
+
+    assert runtime.require_resident_layer(
+        ("seq-suffix", ), 0, {"seq-suffix": 288}, 16) == tuple(range(18))
+
+
 def test_first_window_admission_is_separate_from_full_restore():
     plan = build_layer_restore_plan(plan_id="restore-2",
                                     num_layers=8,
@@ -352,8 +478,11 @@ def test_layer_barrier_is_forward_scoped_and_default_disabled():
             lambda virtual_engine, request_ids, layer: observed.append(
                 (virtual_engine, tuple(request_ids), layer)),
             virtual_engine=3,
-            request_ids=("request-a", "request-b")):
+            request_ids=("request-a", "request-b"),
+            sequence_lengths_by_request={"request-a": 272},
+            block_size=16):
         wait_for_local_layer(5)
+        assert get_active_layer_sequence_lengths() == {"request-a": 272}
 
     # context 退出后模型层调用必须自然退化为 no-op，避免状态泄漏到下一 batch。
     wait_for_local_layer(6)

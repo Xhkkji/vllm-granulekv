@@ -17,7 +17,7 @@ import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, Iterator, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 
 LayerWaitCallback = Callable[[int, Sequence[str], int], Optional[Tuple[int, ...]]]
@@ -48,6 +48,8 @@ class _LayerBarrierSession:
     release_callback: Optional[LayerReleaseCallback]
     virtual_engine: int
     request_ids: tuple[str, ...]
+    sequence_lengths_by_request: Optional[Dict[str, int]]
+    block_size: Optional[int]
 
 
 _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
@@ -63,6 +65,8 @@ def activate_layer_barrier(
     virtual_engine: int,
     request_ids: Sequence[str],
     release_callback: Optional[LayerReleaseCallback] = None,
+    sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
+    block_size: Optional[int] = None,
 ) -> Iterator[None]:
     """在 model forward 的动态范围内安装 worker-local 回调。
 
@@ -74,7 +78,13 @@ def activate_layer_barrier(
         _LayerBarrierSession(callback=callback,
                              release_callback=release_callback,
                              virtual_engine=virtual_engine,
-                             request_ids=tuple(request_ids)))
+                             request_ids=tuple(request_ids),
+                             sequence_lengths_by_request=(
+                                 None if sequence_lengths_by_request is None else
+                                 {str(request_id): int(length)
+                                  for request_id, length in
+                                  sequence_lengths_by_request.items()}),
+                             block_size=block_size))
     try:
         yield
     finally:
@@ -125,3 +135,17 @@ def activate_sparse_kv_blocks(
 def get_active_sparse_kv_blocks() -> Optional[Tuple[int, ...]]:
     """返回当前 layer 允许 attention 访问的 logical KV blocks。"""
     return _ACTIVE_SPARSE_KV_BLOCKS.get()
+
+
+def get_active_layer_request_ids() -> Tuple[str, ...]:
+    """Return request ids for the current model-forward barrier session."""
+    session = _ACTIVE_LAYER_BARRIER.get()
+    return () if session is None else session.request_ids
+
+
+def get_active_layer_sequence_lengths() -> Optional[Dict[str, int]]:
+    """Return current model sequence lengths for the active barrier session."""
+    session = _ACTIVE_LAYER_BARRIER.get()
+    if session is None or session.sequence_lengths_by_request is None:
+        return None
+    return dict(session.sequence_lengths_by_request)

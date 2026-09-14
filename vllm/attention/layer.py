@@ -14,12 +14,51 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.core.custom_schedulers.hierarchical_io import (
+    get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    get_sparse_kv_policy, observe_sparse_query)
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
+
+
+def _layer_index_from_name(layer_name: str) -> Optional[int]:
+    """Extract a conventional ``layers.<index>`` component generically."""
+    parts = layer_name.split(".")
+    for index, part in enumerate(parts[:-1]):
+        if part == "layers" and parts[index + 1].isdigit():
+            return int(parts[index + 1])
+    return None
+
+
+def _observe_decode_query(layer_name: str, attn_metadata: Any,
+                          query: torch.Tensor, num_heads: int,
+                          head_size: int) -> None:
+    # Loading a policy is opt-in. This check is important for ordinary
+    # multi-request decode batches, which must remain untouched.
+    if (get_sparse_kv_policy() is None
+            or (get_active_sparse_kv_blocks() is None
+                and not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE)):
+        return
+    if (attn_metadata.num_prefill_tokens != 0
+            or attn_metadata.num_decode_tokens != 1):
+        return
+    layer_index = _layer_index_from_name(layer_name)
+    if layer_index is None:
+        return
+    request_ids = get_active_layer_request_ids()
+    if len(request_ids) > 1:
+        raise RuntimeError("sparse Quest policy currently supports one request")
+    if query.ndim == 2:
+        query = query.view(-1, num_heads, head_size)
+    if query.ndim != 3 or query.shape[0] != 1:
+        raise RuntimeError(
+            "sparse policy query observation requires one decode token")
+    observe_sparse_query(layer_index, query,
+                         request_id=request_ids[0] if request_ids else "default")
 
 
 class Attention(nn.Module):
@@ -378,6 +417,10 @@ def unified_attention(
     kv_cache = self.kv_cache[forward_context.virtual_engine]
     output = self.impl.forward(self, query, key, value, kv_cache,
                                attn_metadata)
+    # Record this query only after the current attention has consumed it.  The
+    # next decode step can therefore use it as the predictor query.
+    _observe_decode_query(layer_name, attn_metadata, query, self.num_heads,
+                          self.head_size)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -420,6 +463,8 @@ def unified_attention_with_output(
                       kv_cache,
                       attn_metadata,
                       output=output)
+    _observe_decode_query(layer_name, attn_metadata, query, self.num_heads,
+                          self.head_size)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 

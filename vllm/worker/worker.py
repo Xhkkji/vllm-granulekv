@@ -14,7 +14,9 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferRequest,
     AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
-    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier)
+    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier,
+    bind_sparse_page_index_key, get_active_layer_sequence_lengths,
+    register_sparse_restore_context)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -519,6 +521,22 @@ class Worker(LocalOrDistributedWorkerBase):
 
         for request, mapping in prepared:
             key = (virtual_engine, request.request_id)
+            if request.sparse_page_index_key is not None:
+                bind_sparse_page_index_key(request.seq_group_id,
+                                           request.sparse_page_index_key)
+                if request.consumer_local_block_start is not None:
+                    register_sparse_restore_context(
+                        request.seq_group_id,
+                        request.sparse_page_index_key,
+                        request.consumer_local_block_start,
+                        request.layer_range,
+                    )
+                if request.operation == AsyncKVTransferOperation.WRITE:
+                    cache_engine.register_sparse_page_representatives(
+                        request.sparse_page_index_key,
+                        [block.logical_index for block in request.logical_blocks],
+                        mapping[:, 0].tolist(),
+                    )
             if request.prefetch_plan_id is not None:
                 events.extend(self._prefetch_runtime.submit_or_stage(
                     virtual_engine,
@@ -574,13 +592,18 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def activate_hierarchical_layer_barrier(
             self, virtual_engine: int,
-            request_ids: Tuple[str, ...]):
+            request_ids: Tuple[str, ...],
+            *,
+            sequence_lengths_by_request: Optional[Dict[str, int]] = None,
+            block_size: Optional[int] = None):
         """返回覆盖一次 model forward 的 worker-local barrier context。"""
         return activate_layer_barrier(
             self._wait_for_hierarchical_layer,
             virtual_engine=virtual_engine,
             request_ids=request_ids,
             release_callback=self._release_hierarchical_layer,
+            sequence_lengths_by_request=sequence_lengths_by_request,
+            block_size=block_size,
         )
 
     def _release_hierarchical_layer(
@@ -624,7 +647,10 @@ class Worker(LocalOrDistributedWorkerBase):
         # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
         # consumer_block_indices=None，因此此检查不会改变原有 attention。
         sparse_kv_blocks = self._prefetch_runtime.require_resident_layer(
-            request_ids, layer_index)
+            request_ids,
+            layer_index,
+            get_active_layer_sequence_lengths(),
+            self.cache_config.block_size)
         self._log_prefetch_runtime_traces()
         return sparse_kv_blocks
 

@@ -4,6 +4,7 @@
 
 import pytest
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, SchedulerConfig
 from vllm.core.async_kv_scheduler import AsyncKVScheduler
 from vllm.core.block.interfaces import BlockAllocator
@@ -11,6 +12,7 @@ from vllm.core.scheduler import Scheduler, SchedulingBudget
 from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
                                         AsyncKVTransferOperation,
                                         AsyncKVTransferState)
+from vllm.core.custom_schedulers.hierarchical_io import SparseKVPlanFeedback
 from vllm.sequence import SequenceStatus
 from vllm.utils import Device
 
@@ -61,6 +63,8 @@ def test_granulekv_prefix_store_restore_uses_native_computed_semantics(
     store = scheduler.drain_async_kv_transfers_to_submit()
     assert len(store) == 1
     assert store[0].operation == AsyncKVTransferOperation.WRITE
+    populate_page_index_key = store[0].sparse_page_index_key
+    assert populate_page_index_key
     assert store[0].request_id in scheduler.prefix_saving
     scheduler.apply_async_kv_event(
         AsyncKVTransferEvent(store[0].request_id,
@@ -83,6 +87,7 @@ def test_granulekv_prefix_store_restore_uses_native_computed_semantics(
     restore = scheduler.drain_async_kv_transfers_to_submit()
     assert len(restore) == 1
     assert restore[0].operation == AsyncKVTransferOperation.READ
+    assert restore[0].sparse_page_index_key == populate_page_index_key
     assert len(restore[0].block_mapping) == 2
     assert reuse_seq.status == SequenceStatus.WAITING
     # READY 前只存在 2 个 prefix block；未命中的 suffix 尚未分配。
@@ -308,6 +313,46 @@ def test_granulekv_sparse_prefetch_selector_is_profiling_only(monkeypatch):
     assert reuse_group not in scheduler.running
     assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 0
+
+
+def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
+        monkeypatch):
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR", "tail_n")
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+
+    prefix_tokens = list(range(8))
+    source_seq, source_group = create_dummy_prompt(
+        "94", prompt_tokens=prefix_tokens, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source_seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source_seq)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(
+        AsyncKVTransferEvent(store.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    reuse_seq, reuse_group = create_dummy_prompt(
+        "95", prompt_tokens=prefix_tokens + [100, 101, 102, 103],
+        block_size=4)
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+    assert [len(request.block_mapping) for request in windows] == [1, 1]
+    assert all(request.consumer_num_blocks == 3 for request in windows)
+    assert all(request.consumer_block_indices == (1, 2)
+               for request in windows)
+    assert all(request.consumer_blocks_by_layer == ((1, 2), (1, 2))
+               for request in windows)
 
 
 def test_granulekv_layer_barrier_dispatches_after_first_unit(monkeypatch):
@@ -933,3 +978,23 @@ def test_queued_read_precedes_deferred_write():
     next_request = scheduler.drain_async_kv_transfers_to_submit()[0]
     assert next_request.operation == AsyncKVTransferOperation.READ
     assert next_request.seq_group_id == read_group.request_id
+
+
+def test_scheduler_consumes_dynamic_sparse_restore_feedback(monkeypatch):
+    scheduler = AsyncKVScheduler.__new__(AsyncKVScheduler)
+    scheduler._sparse_restore_plans = {}
+    scheduler.hierarchical_io_config = type(
+        "Config", (), {
+            "consumer_enabled": True,
+            "num_layers": 2,
+        })()
+    monkeypatch.setattr(envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE",
+                        True)
+    feedback = SparseKVPlanFeedback("prefix", 2, 4, ((0, 2), (1, 3)))
+
+    scheduler.accept_sparse_kv_plan_feedback((feedback, ))
+    plan = scheduler._peek_sparse_restore_plan("prefix", 4)
+    assert plan is not None
+    assert plan.source == "quest_dynamic"
+    assert plan.block_indices_by_layer == ((0, 2), (1, 3))
+    assert scheduler._peek_sparse_restore_plan("other", 4) is None

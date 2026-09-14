@@ -27,10 +27,9 @@ class PrefetchBlockSelectorConfig:
     """把父 reservation 的 block 集合裁剪成可 profiling 的小粒度 I/O。
 
     默认 ``dense`` 保持现有 layer-prefetch 语义：每个 unit 都恢复父
-    reservation 的全部 blocks。非 dense selector 只是为 sparse attention
-    的访问模式提前打通 I/O 控制面，当前必须视为 profiling-only：它可以
-    测 GranuleKV 小粒度 restore 的提交、完成和带宽，但不能把完整 prefix hash
-    发布给 vLLM 原生 prefix cache。
+    reservation 的全部 blocks。非 dense selector 默认仍是 profiling-only；
+    只有显式的 ``consumer_enabled`` sparse 模式才允许真实 consumer 使用它，
+    且不会把部分恢复发布成完整 prefix hash。
     """
 
     policy: str = "dense"
@@ -130,6 +129,28 @@ class SparseKVAccessPlan:
             if any(left >= right for left, right in zip(indices, indices[1:])):
                 raise ValueError(
                     "sparse KV block indices must be strictly increasing")
+
+    @classmethod
+    def from_layer_selections(
+        cls,
+        *,
+        num_blocks: int,
+        block_indices_by_layer: Sequence[Sequence[int]],
+        source: str = "dynamic",
+    ) -> "SparseKVAccessPlan":
+        """Normalize policy output into an immutable prefix access plan."""
+        selections = tuple(
+            tuple(sorted(set(int(index) for index in indices)))
+            for indices in block_indices_by_layer)
+        if not selections or any(not indices for indices in selections):
+            raise ValueError("sparse layer selections must not be empty")
+        if any(index < 0 or index >= num_blocks for indices in selections
+               for index in indices):
+            raise ValueError("sparse selection is outside the prefix")
+        return cls(num_layers=len(selections),
+                   num_blocks=num_blocks,
+                   block_indices_by_layer=selections,
+                   source=source)
 
     @classmethod
     def from_selector(
@@ -250,6 +271,8 @@ class PrefetchPlan:
     block_selector: str = "dense"
     profiling_only: bool = False
     access_plan: Optional[SparseKVAccessPlan] = None
+    # Default false preserves the old non-dense profiling-only behavior.
+    consumer_enabled: bool = False
 
     @property
     def first_unit(self) -> PrefetchUnit:
@@ -434,6 +457,7 @@ class HierarchicalIOConfig:
     rolling: RollingPrefetchConfig = RollingPrefetchConfig()
     block_selector: PrefetchBlockSelectorConfig = (
         PrefetchBlockSelectorConfig())
+    consumer_enabled: bool = False
 
     @classmethod
     def from_env(
@@ -466,17 +490,26 @@ class HierarchicalIOConfig:
                    window_layers=window_layers,
                    rolling=RollingPrefetchConfig.from_env(values),
                    block_selector=PrefetchBlockSelectorConfig.from_env(
-                       values))
+                       values),
+                   consumer_enabled=bool(
+                       int(_env(values, "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE",
+                                "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", "0"))))
 
-    def build_plan(self, plan_id: str,
-                   num_blocks: Optional[int] = None) -> PrefetchPlan:
+    def build_plan(
+        self,
+        plan_id: str,
+        num_blocks: Optional[int] = None,
+        access_plan: Optional[SparseKVAccessPlan] = None,
+    ) -> PrefetchPlan:
         if not self.enabled:
             raise RuntimeError("hierarchical I/O is disabled")
         return build_layer_restore_plan(plan_id=plan_id,
                                         num_layers=self.num_layers,
                                         window_layers=self.window_layers,
                                         block_selector=self.block_selector,
-                                        num_blocks=num_blocks)
+                                        num_blocks=num_blocks,
+                                        access_plan=access_plan,
+                                        consumer_enabled=self.consumer_enabled)
 
 
 def build_layer_restore_plan(
@@ -489,6 +522,7 @@ def build_layer_restore_plan(
         PrefetchBlockSelectorConfig()),
     num_blocks: Optional[int] = None,
     access_plan: Optional[SparseKVAccessPlan] = None,
+    consumer_enabled: bool = False,
 ) -> PrefetchPlan:
     """按模型执行顺序生成连续、无重叠、无空洞的 layer windows。"""
     if not plan_id:
@@ -497,7 +531,6 @@ def build_layer_restore_plan(
         raise ValueError("num_layers must be positive")
     if window_layers <= 0:
         raise ValueError("window_layers must be positive")
-
     if access_plan is None:
         if block_selector.is_dense:
             # dense 默认路径不构造逐层 block tuple，保持原 layer prefetch 的
@@ -545,4 +578,5 @@ def build_layer_restore_plan(
                         if access_plan is not None else block_selector.policy),
         profiling_only=profiling_only,
         access_plan=access_plan,
+        consumer_enabled=consumer_enabled,
     )

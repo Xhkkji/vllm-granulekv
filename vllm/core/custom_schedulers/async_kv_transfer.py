@@ -71,6 +71,12 @@ class AsyncKVTransferRequest:
     # 完整 prefix 的 logical block 数，用于 residency 区分“已在 HBM”与
     # “本次从 SSD 恢复”的集合。None 表示普通 transfer 不启用 consumer。
     consumer_num_blocks: Optional[int] = None
+    # Prefix restore 后，当前 logical index 及其后的 block 属于 live
+    # request，而不是 SSD mapping。Worker 会按当前 decode 长度动态扩展它。
+    consumer_local_block_start: Optional[int] = None
+    # Stable CPU page-index identity.  It is control-plane metadata only and
+    # never reaches the GranuleKV/native descriptor.
+    sparse_page_index_key: Optional[str] = None
     # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 GranuleKV
     # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
     activate_on_submit: bool = True
@@ -85,6 +91,9 @@ class AsyncKVTransferRequest:
                     self.consumer_block_indices[1:]))):
             raise ValueError(
                 "consumer block indices must be strictly increasing")
+        if (self.consumer_local_block_start is not None
+                and self.consumer_local_block_start < 0):
+            raise ValueError("consumer_local_block_start must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -169,6 +178,8 @@ class AsyncKVTransferQueue:
         consumer_blocks_by_layer: Optional[
             Sequence[Optional[Sequence[int]]]] = None,
         consumer_num_blocks: Optional[int] = None,
+        consumer_local_block_start: Optional[int] = None,
+        sparse_page_index_key: Optional[str] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/GranuleKV request slot。"""
         if priority is None:
@@ -194,6 +205,8 @@ class AsyncKVTransferQueue:
                     None if indices is None else tuple(indices)
                     for indices in consumer_blocks_by_layer)),
             consumer_num_blocks=consumer_num_blocks,
+            consumer_local_block_start=consumer_local_block_start,
+            sparse_page_index_key=sparse_page_index_key,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request

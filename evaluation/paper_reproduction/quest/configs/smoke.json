@@ -3,8 +3,13 @@
   "model": "meta-llama/Llama-2-7b-hf",
   "layers": 32,
   "prefix_blocks": 128,
+  "page_size": 4,
+  "num_heads": 4,
+  "head_dim": 8,
+  "eval_tokens": 512,
   "block_budget": 32,
   "window_layers": 4,
-  "runs": ["smoke", "formal"],
-  "backend": "granulekv"
+  "runs": ["selector_smoke", "selector_evaluation"],
+  "backend": "granulekv",
+  "consumer_enabled": false
 }

@@ -1585,6 +1585,16 @@ class LLMEngine:
                 with _granulekv_nvtx_range("vllm_engine_execute_model"):
                     outputs = self.model_executor.execute_model(
                         execute_model_req=execute_model_req)
+                accept_feedback = getattr(
+                    self.scheduler[virtual_engine],
+                    "accept_sparse_kv_plan_feedback", None)
+                if accept_feedback is not None and outputs:
+                    feedback = tuple(
+                        item for output in outputs
+                        if output is not None
+                        for item in (output.sparse_kv_plan_feedback or ()))
+                    if feedback:
+                        accept_feedback(feedback)
                 self._skip_scheduling_next_step = False
             except DeferredModelExecution as e:
                 # 这里不是错误，而是 connector/runtime 显式要求：

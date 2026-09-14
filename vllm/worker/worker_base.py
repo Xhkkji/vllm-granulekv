@@ -18,6 +18,8 @@ from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.core.custom_schedulers.hierarchical_io import (
+    build_sparse_restore_plan_feedback, discard_sparse_restore_context)
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
 from vllm.utils import (enable_trace_function_call_for_thread,
                         resolve_obj_by_qualname, run_method,
@@ -113,6 +115,21 @@ class WorkerBase:
         speculative decoding.
         """
         raise NotImplementedError
+
+    def get_sparse_kv_stats(self, reset: bool = False):
+        """Expose optional sparse-consumer counters to experiment runners."""
+        from vllm.attention.ops.sparse_kv import (reset_sparse_kv_stats,
+                                                  sparse_kv_stats)
+        result = sparse_kv_stats()
+        if torch.cuda.is_available():
+            result["gpu_memory_allocated"] = torch.cuda.memory_allocated()
+            result["gpu_memory_reserved"] = torch.cuda.memory_reserved()
+            result["gpu_max_memory_allocated"] = torch.cuda.max_memory_allocated()
+        if reset:
+            reset_sparse_kv_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        return result
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
@@ -402,6 +419,9 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         if (execute_model_req is not None and execute_model_req.spec_step_idx):
             kwargs["spec_step_idx"] = execute_model_req.spec_step_idx
 
+        if execute_model_req is not None:
+            discard_sparse_restore_context(execute_model_req.finished_requests_ids)
+
         self.execute_worker(worker_input)
         if envs.VLLM_V0_SWAP_TRACE:
             logger.info(
@@ -430,10 +450,26 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         activate_layer_barrier = (
             getattr(self, "activate_hierarchical_layer_barrier", None)
             if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER else None)
-        request_ids = tuple(
-            (model_input.request_ids_to_seq_ids or {}).keys())
+        request_ids_to_seq_ids = model_input.request_ids_to_seq_ids or {}
+        request_ids = tuple(request_ids_to_seq_ids.keys())
+        sequence_lengths_by_request = None
+        if model_input.seq_lens is not None:
+            sequence_lengths_by_request = {}
+            seq_offset = 0
+            for request_id, seq_ids in request_ids_to_seq_ids.items():
+                # seq_ids are global sequence IDs; seq_lens is flattened in
+                # the same request/sequence order as request_ids_to_seq_ids.
+                lengths = model_input.seq_lens[seq_offset:seq_offset +
+                                               len(seq_ids)]
+                seq_offset += len(seq_ids)
+                if lengths:
+                    sequence_lengths_by_request[str(request_id)] = max(lengths)
         barrier_context = (
-            activate_layer_barrier(worker_input.virtual_engine, request_ids)
+            activate_layer_barrier(
+                worker_input.virtual_engine,
+                request_ids,
+                sequence_lengths_by_request=sequence_lengths_by_request,
+                block_size=self.cache_config.block_size)
             if activate_layer_barrier is not None else nullcontext())
         # 普通 Worker 没有这项可选能力，仍是空上下文；GranuleKV Worker 只在实验
         # 开关打开时由模型侧逐层调用 barrier，不改变原生执行主循环的语义。
@@ -471,6 +507,16 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             for o in output:
                 o.model_execute_time = (orig_model_execute_time +
                                         model_execute_time)
+
+        if output is not None and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
+            feedback = tuple(
+                item for request_id in request_ids
+                for item in [build_sparse_restore_plan_feedback(
+                    str(request_id), envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)]
+                if item is not None)
+            if feedback:
+                for item in output:
+                    item.sparse_kv_plan_feedback = feedback
 
         # output is List[SamplerOutput]
         return output

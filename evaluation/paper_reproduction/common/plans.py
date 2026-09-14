@@ -70,6 +70,7 @@ class StrategyPlan:
             "prefetch_plan_id": self.prefetch_plan.plan_id,
             "block_selector": self.prefetch_plan.block_selector,
             "profiling_only": self.prefetch_plan.profiling_only,
+            "consumer_enabled": self.prefetch_plan.consumer_enabled,
             "units": [{
                 "index": unit.index,
                 "layer_range": list(unit.layer_range),

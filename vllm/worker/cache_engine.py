@@ -13,7 +13,11 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferState)
 from vllm.logger import init_logger
 from vllm.core.custom_schedulers.hierarchical_io import (
-    get_layer_working_set_regions)
+    get_layer_working_set_regions, get_sparse_kv_policy,
+    register_sparse_page_representatives)
+from vllm.attention.ops.paged_attn import PagedAttention
+from vllm.attention.ops.sparse_kv import (
+    build_page_representatives_from_paged_key_cache)
 from vllm.granulekv.connector import GranuleKVTransferState
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
@@ -291,6 +295,32 @@ class CacheEngine:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.READY)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
+
+    def register_sparse_page_representatives(
+        self,
+        page_index_key: str,
+        logical_block_indices: Sequence[int],
+        source_physical_block_ids: Sequence[int],
+    ) -> None:
+        """Capture query-independent page metadata before a GPU -> SSD write."""
+        if get_sparse_kv_policy() is None:
+            return
+        if len(logical_block_indices) != len(source_physical_block_ids):
+            raise ValueError(
+                "logical and physical page ids must have the same length")
+        if not logical_block_indices:
+            return
+        for layer_index, layer_cache in enumerate(self.gpu_cache):
+            key_cache, _ = PagedAttention.split_kv_cache(
+                layer_cache, self.num_kv_heads, self.head_size)
+            representatives = build_page_representatives_from_paged_key_cache(
+                key_cache, source_physical_block_ids)
+            register_sparse_page_representatives(
+                page_index_key,
+                layer_index,
+                representatives,
+                logical_block_indices,
+            )
 
     def poll_async_kv_transfer(
             self, request_id: str) -> AsyncKVTransferEvent:

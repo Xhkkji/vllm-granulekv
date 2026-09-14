@@ -11,7 +11,7 @@ Worker-local runtime 中，不改变 vLLM 原生 block table。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferRequest, AsyncKVTransferState)
@@ -25,6 +25,7 @@ class _UnitResidency:
     requested: Optional[frozenset[int]]
     requested_by_layer: Optional[Tuple[Optional[frozenset[int]], ...]]
     resident: set[int]
+    local_block_start: Optional[int]
     state: AsyncKVTransferState = AsyncKVTransferState.QUEUED
     evicted: bool = False
 
@@ -71,7 +72,8 @@ class PrefetchResidencyDirectory:
             request=request,
             requested=requested,
             requested_by_layer=requested_by_layer,
-            resident=resident)
+            resident=resident,
+            local_block_start=request.consumer_local_block_start)
 
     def mark_pending(self, request_id: str) -> None:
         if request_id not in self._units:
@@ -84,10 +86,14 @@ class PrefetchResidencyDirectory:
             return
         unit = self._get(request_id)
         unit.state = AsyncKVTransferState.READY
-        if unit.request.consumer_num_blocks is not None:
-            unit.resident.update(range(unit.request.consumer_num_blocks))
-        elif unit.requested is not None:
+        # A sparse unit may carry the total logical block count for validation
+        # while restoring only a subset.  The subset must remain the source of
+        # truth; expanding to range(consumer_num_blocks) would make an
+        # incomplete restore look fully resident.
+        if unit.requested is not None:
             unit.resident.update(unit.requested)
+        elif unit.request.consumer_num_blocks is not None:
+            unit.resident.update(range(unit.request.consumer_num_blocks))
         else:
             unit.resident.update(
                 key.logical_index for key in unit.request.logical_blocks)
@@ -103,6 +109,8 @@ class PrefetchResidencyDirectory:
         self,
         request_ids: Sequence[str],
         layer_index: int,
+        sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
+        block_size: Optional[int] = None,
     ) -> Optional[Tuple[int, ...]]:
         """确认当前 layer 的 KV 已驻留，并返回 sparse consumer block 集合。
 
@@ -130,6 +138,29 @@ class PrefetchResidencyDirectory:
             if unit.requested_by_layer is not None:
                 layer_selected = unit.requested_by_layer[
                     layer_index - request.layer_range[0]]
+            if (layer_selected is not None
+                    and request.consumer_local_block_start is not None
+                    and sequence_lengths_by_request is not None
+                    and block_size is not None):
+                sequence_length = sequence_lengths_by_request.get(
+                    request.seq_group_id)
+                if sequence_length is None or sequence_length <= 0:
+                    raise RuntimeError(
+                        "missing current sequence length for sparse KV "
+                        f"request={request.seq_group_id}")
+                if block_size <= 0:
+                    raise RuntimeError("sparse KV block size must be positive")
+                current_block_count = ((sequence_length + block_size - 1) //
+                                       block_size)
+                dynamic_tail = tuple(
+                    range(request.consumer_local_block_start,
+                          current_block_count))
+                if dynamic_tail:
+                    # Local blocks are already produced by the live request;
+                    # they require no GranuleKV completion event.
+                    unit.resident.update(dynamic_tail)
+                    layer_selected = frozenset(layer_selected).union(
+                        dynamic_tail)
             if (layer_selected is not None
                     and not layer_selected.issubset(unit.resident)):
                 raise RuntimeError(

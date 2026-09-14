@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, Mapping, Optional, Sequence,
+                    Tuple)
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
@@ -283,9 +284,16 @@ class RollingPrefetchRuntime:
         self,
         request_ids: Sequence[str],
         layer_index: int,
+        sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
+        block_size: Optional[int] = None,
     ) -> Optional[Tuple[int, ...]]:
         """供 attention/model runner 在消费 sparse KV 前执行一致性校验。"""
-        return self.residency.require_layer(request_ids, layer_index)
+        return self.residency.require_layer(
+            request_ids,
+            layer_index,
+            sequence_lengths_by_request,
+            block_size,
+        )
 
     def forget_seq_groups(self, seq_group_ids: Sequence[str]) -> None:
         """在 vLLM 通知 request finished/abort 时回收 residency 元数据。"""

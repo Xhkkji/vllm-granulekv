@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import time
+import hashlib
 from collections import deque
 from typing import Callable, Iterable, List, Optional, Set, Tuple
 
@@ -22,7 +23,8 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferOperation, AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
-    HierarchicalRestoreController, select_prefetch_unit_blocks)
+    HierarchicalRestoreController, SparseKVAccessPlan,
+    SparseKVPlanFeedback, select_prefetch_unit_blocks)
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 
@@ -36,6 +38,31 @@ ASYNC_KV_STRATEGIES = {
     ASYNC_KV_STRATEGY_CHUNKED_PRIORITY_PREEMPT,
     ASYNC_KV_STRATEGY_LONG_CONTEXT_STRESS,
 }
+
+
+def _prefix_page_index_key(seq_group: SequenceGroup,
+                           block_size: int,
+                           num_prefix_blocks: int) -> Optional[str]:
+    """Return one identity for the exact complete prefix stored/restored.
+
+    A finished populate request may already contain generated suffix tokens.
+    Hashing the whole sequence would therefore miss when a later request
+    restores the same complete prefix.  Limit the identity to the block range
+    represented by the storage lookup/reservation.
+    """
+    sequences = seq_group.get_seqs()
+    if len(sequences) != 1:
+        return None
+    if block_size <= 0 or num_prefix_blocks <= 0:
+        return None
+    sequence = sequences[0]
+    token_count = num_prefix_blocks * block_size
+    token_ids = sequence.get_token_ids()
+    if token_count > len(token_ids):
+        raise ValueError("page-index prefix exceeds sequence token count")
+    payload = repr((tuple(token_ids[:token_count]), sequence.extra_hash(),
+                    block_size, num_prefix_blocks)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class AsyncKVScheduler(Scheduler):
@@ -117,6 +144,10 @@ class AsyncKVScheduler(Scheduler):
                 and not self.hierarchical_layer_barrier_config.enabled):
             raise ValueError(
                 "rolling hierarchical I/O requires the layer barrier")
+        if self.hierarchical_io_config.consumer_enabled:
+            if not self.hierarchical_layer_barrier_config.enabled:
+                raise ValueError(
+                    "sparse consumer requires the layer barrier")
         self.hierarchical_prefix_restores = HierarchicalRestoreController()
         # key 是父 reservation/plan id，而不是 window request id。一个请求
         # 无论拆成多少层窗口，都只占一个 scheduler sequence slot。
@@ -128,6 +159,10 @@ class AsyncKVScheduler(Scheduler):
         # 不再由 Engine 的普通 drain 自动激活，而由 model layer progress
         # 触发。集合只属于 scheduler 控制面，不拥有 block/data。
         self._hierarchical_rolling_staged_plans: Set[str] = set()
+        # Sparse restores must never be written back as a complete dense
+        # prefix: unselected logical blocks were intentionally not restored.
+        self._sparse_restore_seq_group_ids: Set[str] = set()
+        self._sparse_restore_plans: dict[str, SparseKVAccessPlan] = {}
         self._staged_async_kv_discards: list[str] = []
         self._prefix_restore_admission_blocked = False
         logger.info(
@@ -175,6 +210,44 @@ class AsyncKVScheduler(Scheduler):
     def scheduler_strategy(self) -> str:
         """返回稳定的策略名称，供日志和实验结果标记使用。"""
         return f"async_kv:{self.async_kv_scheduler_strategy}"
+
+    def accept_sparse_kv_plan_feedback(
+        self, feedback: Iterable[SparseKVPlanFeedback]) -> None:
+        """Cache the latest policy prediction for a stable prefix key."""
+        if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
+            return
+        for item in feedback:
+            try:
+                plan = SparseKVAccessPlan.from_layer_selections(
+                    num_blocks=item.num_prefix_blocks,
+                    block_indices_by_layer=item.block_indices_by_layer,
+                    source="quest_dynamic",
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning("discarding invalid sparse restore feedback: %s",
+                               exc)
+                continue
+            if plan.num_layers != item.num_layers:
+                logger.warning("discarding sparse restore feedback with invalid "
+                               "layer count: key=%s", item.page_index_key)
+                continue
+            self._sparse_restore_plans[item.page_index_key] = plan
+
+    def _peek_sparse_restore_plan(
+        self, page_index_key: Optional[str], num_blocks: int
+    ) -> Optional[SparseKVAccessPlan]:
+        if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
+            return None
+        if not self.hierarchical_io_config.consumer_enabled:
+            return None
+        if page_index_key is None:
+            return None
+        plan = self._sparse_restore_plans.get(page_index_key)
+        if plan is None or plan.num_blocks != num_blocks:
+            return None
+        if plan.num_layers != self.hierarchical_io_config.num_layers:
+            return None
+        return plan
 
     def _schedule_chunked_prefill(self):
         """在原生 chunked path 前注入可选的等待感知抢占策略。
@@ -323,8 +396,15 @@ class AsyncKVScheduler(Scheduler):
                 break
             self.waiting.remove(seq_group)
             if self.hierarchical_io_config.enabled:
-                self._enqueue_hierarchical_prefix_restore(seq_group,
-                                                          reservation)
+                page_index_key = _prefix_page_index_key(
+                    seq_group, self.cache_config.block_size,
+                    reservation.num_prefix_blocks)
+                access_plan = self._peek_sparse_restore_plan(
+                    page_index_key, reservation.num_prefix_blocks)
+                self._enqueue_hierarchical_prefix_restore(
+                    seq_group, reservation, access_plan=access_plan)
+                if access_plan is not None and page_index_key is not None:
+                    self._sparse_restore_plans.pop(page_index_key, None)
             else:
                 request = self._enqueue_async_kv_transfer(
                     seq_group,
@@ -349,11 +429,27 @@ class AsyncKVScheduler(Scheduler):
         self,
         seq_group: SequenceGroup,
         reservation: BlockPrefixRestoreReservation,
+        *,
+        access_plan: Optional[SparseKVAccessPlan] = None,
     ) -> None:
         """按通用 prefetch plan 投影并建立多个 GranuleKV 子请求。"""
+        sequences = seq_group.get_seqs(status=SequenceStatus.WAITING)
+        if len(sequences) != 1:
+            raise ValueError(
+                "hierarchical sparse restore requires one waiting sequence")
+        sequence = sequences[0]
+        sequence_block_count = (
+            sequence.get_len() + self.cache_config.block_size - 1
+        ) // self.cache_config.block_size
+        if sequence_block_count < reservation.num_prefix_blocks:
+            raise RuntimeError(
+                "prefix restore has more blocks than the target sequence")
+        local_tail = tuple(
+            range(reservation.num_prefix_blocks, sequence_block_count))
         plan = self.hierarchical_io_config.build_plan(
             reservation.reservation_id,
-            num_blocks=len(reservation.block_mapping),
+            num_blocks=reservation.num_prefix_blocks,
+            access_plan=access_plan,
         )
         requests = []
         selected_block_counts = []
@@ -364,6 +460,29 @@ class AsyncKVScheduler(Scheduler):
             block_mapping, logical_blocks = select_prefetch_unit_blocks(
                 unit, reservation.block_mapping, reservation.logical_blocks)
             selected_block_counts.append(len(block_mapping))
+            if plan.consumer_enabled and plan.access_plan is None:
+                # Dense warmup is represented as a consumer-visible all-block
+                # residency set.  The I/O mapping may still omit blocks already
+                # present in HBM, so residency must use the full logical prefix
+                # count rather than len(block_mapping).
+                consumer_block_indices = tuple(range(sequence_block_count))
+                consumer_blocks_by_layer = tuple(
+                    consumer_block_indices for _ in range(unit.num_layers))
+            elif plan.consumer_enabled:
+                # The restore reservation only owns immutable prefix blocks.
+                # The suffix belongs to the live request and is filled by the
+                # normal scheduler; it must not enter the SSD mapping.
+                layer_selections = tuple(
+                    None if selection is None else tuple(
+                        sorted(set(selection).union(local_tail)))
+                    for selection in (unit.consumer_blocks_by_layer or ()))
+                consumer_blocks_by_layer = layer_selections
+                consumer_block_indices = tuple(
+                    sorted({index for selection in layer_selections
+                            if selection is not None for index in selection}))
+            else:
+                consumer_block_indices = unit.block_indices
+                consumer_blocks_by_layer = unit.consumer_blocks_by_layer
             requests.append(
                 self.async_kv_policy.enqueue(
                     seq_group.request_id,
@@ -374,11 +493,18 @@ class AsyncKVScheduler(Scheduler):
                     layer_range=unit.layer_range,
                     prefetch_plan_id=plan.plan_id,
                     prefetch_unit_index=unit.index,
-                    consumer_block_indices=unit.block_indices,
-                    consumer_blocks_by_layer=unit.consumer_blocks_by_layer,
+                    consumer_block_indices=consumer_block_indices,
+                    consumer_blocks_by_layer=consumer_blocks_by_layer,
                     consumer_num_blocks=(
-                        None if plan.access_plan is None else
-                        plan.access_plan.num_blocks),
+                        sequence_block_count if plan.consumer_enabled else
+                        (None if plan.access_plan is None else
+                         plan.access_plan.num_blocks)),
+                    consumer_local_block_start=(
+                        reservation.num_prefix_blocks
+                        if plan.consumer_enabled else None),
+                    sparse_page_index_key=_prefix_page_index_key(
+                        seq_group, self.cache_config.block_size,
+                        reservation.num_prefix_blocks),
                 ))
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(
@@ -388,13 +514,15 @@ class AsyncKVScheduler(Scheduler):
         logger.info(
             "[GRANULEKV_HIERARCHICAL] phase=plan_queued plan_id=%s "
             "seq_group_id=%s windows=%d blocks=%d selector=%s "
-            "profiling_only=%s selected_blocks_per_unit=%s",
+            "profiling_only=%s dynamic_restore=%s "
+            "selected_blocks_per_unit=%s",
             plan.plan_id,
             seq_group.request_id,
             len(plan.units),
             len(reservation.block_mapping),
             plan.block_selector,
             plan.profiling_only,
+            str(access_plan is not None).lower(),
             ",".join(str(count) for count in selected_block_counts),
         )
         for request, unit in zip(requests, plan.units):
@@ -575,12 +703,26 @@ class AsyncKVScheduler(Scheduler):
         prefix: bool = False,
     ) -> AsyncKVTransferRequest:
         """把 block reservation 登记为等待 GranuleKV transfer slot。"""
+        page_index_key = None
+        if prefix:
+            if isinstance(reservation, BlockPrefixRestoreReservation):
+                num_prefix_blocks = reservation.num_prefix_blocks
+            else:
+                sequences = seq_group.get_seqs()
+                if len(sequences) != 1:
+                    raise ValueError(
+                        "sparse page metadata requires one prefix sequence")
+                num_prefix_blocks = (len(sequences[0].get_token_ids()) //
+                                     self.cache_config.block_size)
+            page_index_key = _prefix_page_index_key(
+                seq_group, self.cache_config.block_size, num_prefix_blocks)
         request = self.async_kv_policy.enqueue(
             seq_group.request_id,
             reservation.reservation_id,
             operation,
             reservation.block_mapping,
             reservation.logical_blocks,
+            sparse_page_index_key=page_index_key,
         )
         if prefix:
             lifecycle = (self.prefix_loading
@@ -801,7 +943,8 @@ class AsyncKVScheduler(Scheduler):
             progress.unit.start_layer,
             progress.unit.end_layer,
         )
-        if progress.first_unit_became_ready and not progress.profiling_only:
+        if (progress.first_unit_became_ready
+                and (not progress.profiling_only or progress.consumer_enabled)):
             # 这是 Step 2 的 first-window-ready admission。该集合表示调度器
             # 已接受请求并可在未来交给 layer pipeline；当前不修改 RUNNING
             # 状态，确保 Step 4 之前完整 model forward 看不到半恢复 KV。
@@ -844,7 +987,23 @@ class AsyncKVScheduler(Scheduler):
 
         self.hierarchical_prefix_admitted.discard(progress.plan_id)
         if (progress.all_ready and not progress.cancelled
-                and not progress.profiling_only):
+                and progress.consumer_enabled):
+            # Keep pending GPU targets private to this sequence and release the
+            # temporary CPU source ownership.  This intentionally does not
+            # publish a global dense prefix hash.
+            self.block_manager.finalize_granulekv_prefix_working_set(
+                progress.plan_id)
+            self._sparse_restore_seq_group_ids.add(seq_group.request_id)
+            logger.info(
+                "[GRANULEKV_HIERARCHICAL] phase=sparse_restore_ready "
+                "plan_id=%s seq_group_id=%s sparse_restore_ms=%.3f",
+                progress.plan_id,
+                seq_group.request_id,
+                (time.monotonic_ns() - progress.plan_created_monotonic_ns)
+                / 1.0e6,
+            )
+        elif (progress.all_ready and not progress.cancelled
+              and not progress.profiling_only):
             if envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
                 # 环形 regions 中早期层已被后续层覆盖，只结束 reservation，
                 # 不能把它发布成全局 GPU prefix cache 命中。
@@ -1004,6 +1163,7 @@ class AsyncKVScheduler(Scheduler):
         if self._try_start_granulekv_prefix_store(seq_group):
             return
         super()._free_finished_seq_group(seq_group)
+        self._sparse_restore_seq_group_ids.discard(seq_group.request_id)
 
     def _try_start_granulekv_prefix_store(self,
                                     seq_group: SequenceGroup) -> bool:
@@ -1015,7 +1175,8 @@ class AsyncKVScheduler(Scheduler):
         ``prefix_saving`` 继续推进空调度轮次，不会提前复用 DMA source。
         """
         if (not self.granulekv_prefix_enabled or not seq_group.is_finished()
-                or envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE):
+                or envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+                or seq_group.request_id in self._sparse_restore_seq_group_ids):
             # working-set 已覆盖早期层，不能从当前 HBM regions 回写完整 KV。
             # 该验证模式直接丢弃结果，已有 SSD prefix 仍由 source replica 保留。
             return False
