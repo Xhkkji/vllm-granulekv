@@ -21,8 +21,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode",
-                        choices=("dense", "quest", "solidattention",
-                                 "solidattention_runtime"),
+                        choices=("dense", "quest", "solidattention"),
                         required=True)
     parser.add_argument("--context-length", type=int, required=True)
     parser.add_argument("--decode-tokens", type=int, default=256)
@@ -45,17 +44,12 @@ def _configure(args: argparse.Namespace, block_budget: int) -> None:
     os.environ["VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE"] = (
         "1" if args.mode != "dense" else "0")
-    os.environ["VLLM_GRANULEKV_SPARSE_QUEST_RUNTIME_ENABLE"] = (
-        "1" if args.mode == "solidattention_runtime" else "0")
     os.environ["VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET"] = str(block_budget)
     if args.mode != "dense":
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "1"
         policy_modules = {
             "quest": "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy",
             "solidattention": (
-                "evaluation.paper_reproduction.solidattention.adapter:"
-                "SolidAttentionPolicy"),
-            "solidattention_runtime": (
                 "evaluation.paper_reproduction.solidattention.adapter:"
                 "SolidAttentionPolicy"),
         }
@@ -167,13 +161,6 @@ def main() -> None:
             "metadata_build_calls": stats.get("metadata_build_calls", 0),
             "metadata_build_blocks": stats.get("metadata_build_blocks", 0),
             "gpu_selection_calls": stats.get("gpu_selection_calls", 0),
-            "quest_runtime_selection_calls": stats.get(
-                "quest_runtime_selection_calls", 0),
-            "quest_runtime_attention_calls": stats.get(
-                "quest_runtime_attention_calls", 0),
-            "head_full_blocks": stats.get("head_full_blocks", 0),
-            "head_selected_blocks": stats.get("head_selected_blocks", 0),
-            "head_selected_ratio": stats.get("head_selected_ratio", 0.0),
             "selected_ratio": stats.get("selected_ratio", 0.0),
             "gpu_memory_allocated": stats.get("gpu_memory_allocated"),
             "gpu_memory_reserved": stats.get("gpu_memory_reserved"),
@@ -236,10 +223,7 @@ def main() -> None:
         "request_samples": samples,
         "sparse_stats": sparse_stats,
         "quality": {},
-        "runtime_enabled": args.mode == "solidattention_runtime",
-        "note": ("prefill_ms is vLLM TTFT; runtime mode is a native-vLLM "
-                 "SolidAttention-style consumer, not the official Quest "
-                 "CUDA runtime"),
+        "note": "prefill_ms is vLLM TTFT; adapter is not official Quest CUDA runtime",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

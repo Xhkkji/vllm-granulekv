@@ -22,10 +22,6 @@ _SPARSE_STATS: dict[str, int] = {
     "metadata_build_calls": 0,
     "metadata_build_blocks": 0,
     "gpu_selection_calls": 0,
-    "quest_runtime_selection_calls": 0,
-    "quest_runtime_attention_calls": 0,
-    "head_full_blocks": 0,
-    "head_selected_blocks": 0,
 }
 
 
@@ -34,8 +30,6 @@ def sparse_kv_stats() -> dict[str, float | int]:
     payload: dict[str, float | int] = dict(_SPARSE_STATS)
     payload["selected_ratio"] = payload["selected_blocks"] / max(
         1, payload["full_blocks"])
-    payload["head_selected_ratio"] = payload["head_selected_blocks"] / max(
-        1, payload["head_full_blocks"])
     return payload
 
 
@@ -60,28 +54,6 @@ class SparseKVSelection:
         if any(left >= right for left, right in zip(
                 self.logical_block_indices, self.logical_block_indices[1:])):
             raise ValueError("sparse KV logical blocks must be sorted and unique")
-
-
-@dataclass(frozen=True)
-class SparseKVHeadSelection:
-    """Per-query-head logical pages for a device-side sparse consumer."""
-
-    logical_block_indices: torch.Tensor
-    counts: torch.Tensor
-
-    def __post_init__(self) -> None:
-        if self.logical_block_indices.ndim != 2:
-            raise ValueError("head selection indices must be two-dimensional")
-        if self.counts.ndim != 1:
-            raise ValueError("head selection counts must be one-dimensional")
-        if self.logical_block_indices.shape[0] != self.counts.shape[0]:
-            raise ValueError("head selection heads and counts must match")
-        if not self.logical_block_indices.is_cuda or not self.counts.is_cuda:
-            raise ValueError("head selection must remain on CUDA")
-        if self.logical_block_indices.dtype != torch.int32:
-            raise ValueError("head selection indices must use int32")
-        if self.counts.dtype != torch.int32:
-            raise ValueError("head selection counts must use int32")
 
 
 def _normalize_selection(selected_logical_blocks: Sequence[int],
@@ -304,70 +276,3 @@ def select_and_compact_decode_blocks(
     compact, selected_tokens = build_selected_decode_block_table(
         block_table, selected, sequence_length, block_size)
     return compact, selected_tokens, selected
-
-
-def run_sparse_per_head_decode(
-    *,
-    output: torch.Tensor,
-    block_table: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    query: torch.Tensor,
-    sequence_length: int,
-    block_size: int,
-    request_id: str,
-    layer_index: int,
-    block_budget: int,
-    select_blocks_per_head_device: Callable[..., SparseKVHeadSelection],
-    scale: float,
-    num_kv_heads: int,
-) -> SparseKVHeadSelection:
-    """Run an optional per-head consumer without compacting the block table."""
-    if block_table.ndim != 2 or block_table.shape[0] != 1:
-        raise ValueError("sparse decode requires a batch-one block table")
-    num_blocks = (sequence_length + block_size - 1) // block_size
-    if block_table.shape[1] < num_blocks:
-        raise ValueError("block table is shorter than sequence_length")
-    selection = select_blocks_per_head_device(
-        request_id,
-        layer_index,
-        query,
-        key_cache,
-        block_table[0, :num_blocks],
-        sequence_length,
-        block_size,
-        block_budget,
-    )
-    if not isinstance(selection, SparseKVHeadSelection):
-        raise TypeError("per-head sparse selector returned an invalid result")
-
-    from evaluation.paper_reproduction.quest.runtime import decode
-
-    decode(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        selection.logical_block_indices,
-        selection.counts,
-        sequence_length,
-        block_size,
-        float(scale),
-        int(num_kv_heads),
-    )
-    selected_per_head = int(selection.logical_block_indices.shape[1])
-    _SPARSE_STATS["calls"] += 1
-    _SPARSE_STATS["full_blocks"] += num_blocks
-    _SPARSE_STATS["selected_blocks"] += selected_per_head
-    tail_tokens = sequence_length - (num_blocks - 1) * block_size
-    _SPARSE_STATS["selected_tokens"] += (
-        selected_per_head * block_size - (block_size - tail_tokens))
-    _SPARSE_STATS["gpu_selection_calls"] += 1
-    _SPARSE_STATS["quest_runtime_selection_calls"] += 1
-    _SPARSE_STATS["quest_runtime_attention_calls"] += 1
-    _SPARSE_STATS["head_full_blocks"] += (
-        int(selection.counts.shape[0]) * num_blocks)
-    _SPARSE_STATS["head_selected_blocks"] += (
-        int(selection.logical_block_indices.shape[0]) * selected_per_head)
-    return selection

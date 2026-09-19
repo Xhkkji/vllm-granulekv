@@ -7,18 +7,9 @@ second transfer state machine or replacement attention runtime is introduced.
 The current adapter provides a resident-only `SolidAttentionPolicy`. It keeps
 initial blocks and recent local blocks, scores the remaining immutable prefix
 on the GPU, and returns logical block indices through the shared
-`select_blocks_device()` bridge. It also has an opt-in per-head CUDA runtime
-under `evaluation/paper_reproduction/quest/runtime`; that runtime reads the
-native vLLM key/value cache directly and supports Qwen-style 28-query-head /
-4-KV-head GQA. It is a SolidAttention-style block consumer, not the paper's
-attention-inner CUDA implementation.
-
-The runtime is enabled only by
-`VLLM_GRANULEKV_SPARSE_QUEST_RUNTIME_ENABLE=1` together with resident-only
-XFormers execution. The ordinary bridge and dense paths are unchanged. The
-runtime is correctness-complete for the supported FP16 layout, but the current
-single-warp-per-head consumer is retained as an experimental comparison path;
-on the V100S/Qwen2.5-7B 8K smoke it is slower than the existing compact bridge.
+`select_blocks_device()` bridge. The current implementation uses the existing
+attention consumer and is a block-level approximation, not the paper's
+attention-inner CUDA runtime.
 
 ## Prediction Miss and Correction
 

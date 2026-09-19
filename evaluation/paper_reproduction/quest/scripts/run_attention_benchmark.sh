@@ -9,7 +9,7 @@ PAGE_SIZE="${PAGE_SIZE:-16}"
 DECODE_TOKENS="${DECODE_TOKENS:-256}"
 ITERATIONS="${ITERATIONS:-5}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
-MODES="${MODES:-dense solidattention solidattention_runtime}"
+MODES="${MODES:-dense quest solidattention}"
 
 if [[ -e "${RESULT_DIR}" ]]; then
   echo "result directory already exists: ${RESULT_DIR}" >&2
