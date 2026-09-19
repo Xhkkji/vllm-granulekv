@@ -8,7 +8,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 
 from vllm.attention.ops.sparse_kv import (
-    build_page_representatives_from_paged_key_cache, )
+    SparseKVHeadSelection, build_page_representatives_from_paged_key_cache, )
 
 from ...common.selectors import ExplicitSelector, TailSelector
 
@@ -46,6 +46,8 @@ class SolidAttentionPolicy:
             dict)
         self._representatives: Dict[
             str, Dict[int, Tuple[int, torch.Tensor]]] = defaultdict(dict)
+        self._runtime_buffers: Dict[
+            str, Dict[int, Dict[str, torch.Tensor]]] = defaultdict(dict)
         self._page_index_keys: Dict[str, str] = {}
         self._seen: set[tuple[str, int]] = set()
 
@@ -126,6 +128,33 @@ class SolidAttentionPolicy:
         mask.scatter_(0, torch.cat((fixed, dynamic)), True)
         return torch.nonzero(mask, as_tuple=False).flatten()
 
+    def _cached_representatives(self, request_id: str, layer_index: int,
+                                key_cache: torch.Tensor,
+                                physical_block_ids: torch.Tensor,
+                                prefix_count: int,
+                                device: torch.device) -> torch.Tensor:
+        cached_count, representatives = self._representatives[request_id].get(
+            layer_index, (0, None))
+        if cached_count > prefix_count:
+            cached_count, representatives = 0, None
+        if cached_count < prefix_count:
+            new_ids = physical_block_ids[cached_count:prefix_count]
+            new_representatives = build_page_representatives_from_paged_key_cache(
+                key_cache, new_ids, output_device=device)
+            representatives = (new_representatives
+                               if representatives is None else
+                               torch.cat((representatives, new_representatives)))
+            cached_count = prefix_count
+            self._representatives[request_id][layer_index] = (
+                cached_count, representatives)
+        if representatives is None:
+            return torch.empty((0, 2, 0, 0), device=device)
+        if representatives.device != device:
+            representatives = representatives.to(device=device)
+            self._representatives[request_id][layer_index] = (
+                cached_count, representatives)
+        return representatives[:prefix_count]
+
     def observe_query(self, request_id: str, layer_index: int,
                       query: torch.Tensor) -> None:
         self._previous_queries[request_id][layer_index] = (
@@ -163,19 +192,9 @@ class SolidAttentionPolicy:
             raise ValueError("physical block ids do not cover the sequence")
 
         prefix_count = max(0, num_blocks - 1)
-        cached_count, representatives = self._representatives[request_id].get(
-            layer_index, (0, None))
-        if cached_count > prefix_count:
-            cached_count, representatives = 0, None
-        if cached_count < prefix_count:
-            new_ids = physical_block_ids[cached_count:prefix_count]
-            new_representatives = build_page_representatives_from_paged_key_cache(
-                key_cache, new_ids, output_device=query.device)
-            representatives = (new_representatives if representatives is None else
-                               torch.cat((representatives, new_representatives)))
-            cached_count = prefix_count
-            self._representatives[request_id][layer_index] = (
-                cached_count, representatives)
+        representatives = self._cached_representatives(
+            request_id, layer_index, key_cache, physical_block_ids,
+            prefix_count, query.device)
 
         key = (request_id, layer_index)
         if key not in self._seen:
@@ -187,6 +206,73 @@ class SolidAttentionPolicy:
         suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
                               device=query.device)
         return torch.cat((selected_prefix, suffix))
+
+    def select_blocks_per_head_device(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        physical_block_ids: torch.Tensor,
+        sequence_length: int,
+        block_size: int,
+        block_budget: int,
+    ) -> SparseKVHeadSelection:
+        """Return per-query-head logical pages for the direct consumer."""
+        query = self._normalize_query(query)
+        if (not query.is_cuda or sequence_length <= 0 or block_size <= 0
+                or block_budget <= 0):
+            raise ValueError("SolidAttention runtime requires CUDA inputs")
+        num_blocks = (sequence_length + block_size - 1) // block_size
+        if (physical_block_ids.ndim != 1
+                or physical_block_ids.numel() < num_blocks):
+            raise ValueError("physical block ids do not cover the sequence")
+
+        prefix_count = max(0, num_blocks - 1)
+        representatives = self._cached_representatives(
+            request_id, layer_index, key_cache, physical_block_ids,
+            prefix_count, query.device)
+        key = (request_id, layer_index)
+        if key not in self._seen:
+            self._seen.add(key)
+            indices = torch.arange(num_blocks, dtype=torch.int32,
+                                   device=query.device).unsqueeze(0)
+            indices = indices.expand(query.shape[0], -1).contiguous()
+            counts = torch.full((query.shape[0],), num_blocks,
+                                dtype=torch.int32, device=query.device)
+            return SparseKVHeadSelection(indices, counts)
+        if prefix_count == 0:
+            indices = torch.zeros((query.shape[0], 1), dtype=torch.int32,
+                                  device=query.device)
+            counts = torch.ones((query.shape[0],), dtype=torch.int32,
+                                device=query.device)
+            return SparseKVHeadSelection(indices, counts)
+
+        # The runtime owns the fixed/local merge and returns a device-side
+        # count, so padding never enters the attention consumer.
+        from ...quest.runtime import select_pages, score_pages
+
+        state = self._runtime_buffers[request_id].setdefault(layer_index, {})
+        score_shape = (query.shape[0], prefix_count)
+        scores = state.get("scores")
+        if (scores is None or scores.shape != score_shape
+                or scores.device != query.device):
+            scores = torch.empty(score_shape, dtype=torch.float32,
+                                 device=query.device)
+            state["scores"] = scores
+        scores = score_pages(query, representatives, output=scores)
+        selection = select_pages(
+            scores,
+            num_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            block_budget,
+            output=state.get("indices"),
+            counts=state.get("counts"),
+        )
+        state["indices"] = selection.logical_block_indices
+        state["counts"] = selection.counts
+        return selection
 
     def select_blocks(self, request_id: str, layer_index: int,
                       query: torch.Tensor,
@@ -228,5 +314,6 @@ class SolidAttentionPolicy:
     def discard(self, request_id: str) -> None:
         self._previous_queries.pop(request_id, None)
         self._representatives.pop(request_id, None)
+        self._runtime_buffers.pop(request_id, None)
         self._page_index_keys.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}

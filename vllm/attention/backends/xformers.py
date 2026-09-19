@@ -28,7 +28,8 @@ from vllm.attention.backends.utils import (
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.attention.ops.sparse_kv import (
-    build_selected_decode_block_table, select_and_compact_decode_blocks)
+    build_selected_decode_block_table, run_sparse_per_head_decode,
+    select_and_compact_decode_blocks)
 from vllm.core.custom_schedulers.hierarchical_io import (
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
     get_sparse_kv_policy, register_sparse_page_representatives,
@@ -1211,6 +1212,12 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                         "resident sparse decode requires a block table")
                 active_sparse_blocks = tuple(
                     range((int(sequence_length) + block_size - 1) // block_size))
+            if (envs.VLLM_GRANULEKV_SPARSE_QUEST_RUNTIME_ENABLE
+                    and (not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
+                         or active_sparse_blocks is None)):
+                raise RuntimeError(
+                    "SolidAttention runtime requires resident-only decode")
+            runtime_decode = False
             if active_sparse_blocks is not None:
                 if attn_type != AttentionType.DECODER:
                     raise RuntimeError(
@@ -1229,7 +1236,54 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 if self.kv_cache_dtype.startswith("fp8"):
                     raise RuntimeError(
                         "sparse KV decode does not support FP8 KV cache")
-                if (envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET > 0
+                if envs.VLLM_GRANULEKV_SPARSE_QUEST_RUNTIME_ENABLE:
+                    policy = get_sparse_kv_policy()
+                    runtime_selector = (getattr(
+                        policy, "select_blocks_per_head_device", None)
+                                        if policy is not None else None)
+                    if (envs.VLLM_GRANULEKV_ENABLE
+                            or envs.VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE
+                            or envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                            or not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
+                            or envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET <= 0
+                            or policy is None
+                            or getattr(policy, "name", None) != "solidattention"
+                            or not callable(runtime_selector)):
+                        raise RuntimeError(
+                            "SolidAttention runtime requires resident-only "
+                            "decode with a SolidAttention per-head selector")
+                    if self.alibi_slopes is not None:
+                        raise RuntimeError(
+                            "SolidAttention runtime does not support ALiBi")
+                    request_ids = get_active_layer_request_ids()
+                    layer_name = getattr(layer, "layer_name", "")
+                    layer_index = self._layer_index_from_name(layer_name)
+                    if layer_index is None or len(request_ids) > 1:
+                        raise RuntimeError(
+                            "SolidAttention runtime requires one named layer "
+                            "request")
+                    request_id = (request_ids[0]
+                                  if request_ids else "default")
+                    run_sparse_per_head_decode(
+                        output=output[num_prefill_query_tokens:],
+                        block_table=block_tables_arg,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        query=decode_query,
+                        sequence_length=sequence_length,
+                        block_size=block_size,
+                        request_id=request_id,
+                        layer_index=layer_index,
+                        block_budget=(
+                            envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET),
+                        select_blocks_per_head_device=runtime_selector,
+                        scale=self.scale,
+                        num_kv_heads=self.num_kv_heads,
+                    )
+                    runtime_decode = True
+
+                if not runtime_decode and (
+                        envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET > 0
                         and get_sparse_kv_policy() is not None):
                     layer_name = getattr(layer, "layer_name", "")
                     layer_index = self._layer_index_from_name(layer_name)
@@ -1267,7 +1321,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                                     and active_sparse_blocks is not None) else
                                 None),
                         ))
-                else:
+                elif not runtime_decode:
                     block_tables_arg, selected_seq_len = (
                         build_selected_decode_block_table(
                             block_tables_arg,
@@ -1275,27 +1329,30 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                             sequence_length,
                             block_size,
                         ))
-                seq_lens_arg = torch.tensor(
-                    [selected_seq_len],
-                    dtype=seq_lens_arg.dtype,
-                    device=seq_lens_arg.device,
-                )
-                max_seq_len_arg = selected_seq_len
+                if not runtime_decode:
+                    seq_lens_arg = torch.tensor(
+                        [selected_seq_len],
+                        dtype=seq_lens_arg.dtype,
+                        device=seq_lens_arg.device,
+                    )
+                    max_seq_len_arg = selected_seq_len
 
-            output[num_prefill_query_tokens:] = PagedAttention.forward_decode(
-                decode_query,
-                key_cache,
-                value_cache,
-                block_tables_arg,
-                seq_lens_arg,
-                max_seq_len_arg,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if not runtime_decode:
+                output[num_prefill_query_tokens:] = (
+                    PagedAttention.forward_decode(
+                        decode_query,
+                        key_cache,
+                        value_cache,
+                        block_tables_arg,
+                        seq_lens_arg,
+                        max_seq_len_arg,
+                        self.kv_cache_dtype,
+                        self.num_kv_heads,
+                        self.scale,
+                        self.alibi_slopes,
+                        layer._k_scale,
+                        layer._v_scale,
+                    ))
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
