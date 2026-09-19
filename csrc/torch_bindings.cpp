@@ -64,6 +64,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int blocksparse_head_sliding_step) -> ()");
   ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);
 
+  ops.def(
+      "paged_attention_selected_v1("
+      "    Tensor! out, Tensor query, Tensor key_cache,"
+      "    Tensor value_cache, int num_kv_heads, float scale,"
+      "    Tensor block_tables, Tensor seq_lens,"
+      "    Tensor selected_block_indices, int selected_count,"
+      "    int block_size, int selected_seq_len, Tensor? alibi_slopes,"
+      "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale, int tp_rank) -> ()");
+  ops.impl("paged_attention_selected_v1", torch::kCUDA,
+           &paged_attention_selected_v1);
+
+  ops.def(
+      "paged_attention_selected_v2("
+      "    Tensor! out, Tensor! exp_sums, Tensor! max_logits,"
+      "    Tensor! tmp_out, Tensor query, Tensor key_cache,"
+      "    Tensor value_cache, int num_kv_heads, float scale,"
+      "    Tensor block_tables, Tensor seq_lens,"
+      "    Tensor selected_block_indices, int selected_count,"
+      "    int block_size, int selected_seq_len, Tensor? alibi_slopes,"
+      "    str kv_cache_dtype, Tensor k_scale, Tensor v_scale, int tp_rank) -> ()");
+  ops.impl("paged_attention_selected_v2", torch::kCUDA,
+           &paged_attention_selected_v2);
+
 #ifndef USE_ROCM
   // Merge attn states
   // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005

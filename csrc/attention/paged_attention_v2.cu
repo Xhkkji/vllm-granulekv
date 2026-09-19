@@ -46,6 +46,23 @@
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr,    \
           max_num_partitions);
 
+#define LAUNCH_SELECTED_PAGED_ATTENTION_V2(HEAD_SIZE)                          \
+  vllm::paged_attention_v2_kernel<T, CACHE_T, HEAD_SIZE, BLOCK_SIZE,           \
+                                  NUM_THREADS, KV_DTYPE, false,                \
+                                  PARTITION_SIZE, true>                         \
+      <<<grid, block, shared_mem_size, stream>>>(                              \
+          exp_sums_ptr, max_logits_ptr, tmp_out_ptr, query_ptr, key_cache_ptr, \
+          value_cache_ptr, num_kv_heads, scale, block_tables_ptr,              \
+          seq_lens_ptr, max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,    \
+          kv_block_stride, kv_head_stride, k_scale_ptr, v_scale_ptr, tp_rank,  \
+          0, 0, 0, 0, selected_block_indices_ptr, selected_count,             \
+          selected_seq_len);                                                   \
+  vllm::paged_attention_v2_reduce_kernel<T, HEAD_SIZE, NUM_THREADS,            \
+                                         PARTITION_SIZE, true>                  \
+      <<<reduce_grid, block, reduce_shared_mem_size, stream>>>(                \
+          out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr,    \
+          max_num_partitions, selected_seq_len);
+
 template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE, bool IS_BLOCK_SPARSE,
           int NUM_THREADS = 128, int PARTITION_SIZE = 512>
@@ -139,6 +156,86 @@ void paged_attention_v2_launcher(
   }
 }
 
+template <typename T, typename CACHE_T, int BLOCK_SIZE,
+          vllm::Fp8KVCacheDataType KV_DTYPE, int NUM_THREADS = 128,
+          int PARTITION_SIZE = 512>
+void paged_attention_v2_selected_launcher(
+    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
+    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, int num_kv_heads, float scale,
+    torch::Tensor& block_tables, torch::Tensor& seq_lens,
+    torch::Tensor& selected_block_indices, int selected_count,
+    int selected_seq_len, const std::optional<torch::Tensor>& alibi_slopes,
+    torch::Tensor& k_scale, torch::Tensor& v_scale, const int tp_rank) {
+  int num_seqs = query.size(0);
+  int num_heads = query.size(1);
+  int head_size = query.size(2);
+  int max_num_blocks_per_seq = block_tables.size(1);
+  int q_stride = query.stride(0);
+  int kv_block_stride = key_cache.stride(0);
+  int kv_head_stride = key_cache.stride(1);
+
+  const float* alibi_slopes_ptr =
+      alibi_slopes
+          ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          : nullptr;
+  T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
+  float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
+  float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
+  T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
+  T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
+  CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
+  CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
+  int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* seq_lens_ptr = seq_lens.data_ptr<int>();
+  int* selected_block_indices_ptr = selected_block_indices.data_ptr<int>();
+  const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
+  const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
+
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  int max_num_partitions = DIVIDE_ROUND_UP(selected_seq_len, PARTITION_SIZE);
+  int logits_size = PARTITION_SIZE * sizeof(float);
+  int outputs_size = (NUM_WARPS / 2) * head_size * sizeof(float);
+  dim3 grid(num_heads, num_seqs, max_num_partitions);
+  int shared_mem_size = std::max(logits_size, outputs_size);
+  dim3 reduce_grid(num_heads, num_seqs);
+  int reduce_shared_mem_size = 2 * max_num_partitions * sizeof(float);
+  dim3 block(NUM_THREADS);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  switch (head_size) {
+    case 32:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(32);
+      break;
+    case 64:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(64);
+      break;
+    case 80:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(80);
+      break;
+    case 96:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(96);
+      break;
+    case 112:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(112);
+      break;
+    case 120:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(120);
+      break;
+    case 128:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(128);
+      break;
+    case 192:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(192);
+      break;
+    case 256:
+      LAUNCH_SELECTED_PAGED_ATTENTION_V2(256);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size: ", head_size);
+  }
+}
+
 #define CALL_V2_LAUNCHER(T, CACHE_T, BLOCK_SIZE, KV_DTYPE, IS_BLOCK_SPARSE)   \
   paged_attention_v2_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE,               \
                               IS_BLOCK_SPARSE>(                               \
@@ -199,6 +296,61 @@ void paged_attention_v2(
   DISPATCH_BY_KV_CACHE_DTYPE(query.dtype(), kv_cache_dtype,
                              CALL_V2_LAUNCHER_BLOCK_SIZE)
 }
+
+#define CALL_SELECTED_V2_LAUNCHER(T, CACHE_T, BLOCK_SIZE, KV_DTYPE)            \
+  paged_attention_v2_selected_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE>(     \
+      out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,      \
+      num_kv_heads, scale, block_tables, seq_lens, selected_block_indices,     \
+      selected_count, selected_seq_len, alibi_slopes, k_scale, v_scale,        \
+      tp_rank);
+
+#define CALL_SELECTED_V2_LAUNCHER_BLOCK_SIZE(T, CACHE_T, KV_DTYPE) \
+  switch (block_size) {                                            \
+    case 8:                                                        \
+      CALL_SELECTED_V2_LAUNCHER(T, CACHE_T, 8, KV_DTYPE);          \
+      break;                                                       \
+    case 16:                                                       \
+      CALL_SELECTED_V2_LAUNCHER(T, CACHE_T, 16, KV_DTYPE);         \
+      break;                                                       \
+    case 32:                                                       \
+      CALL_SELECTED_V2_LAUNCHER(T, CACHE_T, 32, KV_DTYPE);         \
+      break;                                                       \
+    default:                                                       \
+      TORCH_CHECK(false, "Unsupported block size: ", block_size); \
+  }
+
+void paged_attention_selected_v2(
+    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
+    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, int64_t num_kv_heads, double scale,
+    torch::Tensor& block_tables, torch::Tensor& seq_lens,
+    torch::Tensor& selected_block_indices, int64_t selected_count,
+    int64_t block_size, int64_t selected_seq_len,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const std::string& kv_cache_dtype, torch::Tensor& k_scale,
+    torch::Tensor& v_scale, const int64_t tp_rank) {
+  TORCH_CHECK(query.dim() == 3 && query.size(0) == 1,
+              "selected paged attention requires batch size one");
+  TORCH_CHECK(selected_block_indices.is_cuda() &&
+                  selected_block_indices.scalar_type() == at::kInt &&
+                  selected_block_indices.dim() == 1 &&
+                  selected_block_indices.is_contiguous(),
+              "selected block indices must be contiguous CUDA int32");
+  TORCH_CHECK(selected_count > 0 && selected_count <=
+                  selected_block_indices.numel(),
+              "selected block count is outside the selection buffer");
+  TORCH_CHECK(selected_seq_len > 0, "selected sequence length must be positive");
+  TORCH_CHECK(block_tables.dim() == 2 && block_tables.size(0) == 1,
+              "selected paged attention requires one block table");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt,
+              "sequence lengths must use int32");
+  DISPATCH_BY_KV_CACHE_DTYPE(query.dtype(), kv_cache_dtype,
+                             CALL_SELECTED_V2_LAUNCHER_BLOCK_SIZE)
+}
+
+#undef CALL_SELECTED_V2_LAUNCHER_BLOCK_SIZE
+#undef CALL_SELECTED_V2_LAUNCHER
+#undef LAUNCH_SELECTED_PAGED_ATTENTION_V2
 
 #undef WARP_SIZE
 #undef MAX

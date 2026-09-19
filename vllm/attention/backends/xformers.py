@@ -28,7 +28,8 @@ from vllm.attention.backends.utils import (
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.attention.ops.sparse_kv import (
-    build_selected_decode_block_table, select_and_compact_decode_blocks)
+    build_selected_decode_block_table, select_and_compact_decode_blocks,
+    validate_sparse_kv_device_selection)
 from vllm.core.custom_schedulers.hierarchical_io import (
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
     get_sparse_kv_policy, register_sparse_page_representatives,
@@ -1203,6 +1204,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
             block_size = value_cache.shape[3]
             sequence_length = int(max_seq_len_arg)
+            selected_attention = None
+            selected_attention_seq_len = None
             active_sparse_blocks = get_active_sparse_kv_blocks()
             if (active_sparse_blocks is None
                     and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):
@@ -1241,32 +1244,59 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     request_id = (request_ids[0] if request_ids else "default")
                     policy = get_sparse_kv_policy()
                     gpu_selector = None
+                    attention_selector = None
                     if (envs.VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE
                             and not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
                             and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
+                            and not envs.VLLM_GRANULEKV_ENABLE
                             and policy is not None):
                         gpu_selector = getattr(policy, "select_blocks_device", None)
-                    block_tables_arg, selected_seq_len, active_sparse_blocks = (
-                        select_and_compact_decode_blocks(
-                            block_table=block_tables_arg,
-                            key_cache=key_cache,
-                            query=decode_query,
-                            sequence_length=sequence_length,
-                            block_size=block_size,
-                            request_id=request_id,
-                            layer_index=layer_index,
-                            block_budget=envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
-                            select_blocks=select_sparse_blocks,
-                            register_page_representatives=(
-                                register_sparse_page_representatives),
-                            select_blocks_device=gpu_selector,
-                            resident_blocks=active_sparse_blocks,
-                            selected_blocks_override=(
-                                active_sparse_blocks
-                                if (envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
-                                    and active_sparse_blocks is not None) else
-                                None),
-                        ))
+                        if envs.VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE:
+                            attention_selector = getattr(
+                                policy, "select_attention_blocks_device", None)
+                    if callable(attention_selector):
+                        selection = validate_sparse_kv_device_selection(
+                            attention_selector(
+                                request_id,
+                                layer_index,
+                                decode_query,
+                                key_cache,
+                                block_tables_arg[0, :((sequence_length +
+                                                       block_size - 1) //
+                                                      block_size)],
+                                sequence_length,
+                                block_size,
+                                envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+                            ))
+                        tail_tokens = sequence_length - (
+                            (sequence_length + block_size - 1) // block_size -
+                            1) * block_size
+                        selected_attention = selection
+                        selected_attention_seq_len = (
+                            selection.count * block_size -
+                            (block_size - tail_tokens))
+                    else:
+                        block_tables_arg, selected_seq_len, active_sparse_blocks = (
+                            select_and_compact_decode_blocks(
+                                block_table=block_tables_arg,
+                                key_cache=key_cache,
+                                query=decode_query,
+                                sequence_length=sequence_length,
+                                block_size=block_size,
+                                request_id=request_id,
+                                layer_index=layer_index,
+                                block_budget=envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+                                select_blocks=select_sparse_blocks,
+                                register_page_representatives=(
+                                    register_sparse_page_representatives),
+                                select_blocks_device=gpu_selector,
+                                resident_blocks=active_sparse_blocks,
+                                selected_blocks_override=(
+                                    active_sparse_blocks
+                                    if (envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                                        and active_sparse_blocks is not None) else
+                                    None),
+                            ))
                 else:
                     block_tables_arg, selected_seq_len = (
                         build_selected_decode_block_table(
@@ -1275,27 +1305,47 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                             sequence_length,
                             block_size,
                         ))
-                seq_lens_arg = torch.tensor(
-                    [selected_seq_len],
-                    dtype=seq_lens_arg.dtype,
-                    device=seq_lens_arg.device,
-                )
-                max_seq_len_arg = selected_seq_len
+                if selected_attention is None:
+                    seq_lens_arg = torch.tensor(
+                        [selected_seq_len],
+                        dtype=seq_lens_arg.dtype,
+                        device=seq_lens_arg.device,
+                    )
+                    max_seq_len_arg = selected_seq_len
 
-            output[num_prefill_query_tokens:] = PagedAttention.forward_decode(
-                decode_query,
-                key_cache,
-                value_cache,
-                block_tables_arg,
-                seq_lens_arg,
-                max_seq_len_arg,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if selected_attention is not None:
+                output[num_prefill_query_tokens:] = (
+                    PagedAttention.forward_decode_selected(
+                        decode_query,
+                        key_cache,
+                        value_cache,
+                        block_tables_arg,
+                        seq_lens_arg,
+                        selected_attention.logical_block_indices,
+                        selected_attention.count,
+                        selected_attention_seq_len,
+                        self.kv_cache_dtype,
+                        self.num_kv_heads,
+                        self.scale,
+                        self.alibi_slopes,
+                        layer._k_scale,
+                        layer._v_scale,
+                    ))
+            else:
+                output[num_prefill_query_tokens:] = PagedAttention.forward_decode(
+                    decode_query,
+                    key_cache,
+                    value_cache,
+                    block_tables_arg,
+                    seq_lens_arg,
+                    max_seq_len_arg,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

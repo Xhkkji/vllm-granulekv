@@ -86,7 +86,8 @@ inline __device__ float block_sum(float* red_smem, float sum) {
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, vllm::Fp8KVCacheDataType KV_DTYPE,
           bool IS_BLOCK_SPARSE,
-          int PARTITION_SIZE = 0>  // Zero means no partitioning.
+          int PARTITION_SIZE = 0,  // Zero means no partitioning.
+          bool USE_SELECTED_BLOCKS = false>
 __device__ void paged_attention_kernel(
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
@@ -107,32 +108,37 @@ __device__ void paged_attention_kernel(
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
     const float* k_scale, const float* v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
-    const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
+    const int blocksparse_block_size, const int blocksparse_head_sliding_step,
+    const int* selected_block_indices, const int selected_count,
+    const int selected_seq_len) {
   const int seq_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
   const int max_num_partitions = gridDim.z;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   const int seq_len = seq_lens[seq_idx];
-  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= seq_len) {
+  const int work_seq_len = USE_SELECTED_BLOCKS ? selected_seq_len : seq_len;
+  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= work_seq_len) {
     // No work to do. Terminate the thread block.
     return;
   }
 
   const int num_seq_blocks = DIVIDE_ROUND_UP(seq_len, BLOCK_SIZE);
+  const int num_work_blocks =
+      USE_SELECTED_BLOCKS ? selected_count : num_seq_blocks;
   const int num_blocks_per_partition =
       USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_seq_blocks;
 
   // [start_block_idx, end_block_idx) is the range of blocks to process.
   const int start_block_idx =
       USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
-  const int end_block_idx =
-      MIN(start_block_idx + num_blocks_per_partition, num_seq_blocks);
+  const int end_block_idx = MIN(start_block_idx + num_blocks_per_partition,
+                                num_work_blocks);
   const int num_blocks = end_block_idx - start_block_idx;
 
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   const int start_token_idx = start_block_idx * BLOCK_SIZE;
   const int end_token_idx =
-      MIN(start_token_idx + num_blocks * BLOCK_SIZE, seq_len);
+      MIN(start_token_idx + num_blocks * BLOCK_SIZE, work_seq_len);
   const int num_tokens = end_token_idx - start_token_idx;
 
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
@@ -226,13 +232,16 @@ __device__ void paged_attention_kernel(
 
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
+    const int logical_block_idx =
+        USE_SELECTED_BLOCKS ? selected_block_indices[block_idx] : block_idx;
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to
     // int64 because int32 can lead to overflow when this variable is multiplied
     // by large numbers (e.g., kv_block_stride).
     // For blocksparse attention: skip computation on blocks that are not
     // attended
     if constexpr (IS_BLOCK_SPARSE) {
-      const int k_bs_block_id = block_idx * BLOCK_SIZE / blocksparse_block_size;
+      const int k_bs_block_id =
+          logical_block_idx * BLOCK_SIZE / blocksparse_block_size;
       const bool is_remote =
           ((k_bs_block_id + bs_block_offset) % blocksparse_vert_stride == 0);
       const bool is_local =
@@ -241,21 +250,21 @@ __device__ void paged_attention_kernel(
         for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
           const int physical_block_offset =
               (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
-          const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
 
           if (thread_group_offset == 0) {
             // NOTE(linxihui): assign very large number to skipped tokens to
             // avoid contribution to the sumexp softmax normalizer. This will
             // not be used at computing sum(softmax*v) as the blocks will be
             // skipped.
-            logits[token_idx - start_token_idx] = -FLT_MAX;
+            logits[(block_idx - start_block_idx) * BLOCK_SIZE +
+                   physical_block_offset] = -FLT_MAX;
           }
         }
         continue;
       }
     }
     const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
+        static_cast<int64_t>(block_table[logical_block_idx]);
 
     // Load a key to registers.
     // Each thread in a thread group has a different part of the key.
@@ -265,7 +274,10 @@ __device__ void paged_attention_kernel(
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
       const int physical_block_offset =
           (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
-      const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+      const int token_idx =
+          logical_block_idx * BLOCK_SIZE + physical_block_offset;
+      const int packed_token_idx =
+          (block_idx - start_block_idx) * BLOCK_SIZE + physical_block_offset;
       K_vec k_vecs[NUM_VECS_PER_THREAD];
 
 #pragma unroll
@@ -300,7 +312,7 @@ __device__ void paged_attention_kernel(
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
         const bool mask = token_idx >= seq_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
+        logits[packed_token_idx] = mask ? 0.f : qk;
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);
       }
@@ -379,25 +391,31 @@ __device__ void paged_attention_kernel(
   zero(zero_value);
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
+    const int logical_block_idx =
+        USE_SELECTED_BLOCKS ? selected_block_indices[block_idx] : block_idx;
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to
     // int64 because int32 can lead to overflow when this variable is multiplied
     // by large numbers (e.g., kv_block_stride).
     // For blocksparse attention: skip computation on blocks that are not
     // attended
     if constexpr (IS_BLOCK_SPARSE) {
-      int v_bs_block_id = block_idx * BLOCK_SIZE / blocksparse_block_size;
+      int v_bs_block_id =
+          logical_block_idx * BLOCK_SIZE / blocksparse_block_size;
       if (!((v_bs_block_id + bs_block_offset) % blocksparse_vert_stride == 0) &&
           !((v_bs_block_id > q_bs_block_id - blocksparse_local_blocks))) {
         continue;
       }
     }
     const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
+        static_cast<int64_t>(block_table[logical_block_idx]);
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
-    const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+    const int token_idx =
+        logical_block_idx * BLOCK_SIZE + physical_block_offset;
+    const int packed_token_idx =
+        (block_idx - start_block_idx) * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
-    from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx -
-                                                           start_token_idx));
+    from_float(logits_vec,
+               *reinterpret_cast<Float_L_vec*>(logits + packed_token_idx));
 
     const cache_t* v_ptr = v_cache + physical_block_number * kv_block_stride +
                            kv_head_idx * kv_head_stride;
@@ -417,7 +435,15 @@ __device__ void paged_attention_kernel(
           v_vec = fp8::scaled_convert<V_vec, V_quant_vec, KV_DTYPE>(v_quant_vec,
                                                                     *v_scale);
         }
-        if (block_idx == num_seq_blocks - 1) {
+        if constexpr (USE_SELECTED_BLOCKS) {
+          // Selected slots can contain logical holes. Tail masking must use
+          // the original logical token position.
+          scalar_t* v_vec_ptr = reinterpret_cast<scalar_t*>(&v_vec);
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            v_vec_ptr[j] = token_idx + j < seq_len ? v_vec_ptr[j] : zero_value;
+          }
+        } else if (logical_block_idx == num_seq_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the
           // context, we should explicitly zero out the values since they may
           // contain NaNs. See
@@ -498,7 +524,7 @@ __device__ void paged_attention_kernel(
 // Grid: (num_heads, num_seqs, 1).
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, vllm::Fp8KVCacheDataType KV_DTYPE,
-          bool IS_BLOCK_SPARSE>
+          bool IS_BLOCK_SPARSE, bool USE_SELECTED_BLOCKS = false>
 __global__ void paged_attention_v1_kernel(
     scalar_t* __restrict__ out,           // [num_seqs, num_heads, head_size]
     const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
@@ -515,22 +541,25 @@ __global__ void paged_attention_v1_kernel(
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
     const float* k_scale, const float* v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
-    const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
+    const int blocksparse_block_size, const int blocksparse_head_sliding_step,
+    const int* selected_block_indices = nullptr, const int selected_count = 0,
+    const int selected_seq_len = 0) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
-                         KV_DTYPE, IS_BLOCK_SPARSE>(
+                         KV_DTYPE, IS_BLOCK_SPARSE, 0, USE_SELECTED_BLOCKS>(
       /* exp_sums */ nullptr, /* max_logits */ nullptr, out, q, k_cache,
       v_cache, num_kv_heads, scale, block_tables, seq_lens,
       max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
       kv_head_stride, k_scale, v_scale, tp_rank, blocksparse_local_blocks,
       blocksparse_vert_stride, blocksparse_block_size,
-      blocksparse_head_sliding_step);
+      blocksparse_head_sliding_step, selected_block_indices, selected_count,
+      selected_seq_len);
 }
 
 // Grid: (num_heads, num_seqs, max_num_partitions).
 template <typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, vllm::Fp8KVCacheDataType KV_DTYPE,
           bool IS_BLOCK_SPARSE,
-          int PARTITION_SIZE>
+          int PARTITION_SIZE, bool USE_SELECTED_BLOCKS = false>
 __global__ void paged_attention_v2_kernel(
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,       // [num_seqs, num_heads,
@@ -551,19 +580,23 @@ __global__ void paged_attention_v2_kernel(
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
     const float* k_scale, const float* v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
-    const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
+    const int blocksparse_block_size, const int blocksparse_head_sliding_step,
+    const int* selected_block_indices = nullptr, const int selected_count = 0,
+    const int selected_seq_len = 0) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
-                         KV_DTYPE, IS_BLOCK_SPARSE, PARTITION_SIZE>(
+                         KV_DTYPE, IS_BLOCK_SPARSE, PARTITION_SIZE,
+                         USE_SELECTED_BLOCKS>(
       exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
       block_tables, seq_lens, max_num_blocks_per_seq, alibi_slopes, q_stride,
       kv_block_stride, kv_head_stride, k_scale, v_scale, tp_rank,
       blocksparse_local_blocks, blocksparse_vert_stride, blocksparse_block_size,
-      blocksparse_head_sliding_step);
+      blocksparse_head_sliding_step, selected_block_indices, selected_count,
+      selected_seq_len);
 }
 
 // Grid: (num_heads, num_seqs).
 template <typename scalar_t, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE>
+          int PARTITION_SIZE, bool USE_SELECTED_BLOCKS = false>
 __global__ void paged_attention_v2_reduce_kernel(
     scalar_t* __restrict__ out,            // [num_seqs, num_heads, head_size]
     const float* __restrict__ exp_sums,    // [num_seqs, num_heads,
@@ -573,11 +606,12 @@ __global__ void paged_attention_v2_reduce_kernel(
     const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_heads,
                                            // max_num_partitions, head_size]
     const int* __restrict__ seq_lens,      // [num_seqs]
-    const int max_num_partitions) {
+    const int max_num_partitions, const int selected_seq_len = 0) {
   const int num_heads = gridDim.x;
   const int head_idx = blockIdx.x;
   const int seq_idx = blockIdx.y;
-  const int seq_len = seq_lens[seq_idx];
+  const int seq_len =
+      USE_SELECTED_BLOCKS ? selected_seq_len : seq_lens[seq_idx];
   const int num_partitions = DIVIDE_ROUND_UP(seq_len, PARTITION_SIZE);
   if (num_partitions == 1) {
     // No need to reduce. Only copy tmp_out to out.

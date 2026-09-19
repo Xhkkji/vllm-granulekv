@@ -54,6 +54,33 @@ def test_solidattention_gpu_path_caches_prefix_representatives():
     assert second[-1].item() == 5
 
 
+def test_solidattention_attention_buffer_is_reused_and_grows():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    query = torch.ones(2, 4, device="cuda")
+    key_cache = torch.randn(16, 2, 4, 4, device="cuda")
+    physical_ids = torch.arange(16, dtype=torch.long, device="cuda")
+
+    first = policy.select_attention_blocks_device("r", 0, query, key_cache,
+                                                 physical_ids, 24, 4, 2)
+    second = policy.select_attention_blocks_device("r", 0, query, key_cache,
+                                                  physical_ids, 24, 4, 2)
+    assert first.logical_block_indices.dtype == torch.int32
+    assert first.logical_block_indices.is_contiguous()
+    assert first.count == 6
+    assert second.count <= first.count
+    assert first.logical_block_indices.data_ptr() == (
+        second.logical_block_indices.data_ptr())
+
+    grown = policy.select_attention_blocks_device("r", 0, query, key_cache,
+                                                  physical_ids, 48, 4, 8)
+    assert grown.count > first.count
+    assert grown.logical_block_indices.numel() >= grown.count
+    policy.discard("r")
+    assert "r" not in policy._attention_selection_buffers
+
+
 def test_solidattention_restore_prediction_is_prefix_only():
     policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
     policy.observe_query("r", 0, torch.ones(2, 2))

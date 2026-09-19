@@ -8,6 +8,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 
 from vllm.attention.ops.sparse_kv import (
+    SparseKVDeviceSelection,
     build_page_representatives_from_paged_key_cache, )
 
 from ...common.selectors import ExplicitSelector, TailSelector
@@ -48,6 +49,8 @@ class SolidAttentionPolicy:
             str, Dict[int, Tuple[int, torch.Tensor]]] = defaultdict(dict)
         self._page_index_keys: Dict[str, str] = {}
         self._seen: set[tuple[str, int]] = set()
+        self._attention_selection_buffers: Dict[
+            str, Dict[int, torch.Tensor]] = defaultdict(dict)
 
     @staticmethod
     def _normalize_query(query: torch.Tensor) -> torch.Tensor:
@@ -171,7 +174,7 @@ class SolidAttentionPolicy:
     def bind_page_index_key(self, request_id: str, page_index_key: str) -> None:
         self._page_index_keys[request_id] = page_index_key
 
-    def select_blocks_device(
+    def _select_blocks_device_impl(
         self,
         request_id: str,
         layer_index: int,
@@ -204,6 +207,48 @@ class SolidAttentionPolicy:
         suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
                               device=query.device)
         return torch.cat((selected_prefix, suffix))
+
+    def select_blocks_device(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        physical_block_ids: torch.Tensor,
+        sequence_length: int,
+        block_size: int,
+        block_budget: int,
+    ) -> torch.Tensor:
+        return self._select_blocks_device_impl(
+            request_id, layer_index, query, key_cache, physical_block_ids,
+            sequence_length, block_size, block_budget)
+
+    def select_attention_blocks_device(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        physical_block_ids: torch.Tensor,
+        sequence_length: int,
+        block_size: int,
+        block_budget: int,
+    ) -> SparseKVDeviceSelection:
+        """Return a reusable GPU logical-block buffer for selected attention."""
+        selected = self._select_blocks_device_impl(
+            request_id, layer_index, query, key_cache, physical_block_ids,
+            sequence_length, block_size, block_budget)
+        count = selected.shape[0]
+        buffers = self._attention_selection_buffers[request_id]
+        buffer = buffers.get(layer_index)
+        if buffer is None or buffer.numel() < count or buffer.device != selected.device:
+            capacity = count if buffer is None else max(count, buffer.numel() * 2)
+            buffers[layer_index] = torch.empty(capacity,
+                                               dtype=torch.int32,
+                                               device=selected.device)
+            buffer = buffers[layer_index]
+        buffer[:count].copy_(selected)
+        return SparseKVDeviceSelection(buffer, count)
 
     def select_blocks(self, request_id: str, layer_index: int,
                       query: torch.Tensor,
@@ -245,5 +290,6 @@ class SolidAttentionPolicy:
     def discard(self, request_id: str) -> None:
         self._previous_queries.pop(request_id, None)
         self._representatives.pop(request_id, None)
+        self._attention_selection_buffers.pop(request_id, None)
         self._page_index_keys.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}

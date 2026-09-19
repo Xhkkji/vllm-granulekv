@@ -22,6 +22,8 @@ _SPARSE_STATS: dict[str, int] = {
     "metadata_build_calls": 0,
     "metadata_build_blocks": 0,
     "gpu_selection_calls": 0,
+    "attention_selection_calls": 0,
+    "attention_selected_blocks": 0,
 }
 
 
@@ -54,6 +56,42 @@ class SparseKVSelection:
         if any(left >= right for left, right in zip(
                 self.logical_block_indices, self.logical_block_indices[1:])):
             raise ValueError("sparse KV logical blocks must be sorted and unique")
+
+
+@dataclass(frozen=True)
+class SparseKVDeviceSelection:
+    """GPU-resident logical block list for a selected-list attention kernel.
+
+    Only the first ``count`` entries of ``logical_block_indices`` are valid.
+    The count is taken from tensor shape metadata by the producer, so consuming
+    code never needs to read a CUDA scalar back to the host.
+    """
+
+    logical_block_indices: torch.Tensor
+    count: int
+
+
+def validate_sparse_kv_device_selection(
+        selection: SparseKVDeviceSelection) -> SparseKVDeviceSelection:
+    """Validate only metadata that is available without synchronizing CUDA."""
+    if not isinstance(selection, SparseKVDeviceSelection):
+        raise TypeError("attention selector must return SparseKVDeviceSelection")
+    indices = selection.logical_block_indices
+    if not isinstance(indices, torch.Tensor) or not indices.is_cuda:
+        raise ValueError("selected logical blocks must be a CUDA tensor")
+    if indices.ndim != 1:
+        raise ValueError("selected logical blocks must be one-dimensional")
+    if indices.dtype != torch.int32:
+        raise ValueError("selected logical blocks must have dtype int32")
+    if not indices.is_contiguous():
+        raise ValueError("selected logical blocks must be contiguous")
+    if not isinstance(selection.count, int) or isinstance(selection.count, bool):
+        raise TypeError("selected logical block count must be a Python int")
+    if selection.count <= 0 or selection.count > indices.numel():
+        raise ValueError("selected logical block count is outside the buffer")
+    _SPARSE_STATS["attention_selection_calls"] += 1
+    _SPARSE_STATS["attention_selected_blocks"] += selection.count
+    return selection
 
 
 def _normalize_selection(selected_logical_blocks: Sequence[int],

@@ -192,6 +192,110 @@ class PagedAttention:
         return output
 
     @staticmethod
+    def forward_decode_selected(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        selected_block_indices: torch.Tensor,
+        selected_count: int,
+        selected_seq_len: int,
+        kv_cache_dtype: str,
+        num_kv_heads: int,
+        scale: float,
+        alibi_slopes: Optional[torch.Tensor],
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        tp_rank: int = 0,
+    ) -> torch.Tensor:
+        """Decode directly from a GPU logical selected-block list.
+
+        ``block_tables`` remains the allocator-owned logical-to-physical table;
+        the selected kernels resolve each logical index inside CUDA and never
+        materialize a compact table.
+        """
+        if query.ndim != 3 or query.shape[0] != 1:
+            raise ValueError("selected paged attention requires batch size one")
+        if block_tables.ndim != 2 or block_tables.shape[0] != 1:
+            raise ValueError("selected paged attention requires one block table")
+        if (not selected_block_indices.is_cuda
+                or selected_block_indices.dtype != torch.int32
+                or selected_block_indices.ndim != 1
+                or not selected_block_indices.is_contiguous()):
+            raise ValueError(
+                "selected block indices must be a contiguous CUDA int32 tensor")
+        if not isinstance(selected_count, int) or selected_count <= 0:
+            raise ValueError("selected_count must be a positive Python int")
+        if selected_count > selected_block_indices.numel():
+            raise ValueError("selected_count exceeds the selection buffer")
+        if selected_seq_len <= 0:
+            raise ValueError("selected_seq_len must be positive")
+
+        output = torch.empty_like(query)
+        block_size = value_cache.shape[3]
+        max_num_partitions = ((selected_seq_len + _PARTITION_SIZE - 1) //
+                              _PARTITION_SIZE)
+        use_v1 = (selected_seq_len <= 8192
+                  and (max_num_partitions == 1 or query.shape[1] > 512))
+        if use_v1:
+            ops.paged_attention_selected_v1(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                scale,
+                block_tables,
+                seq_lens,
+                selected_block_indices,
+                selected_count,
+                block_size,
+                selected_seq_len,
+                alibi_slopes,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                tp_rank,
+            )
+        else:
+            assert _PARTITION_SIZE % block_size == 0
+            tmp_output = torch.empty(
+                size=(1, query.shape[1], max_num_partitions, query.shape[2]),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            exp_sums = torch.empty(
+                size=(1, query.shape[1], max_num_partitions),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            max_logits = torch.empty_like(exp_sums)
+            ops.paged_attention_selected_v2(
+                output,
+                exp_sums,
+                max_logits,
+                tmp_output,
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                scale,
+                block_tables,
+                seq_lens,
+                selected_block_indices,
+                selected_count,
+                block_size,
+                selected_seq_len,
+                alibi_slopes,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                tp_rank,
+            )
+        return output
+
+    @staticmethod
     def forward_prefix(
         query: torch.Tensor,
         key: torch.Tensor,
