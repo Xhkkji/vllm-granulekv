@@ -206,6 +206,11 @@ def main() -> None:
     full_blocks = (sparse_stats["full_blocks"]
                    if sparse_stats is not None else
                    full_blocks_per_run * max(1, len(decode_samples)))
+    decode_p50 = (statistics.median(decode_samples)
+                  if decode_samples else None)
+    decode_p95 = (sorted(decode_samples)[min(
+        len(decode_samples) - 1, int(len(decode_samples) * 0.95))]
+                  if decode_samples else None)
     payload = {
         "strategy": f"{args.mode}_resident_attention",
         "model": args.model,
@@ -238,16 +243,10 @@ def main() -> None:
                 item["prefill_ms"] is not None for item in samples) else None,
         "decode_ms_per_token": statistics.mean(decode_samples)
         if decode_samples else None,
-        "decode_p50_ms_per_token": statistics.median(decode_samples)
-        if decode_samples else None,
-        "decode_p95_ms_per_token": (sorted(decode_samples)[min(
-            len(decode_samples) - 1, int(len(decode_samples) * 0.95))]
-                                     if decode_samples else None),
-        "decode_p50_ms": statistics.median(decode_samples)
-        if decode_samples else None,
-        "decode_p95_ms": (sorted(decode_samples)[min(
-            len(decode_samples) - 1, int(len(decode_samples) * 0.95))]
-                           if decode_samples else None),
+        "decode_p50_ms_per_token": decode_p50,
+        "decode_p95_ms_per_token": decode_p95,
+        "decode_p50_ms": decode_p50,
+        "decode_p95_ms": decode_p95,
         "total_generation_ms": statistics.mean(
             item["elapsed_ms"] for item in samples),
         "throughput": statistics.mean(item["throughput"] for item in samples),

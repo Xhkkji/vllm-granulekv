@@ -62,7 +62,6 @@ class SolidAttentionPolicy:
             dict)
         self._representatives: Dict[
             str, Dict[int, Tuple[int, torch.Tensor]]] = defaultdict(dict)
-        self._page_index_keys: Dict[str, str] = {}
         self._seen: set[tuple[str, int]] = set()
         self._attention_selection_buffers: Dict[
             str, Dict[int, _AttentionSelectionState]] = defaultdict(dict)
@@ -232,7 +231,8 @@ class SolidAttentionPolicy:
             page_representatives.shape[0], page_representatives.detach())
 
     def bind_page_index_key(self, request_id: str, page_index_key: str) -> None:
-        self._page_index_keys[request_id] = page_index_key
+        """Keep the policy protocol; SolidAttention has no page-key state."""
+        return None
 
     def _select_blocks_device_impl(
         self,
@@ -386,5 +386,4 @@ class SolidAttentionPolicy:
         self._previous_queries.pop(request_id, None)
         self._representatives.pop(request_id, None)
         self._attention_selection_buffers.pop(request_id, None)
-        self._page_index_keys.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}
