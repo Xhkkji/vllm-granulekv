@@ -23,6 +23,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode",
                         choices=("dense", "quest", "solidattention"),
                         required=True)
+    parser.add_argument(
+        "--selected-blocks",
+        action="store_true",
+        help="Use SolidAttention's selected-list CUDA kernel path.")
+    parser.add_argument(
+        "--selection-reuse",
+        choices=("on", "off"),
+        default="on",
+        help="Reuse SolidAttention selection within one logical block.")
     parser.add_argument("--context-length", type=int, required=True)
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument("--page-size", type=int, default=16)
@@ -44,6 +53,11 @@ def _configure(args: argparse.Namespace, block_budget: int) -> None:
     os.environ["VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE"] = (
         "1" if args.mode != "dense" else "0")
+    os.environ["VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE"] = (
+        "1" if args.selected_blocks and args.mode == "solidattention" else
+        "0")
+    os.environ["VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE"] = (
+        "1" if args.selection_reuse == "on" else "0")
     os.environ["VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET"] = str(block_budget)
     if args.mode != "dense":
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "1"
@@ -97,6 +111,8 @@ def main() -> None:
     args = _parse_args()
     if args.context_length <= 0 or args.decode_tokens <= 0:
         raise ValueError("context-length and decode-tokens must be positive")
+    if args.selected_blocks and args.mode != "solidattention":
+        raise ValueError("--selected-blocks requires solidattention mode")
     if args.page_size <= 0 or args.context_length % args.page_size != 0:
         raise ValueError("context-length must be divisible by positive page-size")
     if args.mode != "dense" and args.block_budget <= 0:
@@ -161,11 +177,25 @@ def main() -> None:
             "metadata_build_calls": stats.get("metadata_build_calls", 0),
             "metadata_build_blocks": stats.get("metadata_build_blocks", 0),
             "gpu_selection_calls": stats.get("gpu_selection_calls", 0),
+            "attention_selection_calls": stats.get(
+                "attention_selection_calls", 0),
+            "attention_selection_refreshes": stats.get(
+                "attention_selection_refreshes", 0),
+            "attention_selection_cache_hits": stats.get(
+                "attention_selection_cache_hits", 0),
+            "attention_selected_blocks": stats.get(
+                "attention_selected_blocks", 0),
             "selected_ratio": stats.get("selected_ratio", 0.0),
             "gpu_memory_allocated": stats.get("gpu_memory_allocated"),
             "gpu_memory_reserved": stats.get("gpu_memory_reserved"),
             "gpu_max_memory_allocated": stats.get("gpu_max_memory_allocated"),
         }
+        if sparse_stats["attention_selection_calls"]:
+            sparse_stats["selected_blocks"] = sparse_stats[
+                "attention_selected_blocks"]
+            sparse_stats["selected_ratio"] = (
+                sparse_stats["selected_blocks"] /
+                max(1, sparse_stats["full_blocks"]))
     del llm
     decode_samples = [item["decode_ms_per_token"] for item in samples
                       if item["decode_ms_per_token"] is not None]
@@ -189,6 +219,8 @@ def main() -> None:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "granulekv_enabled": False,
+        "selected_blocks_kernel": bool(args.selected_blocks),
+        "selection_reuse": args.selection_reuse,
         "selected_blocks": selected_blocks,
         "full_blocks": full_blocks,
         "selected_ratio": selected_blocks / max(1, full_blocks),

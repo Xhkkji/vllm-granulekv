@@ -29,7 +29,7 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.attention.ops.sparse_kv import (
     build_selected_decode_block_table, select_and_compact_decode_blocks,
-    validate_sparse_kv_device_selection)
+    record_sparse_kv_attention, validate_sparse_kv_device_selection)
 from vllm.core.custom_schedulers.hierarchical_io import (
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
     get_sparse_kv_policy, register_sparse_page_representatives,
@@ -1275,6 +1275,10 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                         selected_attention_seq_len = (
                             selection.count * block_size -
                             (block_size - tail_tokens))
+                        record_sparse_kv_attention(
+                            (sequence_length + block_size - 1) // block_size,
+                            selection.count,
+                            selected_attention_seq_len)
                     else:
                         block_tables_arg, selected_seq_len, active_sparse_blocks = (
                             select_and_compact_decode_blocks(

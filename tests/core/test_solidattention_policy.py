@@ -81,6 +81,68 @@ def test_solidattention_attention_buffer_is_reused_and_grows():
     assert "r" not in policy._attention_selection_buffers
 
 
+def test_solidattention_reuses_selection_within_block(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE", True)
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    query = torch.ones(1, 2, 4, device="cuda")
+    key_cache = torch.randn(16, 2, 4, 4, device="cuda")
+    physical_ids = torch.arange(16, dtype=torch.long, device="cuda")
+
+    warmup = policy.select_attention_blocks_device(
+        "r", 0, query, key_cache, physical_ids, 24, 4, 2)
+    refreshed = policy.select_attention_blocks_device(
+        "r", 0, -query, key_cache, physical_ids, 25, 4, 2)
+    reused = policy.select_attention_blocks_device(
+        "r", 0, query * 3, key_cache, physical_ids, 26, 4, 2)
+
+    assert warmup.count == 6
+    assert refreshed.count == reused.count
+    assert refreshed.logical_block_indices.data_ptr() == (
+        reused.logical_block_indices.data_ptr())
+    assert torch.equal(refreshed.logical_block_indices[:refreshed.count],
+                       reused.logical_block_indices[:reused.count])
+
+
+def test_solidattention_refreshes_when_sequence_enters_new_block(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE", True)
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    query = torch.ones(1, 2, 4, device="cuda")
+    key_cache = torch.randn(16, 2, 4, 4, device="cuda")
+    physical_ids = torch.arange(16, dtype=torch.long, device="cuda")
+
+    policy.select_attention_blocks_device(
+        "r", 0, query, key_cache, physical_ids, 24, 4, 2)
+    within = policy.select_attention_blocks_device(
+        "r", 0, query, key_cache, physical_ids, 26, 4, 2)
+    within_last = within.logical_block_indices[within.count - 1].item()
+    crossed = policy.select_attention_blocks_device(
+        "r", 0, query, key_cache, physical_ids, 29, 4, 2)
+
+    assert within_last == 6
+    assert crossed.logical_block_indices[crossed.count - 1].item() == 7
+    assert policy._attention_selection_buffers["r"][0].num_blocks == 8
+
+
+def test_solidattention_gqa_score_matches_expanded_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    query = torch.randn(28, 8, device="cuda")
+    representatives = torch.randn(7, 2, 4, 8, device="cuda")
+    lower, upper = representatives[:, 0], representatives[:, 1]
+    expanded = representatives.repeat_interleave(7, dim=2)
+    chosen = torch.where(query.unsqueeze(0) >= 0, expanded[:, 1],
+                         expanded[:, 0])
+    expected = torch.einsum("hd,phd->hp", query, chosen)
+    actual = SolidAttentionPolicy._score_pages(query, representatives)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_solidattention_restore_prediction_is_prefix_only():
     policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
     policy.observe_query("r", 0, torch.ones(2, 2))

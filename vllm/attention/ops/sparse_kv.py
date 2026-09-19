@@ -23,6 +23,8 @@ _SPARSE_STATS: dict[str, int] = {
     "metadata_build_blocks": 0,
     "gpu_selection_calls": 0,
     "attention_selection_calls": 0,
+    "attention_selection_refreshes": 0,
+    "attention_selection_cache_hits": 0,
     "attention_selected_blocks": 0,
 }
 
@@ -39,6 +41,25 @@ def reset_sparse_kv_stats() -> None:
     """Reset counters after benchmark warmup."""
     for name in _SPARSE_STATS:
         _SPARSE_STATS[name] = 0
+
+
+def record_sparse_kv_selection(refresh: bool) -> None:
+    """Record whether an attention selection refreshed or reused its cache."""
+    if not refresh:
+        _SPARSE_STATS["attention_selection_cache_hits"] += 1
+        return
+    _SPARSE_STATS["attention_selection_refreshes"] += 1
+
+
+def record_sparse_kv_attention(full_blocks: int, selected_blocks: int,
+                               selected_tokens: int) -> None:
+    """Record one selected-list attention call without changing selection."""
+    if full_blocks <= 0 or selected_blocks <= 0 or selected_tokens <= 0:
+        raise ValueError("sparse attention statistics must be positive")
+    _SPARSE_STATS["calls"] += 1
+    _SPARSE_STATS["full_blocks"] += full_blocks
+    _SPARSE_STATS["selected_blocks"] += selected_blocks
+    _SPARSE_STATS["selected_tokens"] += selected_tokens
 
 
 @dataclass(frozen=True)
