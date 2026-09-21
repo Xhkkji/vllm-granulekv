@@ -5,6 +5,9 @@ import torch
 
 from evaluation.paper_reproduction.solidattention.adapter import (
     SolidAttentionPolicy, )
+from vllm.core.custom_schedulers.hierarchical_io import (
+    build_sparse_restore_plan_feedback, configure_sparse_kv_policy,
+    discard_sparse_restore_context, register_sparse_restore_context)
 
 
 def _representatives(num_pages: int = 8) -> torch.Tensor:
@@ -152,3 +155,70 @@ def test_solidattention_restore_prediction_is_prefix_only():
     assert prediction == tuple(sorted(set(prediction)))
     assert min(prediction) >= 0
     assert max(prediction) < 8
+
+
+def test_solidattention_prediction_uses_stable_page_key():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.bind_page_index_key("request", "prefix")
+    policy.register_page_representatives(
+        "prefix", 0, _representatives(4), tuple(range(4)))
+    policy.observe_query("request", 0, torch.ones(2, 2))
+
+    prediction = policy.predict_restore_blocks("request", 0, 4, 1)
+
+    assert prediction is not None
+    assert prediction == tuple(sorted(set(prediction)))
+    assert set(prediction).issubset(set(range(4)))
+    policy.discard("request")
+    assert "request" not in policy._page_index_keys
+
+
+def test_solidattention_prediction_respects_logical_representative_indices():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.bind_page_index_key("request", "prefix")
+    policy.register_page_representatives(
+        "prefix", 0, _representatives(4), (0, 2, 3, 4))
+    policy.observe_query("request", 0, torch.ones(2, 2))
+
+    prediction = policy.predict_restore_blocks("request", 0, 5, 1)
+
+    assert prediction is not None
+    assert set(prediction).issubset({0, 2, 3, 4})
+    assert max(prediction) < 5
+
+
+def test_solidattention_residency_check_bypasses_request_warmup():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.bind_page_index_key("request", "prefix")
+    policy.register_page_representatives(
+        "prefix", 0, _representatives(4), tuple(range(4)))
+
+    selected = policy.select_blocks_for_residency_check(
+        "request", 0, torch.ones(2, 2), 5, 1)
+
+    assert selected != tuple(range(5))
+    assert selected[-1] == 4
+
+
+def test_solidattention_feedback_compiles_per_layer_prefix_plan():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    configure_sparse_kv_policy(policy)
+    try:
+        policy.bind_page_index_key("request", "prefix")
+        for layer_index in range(2):
+            policy.register_page_representatives(
+                "prefix", layer_index, _representatives(4), tuple(range(4)))
+            policy.observe_query("request", layer_index, torch.ones(2, 2))
+            register_sparse_restore_context("request", "prefix", 4,
+                                            (layer_index, layer_index + 1))
+
+        feedback = build_sparse_restore_plan_feedback("request", 1)
+
+        assert feedback is not None
+        assert feedback.page_index_key == "prefix"
+        assert feedback.num_layers == 2
+        assert all(max(selection) < 4
+                   for selection in feedback.block_indices_by_layer)
+    finally:
+        discard_sparse_restore_context(("request", ))
+        configure_sparse_kv_policy(None)

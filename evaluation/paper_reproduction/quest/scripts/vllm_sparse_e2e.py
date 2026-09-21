@@ -84,6 +84,7 @@ def main() -> None:
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
+    from vllm.attention.ops.sparse_kv import sparse_kv_stats
     from vllm.utils import Device
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
@@ -152,6 +153,7 @@ def main() -> None:
         "second_output_tokens": len(second[0].outputs[0].token_ids),
         "third_elapsed_ms": third_elapsed_ms,
         "third_output_tokens": third_output_tokens,
+        "sparse_stats": sparse_kv_stats(),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

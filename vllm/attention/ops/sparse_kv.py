@@ -26,6 +26,13 @@ _SPARSE_STATS: dict[str, int] = {
     "attention_selection_refreshes": 0,
     "attention_selection_cache_hits": 0,
     "attention_selected_blocks": 0,
+    "prediction_calls": 0,
+    "prediction_predicted_blocks": 0,
+    "prediction_actual_blocks": 0,
+    "prediction_miss": 0,
+    "prediction_hit_blocks": 0,
+    "prediction_miss_blocks": 0,
+    "prediction_wasted_blocks": 0,
 }
 
 
@@ -49,6 +56,84 @@ def record_sparse_kv_selection(refresh: bool) -> None:
         _SPARSE_STATS["attention_selection_cache_hits"] += 1
         return
     _SPARSE_STATS["attention_selection_refreshes"] += 1
+
+
+def validate_sparse_kv_prediction(
+    *,
+    predicted_prefix_blocks: Sequence[int],
+    actual_prefix_blocks: Sequence[int],
+    resident_blocks: Sequence[int],
+    num_prefix_blocks: int,
+    request_id: str,
+    layer_index: int,
+) -> None:
+    """Record and validate a frozen prefix prediction before consumption.
+
+    This is intentionally a control-plane check for dynamic restore.  It is
+    not called by the resident-only selected-list path.
+    """
+    if num_prefix_blocks <= 0:
+        raise ValueError("prediction validation requires immutable prefix blocks")
+
+    def normalize(indices: Sequence[int]) -> set[int]:
+        normalized = {int(index) for index in indices}
+        if any(index < 0 or index >= num_prefix_blocks
+               for index in normalized):
+            raise ValueError(
+                "prediction block is outside the immutable prefix")
+        return normalized
+
+    predicted = normalize(predicted_prefix_blocks)
+    actual = normalize(actual_prefix_blocks)
+    resident = normalize(resident_blocks)
+    missing = actual.difference(resident)
+    _SPARSE_STATS["prediction_calls"] += 1
+    _SPARSE_STATS["prediction_predicted_blocks"] += len(predicted)
+    _SPARSE_STATS["prediction_actual_blocks"] += len(actual)
+    _SPARSE_STATS["prediction_hit_blocks"] += len(actual.intersection(resident))
+    _SPARSE_STATS["prediction_miss_blocks"] += len(missing)
+    _SPARSE_STATS["prediction_wasted_blocks"] += len(predicted.difference(actual))
+    if missing:
+        _SPARSE_STATS["prediction_miss"] += 1
+        missing_indices = tuple(sorted(missing))
+        raise RuntimeError(
+            "SolidAttention prediction_miss: "
+            f"request={request_id} layer={layer_index} "
+            f"missing_prefix_blocks={missing_indices}")
+
+
+def validate_sparse_kv_policy_prediction(
+    policy: object,
+    *,
+    request_id: str,
+    layer_index: int,
+    query: torch.Tensor,
+    num_blocks: int,
+    block_budget: int,
+    resident_blocks: Sequence[int],
+) -> bool:
+    """Run an optional policy selector against a dynamic resident set."""
+    selector = getattr(policy, "select_blocks_for_residency_check", None)
+    if not callable(selector):
+        return False
+    actual = selector(request_id, layer_index, query, num_blocks,
+                      block_budget)
+    prefix_count = max(0, num_blocks - 1)
+    predicted_prefix = tuple(
+        int(index) for index in resident_blocks if int(index) < prefix_count)
+    actual_prefix = tuple(
+        int(index) for index in actual if int(index) < prefix_count)
+    resident_prefix = tuple(
+        int(index) for index in resident_blocks if int(index) < prefix_count)
+    validate_sparse_kv_prediction(
+        predicted_prefix_blocks=predicted_prefix,
+        actual_prefix_blocks=actual_prefix,
+        resident_blocks=resident_prefix,
+        num_prefix_blocks=prefix_count,
+        request_id=request_id,
+        layer_index=layer_index,
+    )
+    return True
 
 
 def record_sparse_kv_attention(full_blocks: int, selected_blocks: int,

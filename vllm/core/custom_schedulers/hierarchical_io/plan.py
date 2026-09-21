@@ -273,6 +273,11 @@ class PrefetchPlan:
     access_plan: Optional[SparseKVAccessPlan] = None
     # Default false preserves the old non-dense profiling-only behavior.
     consumer_enabled: bool = False
+    # False preserves fixed-window union semantics.  True means units were
+    # split at every change of the per-layer prefix selection.
+    exact_grouped: bool = False
+    # Human-readable mode used by logs and experiment aggregation.
+    restore_mode: str = "window_union"
 
     @property
     def first_unit(self) -> PrefetchUnit:
@@ -458,6 +463,7 @@ class HierarchicalIOConfig:
     block_selector: PrefetchBlockSelectorConfig = (
         PrefetchBlockSelectorConfig())
     consumer_enabled: bool = False
+    exact_restore: bool = False
 
     @classmethod
     def from_env(
@@ -493,7 +499,13 @@ class HierarchicalIOConfig:
                        values),
                    consumer_enabled=bool(
                        int(_env(values, "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE",
-                                "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", "0"))))
+                                "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", "0"))),
+                   exact_restore=bool(
+                       int(_env(
+                           values,
+                           "VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE",
+                           "VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE",
+                           "0"))))
 
     def build_plan(
         self,
@@ -509,7 +521,8 @@ class HierarchicalIOConfig:
                                         block_selector=self.block_selector,
                                         num_blocks=num_blocks,
                                         access_plan=access_plan,
-                                        consumer_enabled=self.consumer_enabled)
+                                        consumer_enabled=self.consumer_enabled,
+                                        exact_grouped=self.exact_restore)
 
 
 def build_layer_restore_plan(
@@ -523,6 +536,7 @@ def build_layer_restore_plan(
     num_blocks: Optional[int] = None,
     access_plan: Optional[SparseKVAccessPlan] = None,
     consumer_enabled: bool = False,
+    exact_grouped: bool = False,
 ) -> PrefetchPlan:
     """按模型执行顺序生成连续、无重叠、无空洞的 layer windows。"""
     if not plan_id:
@@ -553,20 +567,43 @@ def build_layer_restore_plan(
             raise ValueError("access plan block count does not match prefix")
         block_indices_by_unit = access_plan
 
-    units = tuple(
-        PrefetchUnit(index=index,
-                     start_layer=start,
-                     end_layer=min(start + window_layers, num_layers),
-                     block_indices=(None if block_indices_by_unit is None else
-                                    block_indices_by_unit.blocks_for_range(
-                                        start,
-                                        min(start + window_layers,
-                                            num_layers))),
-                     consumer_blocks_by_layer=(
-                         None if access_plan is None else
-                         access_plan.block_indices_by_layer[
-                             start:min(start + window_layers, num_layers)]))
-        for index, start in enumerate(range(0, num_layers, window_layers)))
+    if exact_grouped and access_plan is not None:
+        # A unit is allowed to carry one exact prefix set only when every layer
+        # in its range consumes that same set.  This keeps SSD mapping exact;
+        # the per-layer consumer tuples still remain attached to the unit.
+        exact_units = []
+        start = 0
+        while start < num_layers:
+            selected = access_plan.blocks_for_layer(start)
+            end = start + 1
+            while (end < num_layers and end - start < window_layers
+                   and access_plan.blocks_for_layer(end) == selected):
+                end += 1
+            exact_units.append(
+                PrefetchUnit(
+                    index=len(exact_units),
+                    start_layer=start,
+                    end_layer=end,
+                    block_indices=selected,
+                    consumer_blocks_by_layer=(
+                        access_plan.block_indices_by_layer[start:end])))
+            start = end
+        units = tuple(exact_units)
+    else:
+        units = tuple(
+            PrefetchUnit(
+                index=index,
+                start_layer=start,
+                end_layer=min(start + window_layers, num_layers),
+                block_indices=(
+                    None if block_indices_by_unit is None else
+                    block_indices_by_unit.blocks_for_range(
+                        start, min(start + window_layers, num_layers))),
+                consumer_blocks_by_layer=(
+                    None if access_plan is None else
+                    access_plan.block_indices_by_layer[
+                        start:min(start + window_layers, num_layers)]))
+            for index, start in enumerate(range(0, num_layers, window_layers)))
     profiling_only = (access_plan is not None and not access_plan.is_dense)
     return PrefetchPlan(
         plan_id=plan_id,
@@ -579,4 +616,8 @@ def build_layer_restore_plan(
         profiling_only=profiling_only,
         access_plan=access_plan,
         consumer_enabled=consumer_enabled,
+        exact_grouped=(exact_grouped and access_plan is not None),
+        restore_mode=("exact_grouped"
+                      if exact_grouped and access_plan is not None else
+                      "window_union"),
     )

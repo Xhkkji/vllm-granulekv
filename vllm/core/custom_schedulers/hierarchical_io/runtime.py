@@ -295,6 +295,10 @@ class RollingPrefetchRuntime:
             block_size,
         )
 
+    def residency_stats(self) -> Dict[str, int]:
+        """Return physical residency miss counters for experiment reporting."""
+        return self.residency.stats()
+
     def forget_seq_groups(self, seq_group_ids: Sequence[str]) -> None:
         """在 vLLM 通知 request finished/abort 时回收 residency 元数据。"""
         self.residency.forget_seq_groups(seq_group_ids)

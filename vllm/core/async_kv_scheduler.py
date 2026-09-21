@@ -144,6 +144,12 @@ class AsyncKVScheduler(Scheduler):
                 and not self.hierarchical_layer_barrier_config.enabled):
             raise ValueError(
                 "rolling hierarchical I/O requires the layer barrier")
+        if (self.hierarchical_io_config.exact_restore
+                and self.hierarchical_layer_barrier_config.enabled
+                and not self.hierarchical_io_config.rolling.enabled):
+            raise ValueError(
+                "exact sparse restore requires rolling hierarchical I/O when "
+                "the layer barrier is enabled")
         if self.hierarchical_io_config.consumer_enabled:
             if not self.hierarchical_layer_barrier_config.enabled:
                 raise ValueError(
@@ -172,10 +178,12 @@ class AsyncKVScheduler(Scheduler):
         )
         logger.info(
             "[GRANULEKV_HIERARCHICAL] phase=init enabled=%s "
-            "num_layers=%d window_layers=%d dispatch_gate=%s",
+            "num_layers=%d window_layers=%d exact_grouped=%s "
+            "dispatch_gate=%s",
             self.hierarchical_io_config.enabled,
             self.hierarchical_io_config.num_layers,
             self.hierarchical_io_config.window_layers,
+            self.hierarchical_io_config.exact_restore,
             ("layer_barrier"
              if self.hierarchical_layer_barrier_config.enabled else "closed"),
         )
@@ -453,6 +461,8 @@ class AsyncKVScheduler(Scheduler):
         )
         requests = []
         selected_block_counts = []
+        selected_logical_counts = []
+        read_fragments_estimate = 0
         for unit in plan.units:
             # dense layer plan 的 block_indices 为 None，投影结果与历史逻辑
             # 完全一致。sparse-style selector 只改变 unit 的 block 选择，不
@@ -460,6 +470,8 @@ class AsyncKVScheduler(Scheduler):
             block_mapping, logical_blocks = select_prefetch_unit_blocks(
                 unit, reservation.block_mapping, reservation.logical_blocks)
             selected_block_counts.append(len(block_mapping))
+            selected_logical_counts.append(len(logical_blocks))
+            read_fragments_estimate += (len(block_mapping) * unit.num_layers * 2)
             if plan.consumer_enabled and plan.access_plan is None:
                 # Dense warmup is represented as a consumer-visible all-block
                 # residency set.  The I/O mapping may still omit blocks already
@@ -515,7 +527,9 @@ class AsyncKVScheduler(Scheduler):
             "[GRANULEKV_HIERARCHICAL] phase=plan_queued plan_id=%s "
             "seq_group_id=%s windows=%d blocks=%d selector=%s "
             "profiling_only=%s dynamic_restore=%s "
-            "selected_blocks_per_unit=%s",
+            "restore_mode=%s selected_blocks_per_unit=%s "
+            "selected_logical_blocks_per_unit=%s "
+            "unit_layer_ranges=%s read_fragments_estimate=%d",
             plan.plan_id,
             seq_group.request_id,
             len(plan.units),
@@ -523,7 +537,12 @@ class AsyncKVScheduler(Scheduler):
             plan.block_selector,
             plan.profiling_only,
             str(access_plan is not None).lower(),
+            plan.restore_mode,
             ",".join(str(count) for count in selected_block_counts),
+            ",".join(str(count) for count in selected_logical_counts),
+            ",".join(f"[{start},{end})" for start, end in
+                      (unit.layer_range for unit in plan.units)),
+            read_fragments_estimate,
         )
         for request, unit in zip(requests, plan.units):
             logger.info(

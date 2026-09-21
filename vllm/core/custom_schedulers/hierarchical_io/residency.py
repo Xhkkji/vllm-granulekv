@@ -40,6 +40,14 @@ class PrefetchResidencyDirectory:
 
     def __init__(self) -> None:
         self._units: Dict[str, _UnitResidency] = {}
+        self._stats = {
+            "residency_miss": 0,
+            "residency_miss_blocks": 0,
+        }
+
+    def stats(self) -> Dict[str, int]:
+        """Return physical residency counters for experiment reporting."""
+        return dict(self._stats)
 
     def register(self, request: AsyncKVTransferRequest) -> None:
         if request.prefetch_plan_id is None:
@@ -127,6 +135,10 @@ class PrefetchResidencyDirectory:
                             request.layer_range[1])):
                 continue
             if unit.evicted:
+                self._stats["residency_miss"] += 1
+                if unit.requested is not None:
+                    self._stats["residency_miss_blocks"] += len(
+                        unit.requested)
                 raise RuntimeError(
                     f"KV blocks were evicted before layer {layer_index}: "
                     f"{request.request_id}")
@@ -163,9 +175,13 @@ class PrefetchResidencyDirectory:
                         dynamic_tail)
             if (layer_selected is not None
                     and not layer_selected.issubset(unit.resident)):
+                missing = frozenset(layer_selected).difference(unit.resident)
+                self._stats["residency_miss"] += 1
+                self._stats["residency_miss_blocks"] += len(missing)
                 raise RuntimeError(
                     f"sparse KV residency is incomplete for layer "
-                    f"{layer_index}: request={request.request_id}")
+                    f"{layer_index}: request={request.request_id} "
+                    f"missing_blocks={tuple(sorted(missing))}")
             current = (None if layer_selected is None else
                        tuple(sorted(layer_selected)))
             if selected is not None and current != selected:

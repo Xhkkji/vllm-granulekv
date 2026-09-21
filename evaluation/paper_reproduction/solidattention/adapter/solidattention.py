@@ -42,6 +42,12 @@ class _AttentionSelectionState:
     ready: bool
 
 
+@dataclass(frozen=True)
+class _PredictionRepresentativeState:
+    logical_block_indices: Tuple[int, ...]
+    representatives: torch.Tensor
+
+
 class SolidAttentionPolicy:
     """Minimal SolidAttention-style policy for the shared sparse bridge.
 
@@ -62,6 +68,12 @@ class SolidAttentionPolicy:
             dict)
         self._representatives: Dict[
             str, Dict[int, Tuple[int, torch.Tensor]]] = defaultdict(dict)
+        # Prediction metadata is keyed by the stable prefix identity.  The
+        # resident-only attention path uses the request-keyed GPU cache above;
+        # it never consults this control-plane state.
+        self._page_index_keys: Dict[str, str] = {}
+        self._prediction_representatives: Dict[
+            str, Dict[int, _PredictionRepresentativeState]] = defaultdict(dict)
         self._seen: set[tuple[str, int]] = set()
         self._attention_selection_buffers: Dict[
             str, Dict[int, _AttentionSelectionState]] = defaultdict(dict)
@@ -156,6 +168,103 @@ class SolidAttentionPolicy:
         mask.scatter_(0, torch.cat((fixed, dynamic)), True)
         return torch.nonzero(mask, as_tuple=False).flatten()
 
+    def _select_prefix_with_logical_indices(
+        self,
+        query: torch.Tensor,
+        representatives: torch.Tensor,
+        logical_block_indices: Tuple[int, ...],
+        prefix_count: int,
+        block_budget: int,
+    ) -> torch.Tensor:
+        """Select a prefix when metadata carries explicit logical indices.
+
+        This helper is used by the control-plane prediction/check path.  The
+        resident GPU selector keeps its existing dense tensor path untouched.
+        """
+        if representatives.shape[0] != len(logical_block_indices):
+            raise ValueError(
+                "SolidAttention representative count does not match logical "
+                "block indices")
+        if any(index < 0 for index in logical_block_indices) or any(
+                left >= right for left, right in zip(
+                    logical_block_indices, logical_block_indices[1:])):
+            raise ValueError(
+                "SolidAttention logical block indices must be sorted and "
+                "unique")
+        if any(index >= prefix_count for index in logical_block_indices):
+            raise ValueError(
+                "SolidAttention representative is outside immutable prefix")
+        if query.device != representatives.device:
+            query = query.to(device=representatives.device)
+
+        prefix_count = max(0, prefix_count)
+        if prefix_count == 0:
+            return torch.empty(0, dtype=torch.long, device=query.device)
+        init_end = min(self.init_blocks, prefix_count)
+        local_start = max(init_end, prefix_count - self.local_blocks)
+        fixed = torch.cat((
+            torch.arange(init_end, dtype=torch.long, device=query.device),
+            torch.arange(local_start,
+                         prefix_count,
+                         dtype=torch.long,
+                         device=query.device),
+        ))
+        candidate_logical = tuple(
+            index for index in logical_block_indices
+            if init_end <= index < local_start)
+        if not candidate_logical:
+            return fixed
+        candidate_positions = tuple(
+            position for position, index in enumerate(logical_block_indices)
+            if init_end <= index < local_start)
+        positions = torch.tensor(candidate_positions,
+                                  dtype=torch.long,
+                                  device=representatives.device)
+        candidates = torch.tensor(candidate_logical,
+                                  dtype=torch.long,
+                                  device=representatives.device)
+        scores = self._score_pages(
+            query, representatives.index_select(0, positions))
+        dynamic = self._union_topk(scores, candidates, block_budget)
+        mask = torch.zeros(prefix_count,
+                           dtype=torch.bool,
+                           device=representatives.device)
+        mask.scatter_(0, torch.cat((fixed.to(mask.device), dynamic)), True)
+        return torch.nonzero(mask, as_tuple=False).flatten()
+
+    def _get_prediction_representatives(
+        self,
+        request_id: str,
+        layer_index: int,
+        num_prefix_blocks: int,
+    ) -> Optional[tuple[Tuple[int, ...], torch.Tensor]]:
+        page_index_key = self._page_index_keys.get(request_id, request_id)
+        state = self._prediction_representatives.get(page_index_key,
+                                                     {}).get(layer_index)
+        if state is None:
+            cached = self._representatives.get(page_index_key,
+                                               {}).get(layer_index)
+            if cached is None:
+                return None
+            cached_count, representatives = cached
+            logical_block_indices = tuple(range(cached_count))
+        else:
+            logical_block_indices = state.logical_block_indices
+            representatives = state.representatives
+        positions = tuple(
+            position for position, index in enumerate(logical_block_indices)
+            if index < num_prefix_blocks)
+        if not positions:
+            return None
+        if len(positions) != len(logical_block_indices):
+            position_tensor = torch.tensor(positions,
+                                           dtype=torch.long,
+                                           device=representatives.device)
+            representatives = representatives.index_select(0, position_tensor)
+            logical_block_indices = tuple(logical_block_indices[position]
+                                          for position in positions)
+        return logical_block_indices, representatives
+
     def _cached_representatives(self, request_id: str, layer_index: int,
                                 key_cache: torch.Tensor,
                                 physical_block_ids: torch.Tensor,
@@ -227,12 +336,34 @@ class SolidAttentionPolicy:
         page_representatives: torch.Tensor,
         logical_block_indices: Optional[Sequence[int]] = None,
     ) -> None:
+        if not isinstance(page_representatives, torch.Tensor):
+            raise TypeError("page_representatives must be a tensor")
+        if page_representatives.ndim not in (3, 4):
+            raise ValueError(
+                "SolidAttention representatives must have 3 or 4 dimensions")
+        logical = (tuple(range(page_representatives.shape[0]))
+                   if logical_block_indices is None else
+                   tuple(int(index) for index in logical_block_indices))
+        if len(logical) != page_representatives.shape[0]:
+            raise ValueError(
+                "logical block indices must match representative pages")
+        if any(index < 0 for index in logical) or any(
+                left >= right for left, right in zip(logical, logical[1:])):
+            raise ValueError(
+                "SolidAttention logical block indices must be sorted and "
+                "unique")
+        representatives = page_representatives.detach()
         self._representatives[request_id][layer_index] = (
-            page_representatives.shape[0], page_representatives.detach())
+            len(logical), representatives)
+        self._prediction_representatives[request_id][layer_index] = (
+            _PredictionRepresentativeState(logical, representatives))
 
     def bind_page_index_key(self, request_id: str, page_index_key: str) -> None:
-        """Keep the policy protocol; SolidAttention has no page-key state."""
-        return None
+        if not request_id or not page_index_key:
+            raise ValueError("request_id and page_index_key must not be empty")
+        # This mapping is only read by prediction/validation.  The resident
+        # selected-list path remains request-local and does not touch it.
+        self._page_index_keys[request_id] = page_index_key
 
     def _select_blocks_device_impl(
         self,
@@ -370,20 +501,62 @@ class SolidAttentionPolicy:
                               device=selected.device)
         return tuple(torch.cat((selected, suffix)).tolist())
 
+    def select_blocks_for_residency_check(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        num_blocks: int,
+        block_budget: int,
+    ) -> tuple[int, ...]:
+        """Select the current working set without request warmup.
+
+        Dynamic restore uses this control-plane check to detect a prediction
+        miss before the compact compatibility consumer reads KV.  It is not
+        used by resident-only selected-list attention.
+        """
+        if num_blocks <= 0 or block_budget <= 0:
+            raise ValueError("num_blocks and block_budget must be positive")
+        prefix_count = max(0, num_blocks - 1)
+        metadata = self._get_prediction_representatives(
+            request_id, layer_index, prefix_count)
+        if metadata is None:
+            raise RuntimeError(
+                "SolidAttention prediction validation lacks prefix metadata: "
+                f"request={request_id} layer={layer_index}")
+        logical, representatives = metadata
+        selected_prefix = self._select_prefix_with_logical_indices(
+            self._normalize_query(query), representatives, logical,
+            prefix_count, block_budget)
+        suffix = torch.arange(prefix_count,
+                              num_blocks,
+                              dtype=torch.long,
+                              device=selected_prefix.device)
+        return tuple(torch.cat((selected_prefix, suffix)).tolist())
+
     def predict_restore_blocks(self, request_id: str, layer_index: int,
                                num_prefix_blocks: int,
                                block_budget: int) -> Optional[Tuple[int, ...]]:
         history = self._previous_queries.get(request_id, {}).get(layer_index)
-        cached = self._representatives.get(request_id, {}).get(layer_index)
-        if history is None or cached is None:
+        if history is None:
             return None
-        _, representatives = cached
-        selected = self._select_prefix(history, representatives,
-                                       num_prefix_blocks, block_budget)
+        metadata = self._get_prediction_representatives(
+            request_id, layer_index, num_prefix_blocks)
+        if metadata is None:
+            return None
+        logical, representatives = metadata
+        selected = self._select_prefix_with_logical_indices(
+            history, representatives, logical, num_prefix_blocks, block_budget)
         return tuple(int(index) for index in selected.tolist())
 
     def discard(self, request_id: str) -> None:
+        page_index_key = self._page_index_keys.pop(request_id, None)
         self._previous_queries.pop(request_id, None)
         self._representatives.pop(request_id, None)
+        # Stable-prefix metadata is shared by requests using the same page
+        # key.  Request-local metadata is always removed; the stable entry is
+        # retained until a later prefix registration replaces it.
+        if page_index_key is None or page_index_key == request_id:
+            self._prediction_representatives.pop(request_id, None)
         self._attention_selection_buffers.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}

@@ -34,6 +34,17 @@ def test_layer_restore_plan_is_contiguous_and_default_disabled():
     assert all(unit.block_indices is None for unit in plan.units)
 
 
+def test_exact_restore_is_opt_in_in_hierarchical_config():
+    config = HierarchicalIOConfig.from_env({
+        "VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE": "1",
+        "VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS": "4",
+        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS": "2",
+        "VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE": "1",
+    })
+    assert config.exact_restore
+    assert not HierarchicalIOConfig.from_env({}).exact_restore
+
+
 def test_prefetch_unit_projects_dense_and_sparse_block_sets():
     """同一个接口应同时表达 layer 全量读取和未来 sparse 子集读取。"""
     mapping = ((10, 20), (11, 21), (12, 22), (13, 23))
@@ -116,6 +127,51 @@ def test_sparse_access_plan_keeps_per_layer_selection_and_window_union():
     assert plan.consumer_blocks_for_layer(0) == (0, 2)
     assert plan.consumer_blocks_for_layer(1) == (1, 2)
     assert plan.units[1].block_indices == (4, 7)
+
+
+def test_exact_restore_groups_only_adjacent_identical_layer_selections():
+    access = SparseKVAccessPlan(
+        num_layers=4,
+        num_blocks=8,
+        block_indices_by_layer=((0, 1), (0, 1), (0, 2), (0, 2)),
+        source="solidattention_dynamic",
+    )
+    plan = build_layer_restore_plan(
+        plan_id="solidattention-exact",
+        num_layers=4,
+        window_layers=3,
+        access_plan=access,
+        exact_grouped=True,
+        created_monotonic_ns=100,
+    )
+
+    assert plan.exact_grouped
+    assert plan.restore_mode == "exact_grouped"
+    assert [unit.layer_range for unit in plan.units] == [(0, 2), (2, 4)]
+    assert [unit.block_indices for unit in plan.units] == [(0, 1), (0, 2)]
+    assert plan.units[0].consumer_blocks_by_layer == ((0, 1), (0, 1))
+    assert plan.units[1].consumer_blocks_by_layer == ((0, 2), (0, 2))
+
+
+def test_exact_restore_respects_window_limit_and_covers_all_layers():
+    access = SparseKVAccessPlan(
+        num_layers=5,
+        num_blocks=4,
+        block_indices_by_layer=((1, 2), ) * 5,
+        source="solidattention_dynamic",
+    )
+    plan = build_layer_restore_plan(
+        plan_id="solidattention-exact-window",
+        num_layers=5,
+        window_layers=2,
+        access_plan=access,
+        exact_grouped=True,
+    )
+
+    assert [unit.layer_range for unit in plan.units] == [(0, 2), (2, 4),
+                                                          (4, 5)]
+    assert plan.units[-1].block_indices == (1, 2)
+    assert sum(unit.num_layers for unit in plan.units) == 5
 
 
 def test_sparse_access_plan_normalizes_dynamic_policy_output():
@@ -382,6 +438,32 @@ def test_sparse_residency_does_not_expand_selected_unit_to_all_blocks():
         max_active=1,
     )
     assert runtime.require_resident_layer(("seq-subset", ), 0) == (1, )
+
+
+def test_sparse_residency_miss_is_reported_separately_from_prediction():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _sparse_prefetch_request()
+    runtime.submit_or_stage(
+        0, request, "mapping",
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING))
+    runtime.wait_ready(
+        0,
+        ("seq-sparse", ),
+        0,
+        lambda _request, *_args: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.PENDING),
+        lambda _request: AsyncKVTransferEvent(
+            request.request_id, AsyncKVTransferState.READY),
+        max_active=1,
+    )
+    runtime.residency.evict_unit(request.request_id)
+    with pytest.raises(RuntimeError, match="evicted"):
+        runtime.require_resident_layer(("seq-sparse", ), 0)
+    assert runtime.residency_stats() == {
+        "residency_miss": 1,
+        "residency_miss_blocks": 2,
+    }
 
 
 def test_sparse_residency_adds_live_suffix_blocks_from_current_length():

@@ -5,7 +5,9 @@ import torch
 
 from vllm.attention.ops.sparse_kv import (
     SparseKVSelection, build_page_representatives_from_paged_key_cache,
-    build_selected_decode_block_table, select_and_compact_decode_blocks)
+    build_selected_decode_block_table, reset_sparse_kv_stats,
+    select_and_compact_decode_blocks, sparse_kv_stats,
+    validate_sparse_kv_prediction)
 
 
 def test_compact_block_table_accepts_gpu_selection():
@@ -106,6 +108,24 @@ def test_selection_dataclass_requires_sorted_unique_indices():
     assert SparseKVSelection((0, 2), "test").logical_block_indices == (0, 2)
     with pytest.raises(ValueError, match="sorted and unique"):
         SparseKVSelection((2, 1), "test")
+
+
+def test_prediction_validation_records_miss_without_dense_fallback():
+    reset_sparse_kv_stats()
+    with pytest.raises(RuntimeError, match="prediction_miss"):
+        validate_sparse_kv_prediction(
+            predicted_prefix_blocks=(0, 2, 3),
+            actual_prefix_blocks=(0, 1, 3),
+            resident_blocks=(0, 2, 3),
+            num_prefix_blocks=4,
+            request_id="request",
+            layer_index=2,
+        )
+    stats = sparse_kv_stats()
+    assert stats["prediction_calls"] == 1
+    assert stats["prediction_miss"] == 1
+    assert stats["prediction_miss_blocks"] == 1
+    assert stats["prediction_wasted_blocks"] == 1
 
 
 def test_page_representatives_from_four_dimensional_key_cache():
