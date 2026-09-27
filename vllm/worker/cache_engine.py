@@ -376,6 +376,19 @@ class CacheEngine:
         self._finish_async_kv_transfer_trace(request_id)
         return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY)
 
+    def cancel_async_kv_transfer(self, request_id: str) -> None:
+        """Release one timed-out async request through the connector."""
+        if self.granulekv_connector is None:
+            raise RuntimeError(
+                "async KV scheduling requires the resident GranuleKV connector")
+        if request_id not in self._granulekv_async_kv_traces:
+            raise RuntimeError(
+                f"CacheEngine has no async KV transfer: {request_id}")
+        try:
+            self.granulekv_connector.cancel_request(request_id)
+        finally:
+            self._granulekv_async_kv_traces.pop(request_id, None)
+
     def _finish_async_kv_transfer_trace(self, request_id: str) -> None:
         """在异步 read/write 完成后记录耗时并删除对应 trace。"""
         trace = self._granulekv_async_kv_traces.pop(request_id, None)

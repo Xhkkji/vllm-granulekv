@@ -12,9 +12,11 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
     HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
+    SparseKVLayerSelection,
     activate_layer_barrier, activate_sparse_kv_blocks,
-    build_layer_restore_plan, get_active_layer_sequence_lengths,
-    get_active_sparse_kv_blocks,
+    build_layer_restore_plan, correct_local_layer,
+    get_active_layer_sequence_lengths,
+    get_active_sparse_kv_blocks, get_active_sparse_kv_device_selection,
     get_layer_working_set_regions, release_local_layer,
     select_prefetch_unit_blocks,
     wait_for_local_layer)
@@ -127,6 +129,29 @@ def test_sparse_access_plan_keeps_per_layer_selection_and_window_union():
     assert plan.consumer_blocks_for_layer(0) == (0, 2)
     assert plan.consumer_blocks_for_layer(1) == (1, 2)
     assert plan.units[1].block_indices == (4, 7)
+
+
+def test_dynamic_window_union_builds_seven_four_layer_requests():
+    selections = tuple((layer % 8, (layer + 1) % 8)
+                       for layer in range(28))
+    normalized = tuple(tuple(sorted(selection)) for selection in selections)
+    access = SparseKVAccessPlan(
+        num_layers=28,
+        num_blocks=8,
+        block_indices_by_layer=normalized,
+        source="solidattention_dynamic",
+    )
+    plan = build_layer_restore_plan(
+        plan_id="solidattention-window-union",
+        num_layers=28,
+        window_layers=4,
+        access_plan=access,
+    )
+
+    assert plan.restore_mode == "window_union"
+    assert len(plan.units) == 7
+    assert all(unit.num_layers == 4 for unit in plan.units)
+    assert plan.consumer_blocks_for_layer(13) == normalized[13]
 
 
 def test_exact_restore_groups_only_adjacent_identical_layer_selections():
@@ -278,6 +303,33 @@ def test_layer_barrier_reports_consumption_after_wait():
     assert [event[0] for event in events] == ["wait", "release"]
 
 
+def test_layer_barrier_correction_replaces_active_working_set():
+    with activate_layer_barrier(
+            lambda *_args: (0, 2),
+            virtual_engine=0,
+            request_ids=("request-0", ),
+            correction_callback=lambda _engine, _requests, layer, _query:
+            (1, layer)):
+        with activate_sparse_kv_blocks((0, 2)):
+            assert correct_local_layer(3, object()) == (1, 3)
+            assert get_active_sparse_kv_blocks() == (1, 3)
+
+
+def test_layer_barrier_exposes_and_clears_device_selection():
+    device_selection = object()
+    assert get_active_sparse_kv_device_selection() is None
+    with activate_layer_barrier(
+            lambda *_args: (0, 2),
+            virtual_engine=0,
+            request_ids=("request-0", ),
+            correction_callback=lambda *_args: SparseKVLayerSelection(
+                (1, 3), device_selection, True)):
+        with activate_sparse_kv_blocks((0, 2)):
+            assert correct_local_layer(3, object()) == (1, 3)
+            assert get_active_sparse_kv_device_selection() is device_selection
+    assert get_active_sparse_kv_device_selection() is None
+
+
 def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
     return AsyncKVTransferRequest(
         request_id=f"unit-{index}",
@@ -308,6 +360,32 @@ def _sparse_prefetch_request() -> AsyncKVTransferRequest:
         prefetch_unit_index=0,
         consumer_block_indices=(0, 3),
         consumer_blocks_by_layer=((0, ), (3, )),
+    )
+
+
+def _correction_prefetch_request(layer_index: int,
+                                 *, first: bool) -> AsyncKVTransferRequest:
+    return AsyncKVTransferRequest(
+        request_id=f"correction-unit-{layer_index}",
+        seq_group_id="seq-correction",
+        reservation_id="reservation-correction",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((10, 20), ),
+        logical_blocks=(LogicalBlockKey(11, 0), ),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(layer_index, layer_index + 1),
+        prefetch_plan_id="plan-correction",
+        prefetch_unit_index=layer_index,
+        consumer_block_indices=(0, 3),
+        consumer_blocks_by_layer=((0, 3), ),
+        consumer_num_blocks=5,
+        consumer_local_block_start=4,
+        correction_block_mapping=(
+            ((10, 20), (11, 21), (12, 22)) if first else None),
+        correction_logical_blocks=(
+            tuple(LogicalBlockKey(11, index) for index in range(3))
+            if first else None),
+        activate_on_submit=first,
     )
 
 
@@ -464,6 +542,131 @@ def test_sparse_residency_miss_is_reported_separately_from_prediction():
         "residency_miss": 1,
         "residency_miss_blocks": 2,
     }
+
+
+def test_single_layer_correction_updates_only_current_layer():
+    runtime = RollingPrefetchRuntime(
+        RollingPrefetchConfig(lead_units=0, max_lead_units=0))
+    first = _correction_prefetch_request(0, first=True)
+    second = _correction_prefetch_request(1, first=False)
+
+    def pending(request, _mapping):
+        return AsyncKVTransferEvent(request.request_id,
+                                    AsyncKVTransferState.PENDING)
+
+    def ready(request):
+        return AsyncKVTransferEvent(request.request_id,
+                                    AsyncKVTransferState.READY)
+
+    runtime.submit_or_stage(0, first, first.block_mapping, pending)
+    runtime.submit_or_stage(0, second, second.block_mapping, pending)
+    assert runtime.prediction_restore_stats() == {
+        "prediction_restore_requests": 2,
+        "prediction_restore_blocks": 2,
+        "prediction_restore_fragments": 4,
+    }
+    runtime.wait_ready(0, ("seq-correction", ), 0, pending, ready,
+                       max_active=2)
+    state = runtime.prediction_state(("seq-correction", ), 0)
+    assert state is not None
+    assert state.predicted_prefix_blocks == (0, 3)
+    assert state.resident_prefix_blocks == (0, 3)
+
+    submitted = []
+
+    def correction_submit(request, mapping):
+        submitted.append((request, mapping))
+        return AsyncKVTransferEvent(request.request_id,
+                                    AsyncKVTransferState.PENDING)
+
+    result = runtime.correct_layer(
+        0,
+        state,
+        0,
+        (1, ),
+        tuple,
+        correction_submit,
+        ready,
+        max_active=2,
+        timeout_seconds=1.0,
+    )
+    assert result.block_count == 1
+    request, mapping = submitted[0]
+    assert request.layer_range == (0, 1)
+    assert mapping == ((11, 21), )
+    assert [key.logical_index for key in request.logical_blocks] == [1]
+    layer_zero = runtime.prediction_state(("seq-correction", ), 0)
+    layer_one = runtime.prediction_state(("seq-correction", ), 1)
+    assert layer_zero is not None and layer_one is not None
+    assert layer_zero.resident_prefix_blocks == (0, 1, 3)
+    assert layer_one.resident_prefix_blocks == (3, )
+
+
+def test_single_layer_correction_error_does_not_publish_residency():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _correction_prefetch_request(0, first=True)
+    runtime.submit_or_stage(
+        0, request, request.block_mapping,
+        lambda current, _mapping: AsyncKVTransferEvent(
+            current.request_id, AsyncKVTransferState.READY))
+    state = runtime.prediction_state(("seq-correction", ), 0)
+    assert state is not None
+    with pytest.raises(RuntimeError, match="correction failed"):
+        runtime.correct_layer(
+            0,
+            state,
+            0,
+            (1, ),
+            tuple,
+            lambda current, _mapping: AsyncKVTransferEvent(
+                current.request_id, AsyncKVTransferState.ERROR, "io error"),
+            lambda current: AsyncKVTransferEvent(
+                current.request_id, AsyncKVTransferState.ERROR, "io error"),
+            max_active=1,
+            timeout_seconds=1.0,
+        )
+    after = runtime.prediction_state(("seq-correction", ), 0)
+    assert after is not None
+    assert after.resident_prefix_blocks == (0, 3)
+
+
+def test_single_layer_correction_accepts_immediate_ready():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _correction_prefetch_request(0, first=True)
+    immediate = lambda current, *_args: AsyncKVTransferEvent(
+        current.request_id, AsyncKVTransferState.READY)
+    runtime.submit_or_stage(0, request, request.block_mapping, immediate)
+    state = runtime.prediction_state(("seq-correction", ), 0)
+    assert state is not None
+    result = runtime.correct_layer(
+        0, state, 0, (2, ), tuple, immediate, immediate,
+        max_active=1, timeout_seconds=1.0)
+    assert result.block_count == 1
+    after = runtime.prediction_state(("seq-correction", ), 0)
+    assert after is not None
+    assert after.resident_prefix_blocks == (0, 2, 3)
+
+
+def test_single_layer_correction_timeout_keeps_block_nonresident():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _correction_prefetch_request(0, first=True)
+    immediate = lambda current, *_args: AsyncKVTransferEvent(
+        current.request_id, AsyncKVTransferState.READY)
+    runtime.submit_or_stage(0, request, request.block_mapping, immediate)
+    state = runtime.prediction_state(("seq-correction", ), 0)
+    assert state is not None
+    pending = lambda current, *_args: AsyncKVTransferEvent(
+        current.request_id, AsyncKVTransferState.PENDING)
+    cancelled = []
+    with pytest.raises(TimeoutError, match="timed out"):
+        runtime.correct_layer(
+            0, state, 0, (2, ), tuple, pending, pending,
+            lambda current: cancelled.append(current.request_id),
+            max_active=1, timeout_seconds=0.001, sleep_seconds=0.0001)
+    assert len(cancelled) == 1
+    after = runtime.prediction_state(("seq-correction", ), 0)
+    assert after is not None
+    assert after.resident_prefix_blocks == (0, 3)
 
 
 def test_sparse_residency_adds_live_suffix_blocks_from_current_length():

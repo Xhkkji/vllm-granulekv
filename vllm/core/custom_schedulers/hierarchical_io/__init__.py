@@ -2,9 +2,13 @@
 
 """GranuleKV 层级 I/O 的独立控制面组件。"""
 
-from .barrier import (HierarchicalLayerBarrierConfig, activate_layer_barrier,
+from .barrier import (HierarchicalLayerBarrierConfig, SparseKVLayerSelection,
+                      active_sparse_kv_device_selection_required,
+                      activate_layer_barrier,
                       activate_sparse_kv_blocks,
-                      get_active_sparse_kv_blocks, release_local_layer,
+                      correct_local_layer, get_active_sparse_kv_blocks,
+                      get_active_sparse_kv_device_selection,
+                      release_local_layer,
                       wait_for_local_layer, get_active_layer_request_ids,
                       get_active_layer_sequence_lengths)
 from .lifecycle import (HierarchicalRestoreController,
@@ -15,8 +19,10 @@ from .plan import (HierarchicalIOConfig, PrefetchBlockSelectorConfig,
                    get_layer_working_set_regions,
                    select_prefetch_unit_blocks)
 from .residency import PrefetchResidencyDirectory
-from .runtime import PrefetchRuntimeTrace, RollingPrefetchRuntime
-from .sparse_policy import (SparseKVPlanFeedback, SparseKVPolicy,
+from .runtime import (PrefetchRuntimeTrace, RollingPrefetchRuntime,
+                      SparseKVCorrectionResult)
+from .sparse_policy import (SparseKVActualSelection, SparseKVPlanFeedback,
+                            SparseKVPolicy,
                             SparseKVPolicyRuntime,
                             bind_sparse_page_index_key,
                             build_sparse_restore_plan_feedback,
@@ -25,7 +31,9 @@ from .sparse_policy import (SparseKVPlanFeedback, SparseKVPolicy,
                             get_sparse_kv_policy, load_sparse_kv_policy,
                             observe_sparse_query, select_sparse_blocks)
 from .sparse_policy import (register_sparse_page_representatives,
-                            register_sparse_restore_context)
+                            register_sparse_restore_context,
+                            select_actual_sparse_blocks_device,
+                            select_actual_sparse_prefix_blocks)
 
 __all__ = [
     "HierarchicalIOConfig",
@@ -39,11 +47,15 @@ __all__ = [
     "RollingPrefetchConfig",
     "RollingPrefetchRuntime",
     "SparseKVAccessPlan",
+    "SparseKVCorrectionResult",
+    "SparseKVLayerSelection",
     "PrefetchRuntimeTrace",
     "activate_layer_barrier",
     "activate_sparse_kv_blocks",
     "build_layer_restore_plan",
     "get_active_sparse_kv_blocks",
+    "get_active_sparse_kv_device_selection",
+    "active_sparse_kv_device_selection_required",
     "get_active_layer_request_ids",
     "get_active_layer_sequence_lengths",
     "get_layer_working_set_regions",
@@ -51,14 +63,18 @@ __all__ = [
     "select_prefetch_unit_blocks",
     "wait_for_local_layer",
     "SparseKVPolicy",
+    "SparseKVActualSelection",
     "SparseKVPlanFeedback",
     "SparseKVPolicyRuntime",
     "configure_sparse_kv_policy",
+    "correct_local_layer",
     "bind_sparse_page_index_key",
     "get_sparse_kv_policy",
     "load_sparse_kv_policy",
     "observe_sparse_query",
     "select_sparse_blocks",
+    "select_actual_sparse_prefix_blocks",
+    "select_actual_sparse_blocks_device",
     "build_sparse_restore_plan_feedback",
     "discard_sparse_restore_context",
     "register_sparse_page_representatives",

@@ -29,9 +29,12 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.attention.ops.sparse_kv import (
     build_selected_decode_block_table, select_and_compact_decode_blocks,
-    record_sparse_kv_attention, validate_sparse_kv_device_selection)
+    record_sparse_kv_attention, record_sparse_kv_compact_attention,
+    validate_sparse_kv_device_selection)
 from vllm.core.custom_schedulers.hierarchical_io import (
+    active_sparse_kv_device_selection_required,
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    get_active_sparse_kv_device_selection,
     get_sparse_kv_policy, register_sparse_page_representatives,
     select_sparse_blocks)
 from vllm.logger import init_logger
@@ -1207,6 +1210,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             selected_attention = None
             selected_attention_seq_len = None
             active_sparse_blocks = get_active_sparse_kv_blocks()
+            active_device_selection = get_active_sparse_kv_device_selection()
             if (active_sparse_blocks is None
                     and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):
                 if block_tables_arg is None:
@@ -1232,7 +1236,24 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 if self.kv_cache_dtype.startswith("fp8"):
                     raise RuntimeError(
                         "sparse KV decode does not support FP8 KV cache")
-                if (envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET > 0
+                if active_device_selection is not None:
+                    selected_attention = validate_sparse_kv_device_selection(
+                        active_device_selection)
+                    tail_tokens = sequence_length - (
+                        (sequence_length + block_size - 1) // block_size - 1
+                    ) * block_size
+                    selected_attention_seq_len = (
+                        selected_attention.count * block_size -
+                        (block_size - tail_tokens))
+                    record_sparse_kv_attention(
+                        (sequence_length + block_size - 1) // block_size,
+                        selected_attention.count,
+                        selected_attention_seq_len)
+                elif active_sparse_kv_device_selection_required():
+                    raise RuntimeError(
+                        "dynamic selected-list attention lacks a device "
+                        "selection")
+                elif (envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET > 0
                         and get_sparse_kv_policy() is not None):
                     layer_name = getattr(layer, "layer_name", "")
                     layer_index = self._layer_index_from_name(layer_name)
@@ -1301,6 +1322,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                                         and active_sparse_blocks is not None) else
                                     None),
                             ))
+                        record_sparse_kv_compact_attention()
                 else:
                     block_tables_arg, selected_seq_len = (
                         build_selected_decode_block_table(
@@ -1309,6 +1331,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                             sequence_length,
                             block_size,
                         ))
+                    record_sparse_kv_compact_attention()
                 if selected_attention is None:
                     seq_lens_arg = torch.tensor(
                         [selected_seq_len],

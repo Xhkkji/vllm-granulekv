@@ -5,7 +5,8 @@ import torch
 
 from vllm.attention.ops.sparse_kv import (
     SparseKVSelection, build_page_representatives_from_paged_key_cache,
-    build_selected_decode_block_table, reset_sparse_kv_stats,
+    build_selected_decode_block_table, build_sparse_kv_prediction_gap,
+    reset_sparse_kv_stats,
     select_and_compact_decode_blocks, sparse_kv_stats,
     validate_sparse_kv_prediction)
 
@@ -126,6 +127,28 @@ def test_prediction_validation_records_miss_without_dense_fallback():
     assert stats["prediction_miss"] == 1
     assert stats["prediction_miss_blocks"] == 1
     assert stats["prediction_wasted_blocks"] == 1
+
+
+def test_prediction_gap_keeps_control_plane_sets_distinct():
+    reset_sparse_kv_stats()
+    gap = build_sparse_kv_prediction_gap(
+        predicted_prefix_blocks=(0, 2),
+        actual_prefix_blocks=(1, 2),
+        resident_blocks=(0, 2, 3),
+        num_prefix_blocks=4,
+        request_id="request-gap",
+        layer_index=3,
+    )
+    assert gap.predicted_prefix_blocks == (0, 2)
+    assert gap.actual_prefix_blocks == (1, 2)
+    assert gap.resident_prefix_blocks == (0, 2, 3)
+    assert gap.hit_blocks == (2, )
+    assert gap.missing_blocks == (1, )
+    assert gap.wasted_blocks == (0, )
+    stats = sparse_kv_stats()
+    assert stats["prediction_checks"] == 1
+    assert stats["prediction_gap_events"] == 1
+    assert stats["prediction_recall"] == 0.5
 
 
 def test_page_representatives_from_four_dimensional_key_cache():

@@ -17,11 +17,25 @@ import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 
 LayerWaitCallback = Callable[[int, Sequence[str], int], Optional[Tuple[int, ...]]]
 LayerReleaseCallback = Callable[[int, Sequence[str], int], None]
+
+
+@dataclass(frozen=True)
+class SparseKVLayerSelection:
+    """Host residency set plus an optional device attention selection."""
+
+    block_indices: Tuple[int, ...]
+    device_selection: Optional[Any] = None
+    device_selection_required: bool = False
+
+
+LayerCorrectionResult = Optional[Tuple[int, ...] | SparseKVLayerSelection]
+LayerCorrectionCallback = Callable[
+    [int, Sequence[str], int, Any], LayerCorrectionResult]
 
 
 @dataclass(frozen=True)
@@ -46,6 +60,7 @@ class _LayerBarrierSession:
 
     callback: LayerWaitCallback
     release_callback: Optional[LayerReleaseCallback]
+    correction_callback: Optional[LayerCorrectionCallback]
     virtual_engine: int
     request_ids: tuple[str, ...]
     sequence_lengths_by_request: Optional[Dict[str, int]]
@@ -56,6 +71,10 @@ _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
     "granulekv_hierarchical_layer_barrier", default=None)
 _ACTIVE_SPARSE_KV_BLOCKS: ContextVar[Optional[Tuple[int, ...]]] = ContextVar(
     "granulekv_sparse_kv_blocks", default=None)
+_ACTIVE_SPARSE_KV_DEVICE_SELECTION: ContextVar[Optional[Any]] = ContextVar(
+    "granulekv_sparse_kv_device_selection", default=None)
+_ACTIVE_SPARSE_KV_DEVICE_REQUIRED: ContextVar[bool] = ContextVar(
+    "granulekv_sparse_kv_device_required", default=False)
 
 
 @contextmanager
@@ -65,6 +84,7 @@ def activate_layer_barrier(
     virtual_engine: int,
     request_ids: Sequence[str],
     release_callback: Optional[LayerReleaseCallback] = None,
+    correction_callback: Optional[LayerCorrectionCallback] = None,
     sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
     block_size: Optional[int] = None,
 ) -> Iterator[None]:
@@ -77,6 +97,7 @@ def activate_layer_barrier(
     token = _ACTIVE_LAYER_BARRIER.set(
         _LayerBarrierSession(callback=callback,
                              release_callback=release_callback,
+                             correction_callback=correction_callback,
                              virtual_engine=virtual_engine,
                              request_ids=tuple(request_ids),
                              sequence_lengths_by_request=(
@@ -113,6 +134,29 @@ def release_local_layer(layer_index: int) -> None:
                              layer_index)
 
 
+def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...]]:
+    """Resolve current-query selection and replace the active working set."""
+    session = _ACTIVE_LAYER_BARRIER.get()
+    if session is None or session.correction_callback is None:
+        return get_active_sparse_kv_blocks()
+    selected = session.correction_callback(
+        session.virtual_engine, session.request_ids, layer_index, query)
+    if selected is not None:
+        if isinstance(selected, SparseKVLayerSelection):
+            blocks = selected.block_indices
+            _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(
+                selected.device_selection)
+            _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(
+                selected.device_selection_required)
+        else:
+            blocks = tuple(selected)
+            _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
+            _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
+        _ACTIVE_SPARSE_KV_BLOCKS.set(blocks)
+        return blocks
+    return None
+
+
 @contextmanager
 def activate_sparse_kv_blocks(
     block_indices: Optional[Sequence[int]],
@@ -126,15 +170,29 @@ def activate_sparse_kv_blocks(
     """
     selected = (None if block_indices is None else tuple(block_indices))
     token = _ACTIVE_SPARSE_KV_BLOCKS.set(selected)
+    device_token = _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
+    required_token = _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
     try:
         yield
     finally:
+        _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.reset(required_token)
+        _ACTIVE_SPARSE_KV_DEVICE_SELECTION.reset(device_token)
         _ACTIVE_SPARSE_KV_BLOCKS.reset(token)
 
 
 def get_active_sparse_kv_blocks() -> Optional[Tuple[int, ...]]:
     """返回当前 layer 允许 attention 访问的 logical KV blocks。"""
     return _ACTIVE_SPARSE_KV_BLOCKS.get()
+
+
+def get_active_sparse_kv_device_selection() -> Optional[Any]:
+    """Return the current layer's GPU logical-block list, when available."""
+    return _ACTIVE_SPARSE_KV_DEVICE_SELECTION.get()
+
+
+def active_sparse_kv_device_selection_required() -> bool:
+    """Whether the current dynamic layer forbids compact fallback."""
+    return _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.get()
 
 
 def get_active_layer_request_ids() -> Tuple[str, ...]:

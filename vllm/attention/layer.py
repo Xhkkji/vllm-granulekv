@@ -15,7 +15,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.core.custom_schedulers.hierarchical_io import (
-    get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    correct_local_layer, get_active_layer_request_ids,
+    get_active_sparse_kv_blocks,
     get_sparse_kv_policy, observe_sparse_query)
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
@@ -59,6 +60,25 @@ def _observe_decode_query(layer_name: str, attn_metadata: Any,
             "sparse policy query observation requires one decode token")
     observe_sparse_query(layer_index, query,
                          request_id=request_ids[0] if request_ids else "default")
+
+
+def _correct_decode_sparse_blocks(layer_name: str, attn_metadata: Any,
+                                  query: torch.Tensor, num_heads: int,
+                                  head_size: int) -> None:
+    if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
+        return
+    if (attn_metadata.num_prefill_tokens != 0
+            or attn_metadata.num_decode_tokens != 1):
+        return
+    layer_index = _layer_index_from_name(layer_name)
+    if layer_index is None:
+        return
+    if query.ndim == 2:
+        query = query.view(-1, num_heads, head_size)
+    if query.ndim != 3 or query.shape[0] != 1:
+        raise RuntimeError(
+            "sparse correction requires one decode query token")
+    correct_local_layer(layer_index, query)
 
 
 class Attention(nn.Module):
@@ -415,6 +435,8 @@ def unified_attention(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
+                                  self.num_heads, self.head_size)
     output = self.impl.forward(self, query, key, value, kv_cache,
                                attn_metadata)
     # Record this query only after the current attention has consumed it.  The
@@ -456,6 +478,8 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
+                                  self.num_heads, self.head_size)
     self.impl.forward(self,
                       query,
                       key,

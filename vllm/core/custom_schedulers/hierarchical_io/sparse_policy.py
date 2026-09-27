@@ -28,6 +28,16 @@ class SparseKVPlanFeedback(msgspec.Struct,
     num_layers: int
     num_prefix_blocks: int
     block_indices_by_layer: Tuple[Tuple[int, ...], ...]
+    source: str = "quest_dynamic"
+
+
+@dataclass(frozen=True)
+class SparseKVActualSelection:
+    """Current-query host prefix plus device attention metadata."""
+
+    prefix_blocks: Tuple[int, ...]
+    attention: Any
+    prefix_count: int = 0
 
 
 class SparseKVPolicy(Protocol):
@@ -136,8 +146,63 @@ def build_sparse_restore_plan_feedback(
         num_layers=len(selections),
         num_prefix_blocks=context.num_prefix_blocks,
         block_indices_by_layer=tuple(selections),
+        source=f"{getattr(policy, 'name', 'sparse')}_dynamic",
     )
 
+
+def select_actual_sparse_prefix_blocks(
+    request_id: str,
+    layer_index: int,
+    query: torch.Tensor,
+    num_prefix_blocks: int,
+    block_budget: int,
+) -> Tuple[int, ...]:
+    """Select the current-query immutable prefix without dense warmup."""
+    policy = get_sparse_kv_policy()
+    selector = (None if policy is None else
+                getattr(policy, "select_actual_prefix_blocks", None))
+    if not callable(selector):
+        raise RuntimeError(
+            "dynamic sparse correction requires "
+            "select_actual_prefix_blocks()")
+    selected = tuple(int(index) for index in selector(
+        request_id, layer_index, query, num_prefix_blocks, block_budget))
+    normalized = tuple(sorted(set(selected)))
+    if (not normalized or normalized != selected
+            or normalized[0] < 0
+            or normalized[-1] >= num_prefix_blocks):
+        raise RuntimeError("actual sparse selection is outside prefix")
+    return normalized
+
+
+def select_actual_sparse_blocks_device(
+    request_id: str,
+    layer_index: int,
+    query: torch.Tensor,
+    num_prefix_blocks: int,
+    num_blocks: int,
+    block_budget: int,
+) -> SparseKVActualSelection:
+    """Select once for both host-side correction and device attention."""
+    policy = get_sparse_kv_policy()
+    selector = (None if policy is None else
+                getattr(policy, "select_actual_blocks_device", None))
+    if not callable(selector):
+        raise RuntimeError(
+            "dynamic selected-list attention requires "
+            "select_actual_blocks_device()")
+    selection = selector(request_id, layer_index, query, num_prefix_blocks,
+                         num_blocks, block_budget)
+    if not isinstance(selection, SparseKVActualSelection):
+        raise TypeError(
+            "device actual selector must return SparseKVActualSelection")
+    prefix = selection.prefix_blocks
+    normalized = tuple(sorted(set(int(index) for index in prefix)))
+    if (not normalized or normalized != prefix
+            or normalized[0] < 0
+            or normalized[-1] >= num_prefix_blocks):
+        raise RuntimeError("actual sparse selection is outside prefix")
+    return selection
 
 def discard_sparse_restore_context(request_ids: Sequence[str]) -> None:
     for request_id in request_ids:

@@ -10,19 +10,23 @@ Scheduler 预留 block 并一次下发完整 plan；本模块只决定已经预�
 from __future__ import annotations
 
 import time
+import itertools
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterable, Mapping, Optional, Sequence,
                     Tuple)
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
-    AsyncKVTransferEvent, AsyncKVTransferRequest, AsyncKVTransferState)
+    AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
+    AsyncKVTransferRequest, AsyncKVTransferState)
 
 from .plan import RollingPrefetchConfig
-from .residency import PrefetchResidencyDirectory
+from .residency import (PrefetchResidencyDirectory,
+                        SparseKVLayerPredictionState)
 
 
 SubmitCallback = Callable[[AsyncKVTransferRequest, Any], AsyncKVTransferEvent]
 PollCallback = Callable[[AsyncKVTransferRequest], AsyncKVTransferEvent]
+CancelCallback = Callable[[AsyncKVTransferRequest], None]
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,15 @@ class PrefetchRuntimeTrace:
     layer_index: Optional[int] = None
     wait_ns: int = 0
     lead_units: int = 0
+
+
+@dataclass(frozen=True)
+class SparseKVCorrectionResult:
+    request_id: str
+    block_count: int
+    submit_ms: float
+    wait_ms: float
+    total_ms: float
 
 
 @dataclass
@@ -71,6 +84,7 @@ class RollingPrefetchRuntime:
         self._plans: Dict[Tuple[int, str], _PlanState] = {}
         self._events: list[AsyncKVTransferEvent] = []
         self._traces: list[PrefetchRuntimeTrace] = []
+        self._correction_counter = itertools.count()
         self.residency = PrefetchResidencyDirectory()
 
     def submit_or_stage(
@@ -299,9 +313,102 @@ class RollingPrefetchRuntime:
         """Return physical residency miss counters for experiment reporting."""
         return self.residency.stats()
 
+    def prediction_restore_stats(self, reset: bool = False) -> Dict[str, int]:
+        return self.residency.restore_stats(reset)
+
+    def prediction_state(
+        self,
+        request_ids: Sequence[str],
+        layer_index: int,
+    ) -> Optional[SparseKVLayerPredictionState]:
+        return self.residency.prediction_state(request_ids, layer_index)
+
+    def correct_layer(
+        self,
+        virtual_engine: int,
+        state: SparseKVLayerPredictionState,
+        layer_index: int,
+        missing_blocks: Sequence[int],
+        prepare_mapping: Callable[[Any], Any],
+        submit: SubmitCallback,
+        poll: PollCallback,
+        cancel: Optional[CancelCallback] = None,
+        *,
+        max_active: int,
+        timeout_seconds: float,
+        sleep_seconds: float = 0.0001,
+    ) -> SparseKVCorrectionResult:
+        """Synchronously close one layer gap through the async lifecycle."""
+        if self.config.working_set_enabled:
+            raise RuntimeError(
+                "sparse correction does not support layer working-set mode")
+        if max_active <= 0 or timeout_seconds <= 0:
+            raise ValueError("invalid sparse correction runtime limits")
+        projection = self.residency.project_correction(
+            state, layer_index, missing_blocks)
+        request_id = (
+            f"{projection.plan_id}-correction-{layer_index}-"
+            f"{next(self._correction_counter)}")
+        request = AsyncKVTransferRequest(
+            request_id=request_id,
+            seq_group_id=projection.seq_group_id,
+            reservation_id=projection.reservation_id,
+            operation=AsyncKVTransferOperation.READ,
+            block_mapping=projection.block_mapping,
+            logical_blocks=projection.logical_blocks,
+            priority=AsyncKVTransferPriority.CRITICAL_READ,
+            layer_range=(layer_index, layer_index + 1),
+        )
+        mapping = prepare_mapping(projection.block_mapping)
+        total_started = time.perf_counter()
+        deadline = time.monotonic() + timeout_seconds
+        while self._active_count(virtual_engine) >= max_active:
+            self._progress(virtual_engine, poll)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "timed out waiting for a GranuleKV correction slot")
+            time.sleep(sleep_seconds)
+
+        submit_started = time.perf_counter()
+        event = submit(request, mapping)
+        submit_ms = (time.perf_counter() - submit_started) * 1000.0
+        wait_started = time.perf_counter()
+        while event.state == AsyncKVTransferState.PENDING:
+            self._progress(virtual_engine, poll)
+            event = poll(request)
+            if event.state == AsyncKVTransferState.PENDING:
+                if time.monotonic() >= deadline:
+                    if cancel is not None:
+                        cancel(request)
+                    raise TimeoutError(
+                        f"timed out waiting for correction {request_id}")
+                time.sleep(sleep_seconds)
+        wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        if event.state != AsyncKVTransferState.READY:
+            raise RuntimeError(
+                f"sparse correction failed: request={request_id} "
+                f"error={event.error}")
+        self.residency.mark_corrected(projection)
+        total_ms = (time.perf_counter() - total_started) * 1000.0
+        return SparseKVCorrectionResult(
+            request_id=request_id,
+            block_count=len(projection.logical_blocks),
+            submit_ms=submit_ms,
+            wait_ms=wait_ms,
+            total_ms=total_ms,
+        )
+
     def forget_seq_groups(self, seq_group_ids: Sequence[str]) -> None:
         """在 vLLM 通知 request finished/abort 时回收 residency 元数据。"""
         self.residency.forget_seq_groups(seq_group_ids)
+        finished = frozenset(seq_group_ids)
+        for plan_key, plan in tuple(self._plans.items()):
+            if any(unit.request.seq_group_id in finished and unit.active
+                   for unit in plan.units.values()):
+                continue
+            if any(unit.request.seq_group_id in finished
+                   for unit in plan.units.values()):
+                del self._plans[plan_key]
 
     def _activate_until(
         self,

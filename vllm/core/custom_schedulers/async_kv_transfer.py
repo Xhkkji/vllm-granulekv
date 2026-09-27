@@ -77,6 +77,11 @@ class AsyncKVTransferRequest:
     # Stable CPU page-index identity.  It is control-plane metadata only and
     # never reaches the GranuleKV/native descriptor.
     sparse_page_index_key: Optional[str] = None
+    # Dynamic sparse restore sends the complete immutable-prefix projection to
+    # the Worker once. It is a read-only correction catalog and never enters
+    # the initial GranuleKV descriptor, regardless of prediction grouping.
+    correction_block_mapping: Optional[BlockMapping] = None
+    correction_logical_blocks: Optional[Tuple[LogicalBlockKey, ...]] = None
     # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 GranuleKV
     # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
     activate_on_submit: bool = True
@@ -94,6 +99,15 @@ class AsyncKVTransferRequest:
         if (self.consumer_local_block_start is not None
                 and self.consumer_local_block_start < 0):
             raise ValueError("consumer_local_block_start must be non-negative")
+        if ((self.correction_block_mapping is None)
+                != (self.correction_logical_blocks is None)):
+            raise ValueError(
+                "correction mapping and logical blocks must be provided together")
+        if (self.correction_block_mapping is not None
+                and len(self.correction_block_mapping) !=
+                len(self.correction_logical_blocks or ())):
+            raise ValueError(
+                "correction mapping and logical blocks must have equal length")
 
 
 @dataclass(frozen=True)
@@ -180,6 +194,8 @@ class AsyncKVTransferQueue:
         consumer_num_blocks: Optional[int] = None,
         consumer_local_block_start: Optional[int] = None,
         sparse_page_index_key: Optional[str] = None,
+        correction_block_mapping: Optional[Sequence[Tuple[int, int]]] = None,
+        correction_logical_blocks: Optional[Sequence[LogicalBlockKey]] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/GranuleKV request slot。"""
         if priority is None:
@@ -207,6 +223,12 @@ class AsyncKVTransferQueue:
             consumer_num_blocks=consumer_num_blocks,
             consumer_local_block_start=consumer_local_block_start,
             sparse_page_index_key=sparse_page_index_key,
+            correction_block_mapping=(
+                None if correction_block_mapping is None else tuple(
+                    tuple(pair) for pair in correction_block_mapping)),
+            correction_logical_blocks=(
+                None if correction_logical_blocks is None else
+                tuple(correction_logical_blocks)),
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request

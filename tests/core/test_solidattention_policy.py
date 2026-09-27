@@ -173,6 +173,70 @@ def test_solidattention_prediction_uses_stable_page_key():
     assert "request" not in policy._page_index_keys
 
 
+def test_solidattention_actual_selector_returns_prefix_only():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.register_page_representatives(
+        "prefix", 0, _representatives(4), tuple(range(4)))
+    policy.bind_page_index_key("request-actual", "prefix")
+
+    selected = policy.select_actual_prefix_blocks(
+        "request-actual", 0, torch.ones(2, 2), 4, 1)
+
+    assert selected == tuple(sorted(set(selected)))
+    assert 0 in selected and 3 in selected
+    assert all(index < 4 for index in selected)
+
+
+def test_solidattention_actual_device_selection_includes_suffix_once():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.register_page_representatives(
+        "prefix", 0, _representatives(4).cuda(), tuple(range(4)))
+    policy.bind_page_index_key("request-device", "prefix")
+
+    selected = policy.select_actual_blocks_device(
+        "request-device", 0, torch.ones(2, 2, device="cuda"), 4, 6, 1)
+
+    indices = selected.attention.logical_block_indices[
+        :selected.attention.count]
+    assert indices.dtype == torch.int32
+    assert indices.is_contiguous()
+    assert selected.prefix_blocks == tuple(indices[:len(
+        selected.prefix_blocks)].cpu().tolist())
+    assert indices[-2:].cpu().tolist() == [4, 5]
+    assert selected.attention.count == len(selected.prefix_blocks) + 2
+
+
+def test_solidattention_prediction_guard_does_not_change_actual(monkeypatch):
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    representatives = torch.randn(12, 2, 2, 2)
+    policy.bind_page_index_key("request-guard", "prefix")
+    policy.register_page_representatives(
+        "prefix", 0, representatives, tuple(range(12)))
+    query = torch.randn(2, 2)
+    policy.observe_query("request-guard", 0, query)
+    actual_before = policy.select_actual_prefix_blocks(
+        "request-guard", 0, query, 12, 1)
+
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    prediction_without_guard = policy.predict_restore_blocks(
+        "request-guard", 0, 12, 1)
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 2)
+    prediction_with_guard = policy.predict_restore_blocks(
+        "request-guard", 0, 12, 1)
+    actual_after = policy.select_actual_prefix_blocks(
+        "request-guard", 0, query, 12, 1)
+
+    assert prediction_without_guard is not None
+    assert prediction_with_guard is not None
+    assert set(prediction_without_guard).issubset(prediction_with_guard)
+    assert len(prediction_with_guard) >= len(prediction_without_guard)
+    assert actual_after == actual_before
+
+
 def test_solidattention_prediction_respects_logical_representative_indices():
     policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
     policy.bind_page_index_key("request", "prefix")
@@ -217,6 +281,7 @@ def test_solidattention_feedback_compiles_per_layer_prefix_plan():
         assert feedback is not None
         assert feedback.page_index_key == "prefix"
         assert feedback.num_layers == 2
+        assert feedback.source == "solidattention_dynamic"
         assert all(max(selection) < 4
                    for selection in feedback.block_indices_by_layer)
     finally:

@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
+from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
+
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferRequest, AsyncKVTransferState)
 
@@ -30,6 +32,41 @@ class _UnitResidency:
     evicted: bool = False
 
 
+@dataclass
+class _CorrectionPlanResidency:
+    plan_id: str
+    seq_group_id: str
+    reservation_id: str
+    num_prefix_blocks: int
+    catalog: Dict[int, Tuple[Tuple[int, int], LogicalBlockKey]]
+    predicted_by_layer: Dict[int, frozenset[int]]
+    resident_by_layer: Dict[int, set[int]]
+
+
+@dataclass(frozen=True)
+class SparseKVLayerPredictionState:
+    plan_id: str
+    seq_group_id: str
+    reservation_id: str
+    num_prefix_blocks: int
+    predicted_prefix_blocks: Tuple[int, ...]
+    resident_prefix_blocks: Tuple[int, ...]
+    # Prefix-indexed (GPU physical block, SSD logical block) pairs. A negative
+    # pair denotes a block already owned by the resident allocation and is not
+    # a valid correction source.
+    correction_mapping_by_logical: Tuple[Tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class SparseKVCorrectionProjection:
+    plan_id: str
+    seq_group_id: str
+    reservation_id: str
+    layer_index: int
+    block_mapping: BlockMapping
+    logical_blocks: Tuple[LogicalBlockKey, ...]
+
+
 class PrefetchResidencyDirectory:
     """维护 prefetch unit 的 logical block 可见性。
 
@@ -40,6 +77,12 @@ class PrefetchResidencyDirectory:
 
     def __init__(self) -> None:
         self._units: Dict[str, _UnitResidency] = {}
+        self._correction_plans: Dict[str, _CorrectionPlanResidency] = {}
+        self._restore_stats = {
+            "prediction_restore_requests": 0,
+            "prediction_restore_blocks": 0,
+            "prediction_restore_fragments": 0,
+        }
         self._stats = {
             "residency_miss": 0,
             "residency_miss_blocks": 0,
@@ -49,9 +92,25 @@ class PrefetchResidencyDirectory:
         """Return physical residency counters for experiment reporting."""
         return dict(self._stats)
 
+    def restore_stats(self, reset: bool = False) -> Dict[str, int]:
+        result = dict(self._restore_stats)
+        if reset:
+            for name in self._restore_stats:
+                self._restore_stats[name] = 0
+        return result
+
     def register(self, request: AsyncKVTransferRequest) -> None:
         if request.prefetch_plan_id is None:
             return
+        self._register_correction_plan(request)
+        if request.prefetch_plan_id in self._correction_plans:
+            self._restore_stats["prediction_restore_requests"] += 1
+            layer_count = (0 if request.layer_range is None else
+                           request.layer_range[1] - request.layer_range[0])
+            block_layers = len(request.logical_blocks) * layer_count
+            self._restore_stats["prediction_restore_blocks"] += block_layers
+            self._restore_stats["prediction_restore_fragments"] += (
+                block_layers * 2)
         if (request.consumer_block_indices is None
                 and request.consumer_blocks_by_layer is None
                 and request.consumer_num_blocks is None):
@@ -105,6 +164,7 @@ class PrefetchResidencyDirectory:
         else:
             unit.resident.update(
                 key.logical_index for key in unit.request.logical_blocks)
+        self._mark_plan_unit_ready(unit.request)
 
     def mark_error(self, request_id: str) -> None:
         if request_id not in self._units:
@@ -215,6 +275,155 @@ class PrefetchResidencyDirectory:
         for request_id, unit in tuple(self._units.items()):
             if unit.request.seq_group_id in finished:
                 del self._units[request_id]
+        for plan_id, plan in tuple(self._correction_plans.items()):
+            if plan.seq_group_id in finished:
+                del self._correction_plans[plan_id]
+
+    def prediction_state(
+        self,
+        request_ids: Sequence[str],
+        layer_index: int,
+    ) -> Optional[SparseKVLayerPredictionState]:
+        request_id_set = frozenset(request_ids)
+        matches = tuple(
+            plan for plan in self._correction_plans.values()
+            if plan.seq_group_id in request_id_set
+            and layer_index in plan.predicted_by_layer)
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError(
+                "one layer matched multiple sparse correction plans")
+        plan = matches[0]
+        return SparseKVLayerPredictionState(
+            plan_id=plan.plan_id,
+            seq_group_id=plan.seq_group_id,
+            reservation_id=plan.reservation_id,
+            num_prefix_blocks=plan.num_prefix_blocks,
+            predicted_prefix_blocks=tuple(
+                sorted(plan.predicted_by_layer[layer_index])),
+            resident_prefix_blocks=tuple(
+                sorted(plan.resident_by_layer[layer_index])),
+            correction_mapping_by_logical=tuple(
+                tuple(plan.catalog[index][0]) if index in plan.catalog else
+                (-1, -1)
+                for index in range(plan.num_prefix_blocks)),
+        )
+
+    def project_correction(
+        self,
+        state: SparseKVLayerPredictionState,
+        layer_index: int,
+        missing_blocks: Sequence[int],
+    ) -> SparseKVCorrectionProjection:
+        plan = self._correction_plans.get(state.plan_id)
+        if plan is None:
+            raise RuntimeError("sparse correction catalog is unavailable")
+        missing = tuple(sorted(set(int(index) for index in missing_blocks)))
+        if not missing:
+            raise ValueError("sparse correction requires missing blocks")
+        resident = plan.resident_by_layer.get(layer_index)
+        if resident is None:
+            raise RuntimeError("sparse correction layer is not registered")
+        missing = tuple(index for index in missing if index not in resident)
+        if not missing:
+            raise RuntimeError("sparse correction no longer has missing blocks")
+        unavailable = tuple(index for index in missing
+                            if index not in plan.catalog)
+        if unavailable:
+            raise RuntimeError(
+                "missing sparse blocks have no correction mapping: "
+                f"{unavailable}")
+        projected = tuple(plan.catalog[index] for index in missing)
+        return SparseKVCorrectionProjection(
+            plan_id=plan.plan_id,
+            seq_group_id=plan.seq_group_id,
+            reservation_id=plan.reservation_id,
+            layer_index=layer_index,
+            block_mapping=tuple(item[0] for item in projected),
+            logical_blocks=tuple(item[1] for item in projected),
+        )
+
+    def mark_corrected(self, projection: SparseKVCorrectionProjection) -> None:
+        plan = self._correction_plans.get(projection.plan_id)
+        if plan is None:
+            raise RuntimeError("sparse correction plan was discarded")
+        resident = plan.resident_by_layer.get(projection.layer_index)
+        if resident is None:
+            raise RuntimeError("sparse correction layer is not registered")
+        resident.update(key.logical_index
+                        for key in projection.logical_blocks)
+
+    def _register_correction_plan(
+        self,
+        request: AsyncKVTransferRequest,
+    ) -> None:
+        plan_id = request.prefetch_plan_id
+        assert plan_id is not None
+        prefix_count = request.consumer_local_block_start
+        if prefix_count is None:
+            return
+        plan = self._correction_plans.get(plan_id)
+        if request.correction_block_mapping is not None:
+            if plan is not None:
+                raise RuntimeError("duplicate sparse correction catalog")
+            catalog = {
+                key.logical_index: (tuple(pair), key)
+                for pair, key in zip(request.correction_block_mapping,
+                                     request.correction_logical_blocks or ())
+            }
+            if len(catalog) != len(request.correction_block_mapping):
+                raise RuntimeError(
+                    "sparse correction catalog has duplicate logical blocks")
+            if any(index < 0 or index >= prefix_count for index in catalog):
+                raise RuntimeError(
+                    "sparse correction catalog is outside immutable prefix")
+            plan = _CorrectionPlanResidency(
+                plan_id=plan_id,
+                seq_group_id=request.seq_group_id,
+                reservation_id=request.reservation_id,
+                num_prefix_blocks=prefix_count,
+                catalog=catalog,
+                predicted_by_layer={},
+                resident_by_layer={},
+            )
+            self._correction_plans[plan_id] = plan
+        if plan is None:
+            return
+        if (plan.seq_group_id != request.seq_group_id
+                or plan.reservation_id != request.reservation_id
+                or plan.num_prefix_blocks != prefix_count):
+            raise RuntimeError("inconsistent sparse correction plan metadata")
+        if request.layer_range is None:
+            raise RuntimeError("sparse correction plan requires layer range")
+        baseline = set(range(prefix_count)).difference(plan.catalog)
+        for layer_index in range(*request.layer_range):
+            relative = layer_index - request.layer_range[0]
+            selection = (request.consumer_block_indices
+                         if request.consumer_blocks_by_layer is None else
+                         request.consumer_blocks_by_layer[relative])
+            if selection is None:
+                continue
+            predicted = frozenset(int(index) for index in selection
+                                  if int(index) < prefix_count)
+            if not predicted:
+                raise RuntimeError(
+                    "sparse correction plan has empty prefix prediction")
+            plan.predicted_by_layer[layer_index] = predicted
+            plan.resident_by_layer[layer_index] = set(baseline)
+
+    def _mark_plan_unit_ready(self, request: AsyncKVTransferRequest) -> None:
+        plan_id = request.prefetch_plan_id
+        if plan_id is None or request.layer_range is None:
+            return
+        plan = self._correction_plans.get(plan_id)
+        if plan is None:
+            return
+        restored = {key.logical_index for key in request.logical_blocks}
+        for layer_index in range(*request.layer_range):
+            resident = plan.resident_by_layer.get(layer_index)
+            if resident is not None:
+                resident.update(restored)
 
     def _get(self, request_id: str) -> _UnitResidency:
         try:

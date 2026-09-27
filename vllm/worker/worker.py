@@ -14,9 +14,14 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferRequest,
     AsyncKVTransferState)
 from vllm.core.custom_schedulers.hierarchical_io import (
-    RollingPrefetchConfig, RollingPrefetchRuntime, activate_layer_barrier,
+    RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVLayerSelection,
+    activate_layer_barrier,
     bind_sparse_page_index_key, get_active_layer_sequence_lengths,
-    register_sparse_restore_context)
+    register_sparse_restore_context, select_actual_sparse_blocks_device,
+    select_actual_sparse_prefix_blocks)
+from vllm.attention.ops.sparse_kv import (
+    build_sparse_kv_prediction_gap, record_sparse_kv_actual_selection,
+    record_sparse_kv_correction, record_sparse_kv_correction_error)
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -76,6 +81,10 @@ class Worker(LocalOrDistributedWorkerBase):
         # 根据 model progress 激活 GranuleKV handle，并缓存 completion event。
         self._prefetch_runtime = RollingPrefetchRuntime(
             RollingPrefetchConfig.from_env())
+        if (envs.VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE
+                and envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE):
+            raise ValueError(
+                "sparse correction does not support layer working-set mode")
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -103,6 +112,7 @@ class Worker(LocalOrDistributedWorkerBase):
             is_driver_worker=is_driver_worker,
             **speculative_args,
         )
+
         if model_runner_cls is not None:
             self.model_runner = model_runner_cls(self.model_runner)
 
@@ -132,6 +142,24 @@ class Worker(LocalOrDistributedWorkerBase):
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+
+    def get_sparse_kv_stats(self, reset: bool = False):
+        result = super().get_sparse_kv_stats(reset=reset)
+        result.update(self._prefetch_runtime.residency_stats())
+        restore = self._prefetch_runtime.prediction_restore_stats(reset=reset)
+        result.update(restore)
+        fragment_bytes = (CacheEngine.get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config) //
+                          self.cache_engine[0].num_attention_layers // 2)
+        result["prediction_restore_bytes"] = (
+            restore["prediction_restore_fragments"] * fragment_bytes)
+        result["prediction_restore_mode"] = (
+            "exact_grouped"
+            if envs.VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE else
+            "window_union")
+        result["prediction_guard_blocks"] = (
+            envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS)
+        return result
 
     def start_profile(self):
         if self.profiler is None:
@@ -602,8 +630,129 @@ class Worker(LocalOrDistributedWorkerBase):
             virtual_engine=virtual_engine,
             request_ids=request_ids,
             release_callback=self._release_hierarchical_layer,
+            correction_callback=self._correct_hierarchical_layer,
             sequence_lengths_by_request=sequence_lengths_by_request,
             block_size=block_size,
+        )
+
+    def _correct_hierarchical_layer(
+        self,
+        virtual_engine: int,
+        request_ids: Tuple[str, ...],
+        layer_index: int,
+        query: torch.Tensor,
+    ) -> Optional[Tuple[int, ...] | SparseKVLayerSelection]:
+        """Resolve actual prefix selection and synchronously close its gap."""
+        if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
+            return None
+        state = self._prefetch_runtime.prediction_state(
+            request_ids, layer_index)
+        if state is None:
+            return None
+        if len(request_ids) != 1:
+            raise RuntimeError(
+                "sparse correction currently supports one request")
+
+        lengths = get_active_layer_sequence_lengths()
+        sequence_length = (None if lengths is None else
+                           lengths.get(state.seq_group_id))
+        if sequence_length is None or sequence_length <= 0:
+            raise RuntimeError(
+                "sparse correction lacks current sequence length")
+        current_blocks = ((sequence_length + self.cache_config.block_size - 1)
+                          // self.cache_config.block_size)
+        selected_list_enabled = (
+            envs.VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE
+            and envs.VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE)
+
+        selection_started = time.perf_counter()
+        device_selection = None
+        if selected_list_enabled:
+            actual = select_actual_sparse_blocks_device(
+                state.seq_group_id,
+                layer_index,
+                query,
+                state.num_prefix_blocks,
+                current_blocks,
+                envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+            )
+            actual_prefix = actual.prefix_blocks
+            device_selection = actual.attention
+        else:
+            actual_prefix = select_actual_sparse_prefix_blocks(
+                state.seq_group_id,
+                layer_index,
+                query,
+                state.num_prefix_blocks,
+                envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+            )
+        record_sparse_kv_actual_selection(
+            (time.perf_counter() - selection_started) * 1000.0)
+        gap = build_sparse_kv_prediction_gap(
+            predicted_prefix_blocks=state.predicted_prefix_blocks,
+            actual_prefix_blocks=actual_prefix,
+            resident_blocks=state.resident_prefix_blocks,
+            num_prefix_blocks=state.num_prefix_blocks,
+            request_id=state.seq_group_id,
+            layer_index=layer_index,
+        )
+        if gap.missing_blocks:
+            if not envs.VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE:
+                raise RuntimeError(
+                    "SolidAttention prediction_miss with correction disabled: "
+                    f"request={state.seq_group_id} layer={layer_index} "
+                    f"missing_prefix_blocks={gap.missing_blocks}")
+            cache_engine = self.cache_engine[virtual_engine]
+            try:
+                correction = self._prefetch_runtime.correct_layer(
+                    virtual_engine,
+                    state,
+                    layer_index,
+                    gap.missing_blocks,
+                    lambda mapping: torch.tensor(
+                        mapping, device="cpu", dtype=torch.int64).view(-1, 2),
+                    lambda request, mapping: cache_engine.
+                    submit_async_kv_transfer(
+                        request.request_id,
+                        request.operation,
+                        mapping,
+                        layer_range=request.layer_range),
+                    lambda request: cache_engine.poll_async_kv_transfer(
+                        request.request_id),
+                    lambda request: cache_engine.cancel_async_kv_transfer(
+                        request.request_id),
+                    max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
+                    timeout_seconds=envs.VLLM_GRANULEKV_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                record_sparse_kv_correction_error()
+                raise
+            all_layer_block_bytes = CacheEngine.get_cache_block_size(
+                self.cache_config, self.model_config, self.parallel_config)
+            layer_block_bytes = (
+                all_layer_block_bytes // cache_engine.num_attention_layers)
+            record_sparse_kv_correction(
+                blocks=correction.block_count,
+                fragments=correction.block_count * 2,
+                read_bytes=correction.block_count * layer_block_bytes,
+                submit_ms=correction.submit_ms,
+                wait_ms=correction.wait_ms,
+                total_ms=correction.total_ms,
+            )
+            resident_after = self._prefetch_runtime.prediction_state(
+                request_ids, layer_index)
+            if (resident_after is None
+                    or not set(actual_prefix).issubset(
+                        resident_after.resident_prefix_blocks)):
+                raise RuntimeError(
+                    "sparse correction completed without full residency")
+
+        suffix = tuple(range(state.num_prefix_blocks, current_blocks))
+        working_set = tuple(sorted(set(actual_prefix).union(suffix)))
+        return SparseKVLayerSelection(
+            block_indices=working_set,
+            device_selection=device_selection,
+            device_selection_required=selected_list_enabled,
         )
 
     def _release_hierarchical_layer(
@@ -712,7 +861,6 @@ class Worker(LocalOrDistributedWorkerBase):
         # Clean up finished ids
         for finished_id in finished_request_ids:
             del self._seq_group_metadata_cache[finished_id]
-
         return new_seq_group_metadata_list
 
     def _execute_model_spmd(

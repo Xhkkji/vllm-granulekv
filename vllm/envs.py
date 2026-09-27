@@ -74,9 +74,11 @@ if TYPE_CHECKING:
     VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET: int = 0
     VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE: bool = False
     VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE: bool = False
+    VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE: bool = False
     VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE: bool = False
     VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE: bool = False
     VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE: bool = True
+    VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS: int = 0
     VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
     VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND: str = "auto"
     VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND: str = "auto"
@@ -480,6 +482,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE":
     lambda: bool(
         int(os.getenv("VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE", "0"))),
+    "VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE":
+    lambda: bool(
+        int(os.getenv("VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE", "0"))),
     "VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE":
     lambda: bool(
         int(os.getenv("VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE", "0"))),
@@ -489,6 +494,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE":
     lambda: bool(
         int(os.getenv("VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE", "1"))),
+    "VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS":
+    lambda: int(
+        os.getenv("VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", "0")),
 
     # 是否为 xformers prefix fallback 打开细粒度阶段计时。
     # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。

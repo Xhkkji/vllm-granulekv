@@ -40,6 +40,12 @@ ASYNC_KV_STRATEGIES = {
 }
 
 
+def _prompt_prefix_block_count(sequence: Sequence, block_size: int) -> int:
+    if block_size <= 0:
+        raise ValueError("block size must be positive")
+    return sequence.get_prompt_len() // block_size
+
+
 def _prefix_page_index_key(seq_group: SequenceGroup,
                            block_size: int,
                            num_prefix_blocks: int) -> Optional[str]:
@@ -229,7 +235,7 @@ class AsyncKVScheduler(Scheduler):
                 plan = SparseKVAccessPlan.from_layer_selections(
                     num_blocks=item.num_prefix_blocks,
                     block_indices_by_layer=item.block_indices_by_layer,
-                    source="quest_dynamic",
+                    source=item.source,
                 )
             except (TypeError, ValueError) as exc:
                 logger.warning("discarding invalid sparse restore feedback: %s",
@@ -517,6 +523,16 @@ class AsyncKVScheduler(Scheduler):
                     sparse_page_index_key=_prefix_page_index_key(
                         seq_group, self.cache_config.block_size,
                         reservation.num_prefix_blocks),
+                    correction_block_mapping=(
+                        reservation.block_mapping
+                        if unit.index == 0 and plan.access_plan is not None
+                        and plan.access_plan.source ==
+                        "solidattention_dynamic" else None),
+                    correction_logical_blocks=(
+                        reservation.logical_blocks
+                        if unit.index == 0 and plan.access_plan is not None
+                        and plan.access_plan.source ==
+                        "solidattention_dynamic" else None),
                 ))
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(
@@ -731,8 +747,12 @@ class AsyncKVScheduler(Scheduler):
                 if len(sequences) != 1:
                     raise ValueError(
                         "sparse page metadata requires one prefix sequence")
-                num_prefix_blocks = (len(sequences[0].get_token_ids()) //
-                                     self.cache_config.block_size)
+                # Prediction metadata belongs to the reusable prompt prefix,
+                # not to complete blocks created by generated output.  The
+                # write reservation may still persist those suffix blocks;
+                # only the stable page-index identity is prompt-bounded.
+                num_prefix_blocks = _prompt_prefix_block_count(
+                    sequences[0], self.cache_config.block_size)
             page_index_key = _prefix_page_index_key(
                 seq_group, self.cache_config.block_size, num_prefix_blocks)
         request = self.async_kv_policy.enqueue(

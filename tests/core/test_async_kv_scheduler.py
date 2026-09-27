@@ -6,7 +6,8 @@ import pytest
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, SchedulerConfig
-from vllm.core.async_kv_scheduler import AsyncKVScheduler
+from vllm.core.async_kv_scheduler import (AsyncKVScheduler,
+                                          _prompt_prefix_block_count)
 from vllm.core.block.interfaces import BlockAllocator
 from vllm.core.scheduler import Scheduler, SchedulingBudget
 from vllm.core.scheduler_policy import (AsyncKVTransferEvent,
@@ -998,3 +999,8 @@ def test_scheduler_consumes_dynamic_sparse_restore_feedback(monkeypatch):
     assert plan.source == "quest_dynamic"
     assert plan.block_indices_by_layer == ((0, 2), (1, 3))
     assert scheduler._peek_sparse_restore_plan("other", 4) is None
+
+
+def test_prediction_metadata_key_ignores_generated_complete_blocks():
+    sequence = type("Sequence", (), {"get_prompt_len": lambda self: 8192})()
+    assert _prompt_prefix_block_count(sequence, 16) == 512

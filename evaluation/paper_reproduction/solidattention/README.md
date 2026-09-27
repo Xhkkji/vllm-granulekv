@@ -18,8 +18,8 @@ logical block plan:
 
 1. Use the previous iteration's information to predict the next set of KV
    blocks and prefetch those blocks.
-2. Group adjacent layers only when their predicted prefix block sets are
-   identical, and submit each group through the existing layer-range request.
+2. Restore either exact adjacent groups or a four-layer union through the
+   existing layer-range request.
 3. Let the worker residency directory verify the planned layer selection after
    the corresponding unit reaches `READY`.
 4. Record prediction gaps separately from physical residency misses.
@@ -31,18 +31,38 @@ statistics remain policy-independent; SolidAttention only supplies the
 prediction and actual block selections. GranuleKV native protocol, CUDA IPC,
 descriptor handling, mapping, and completion are unchanged.
 
-The first dynamic implementation is fail-fast: it does not issue an on-demand
-correction read and does not silently expand the request to dense attention.
-Enable exact grouped restore only for a SolidAttention dynamic experiment:
+The dynamic implementation computes the current-query actual prefix before
+decode attention. With correction disabled, a prediction gap remains
+fail-fast. The optional first correction path projects missing blocks from the
+read-only admission catalog and submits a single-layer GranuleKV request
+through the existing submit/poll/complete lifecycle:
 
 ```bash
 export VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE=1
 export VLLM_GRANULEKV_SPARSE_EXACT_RESTORE_ENABLE=1
+export VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE=1
+export VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE=1
+export VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE=1
+export VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS=0
 ```
 
-The exact mode reuses the existing rolling layer barrier and GranuleKV request
-lifecycle. The selected prefix mapping excludes the live suffix; the suffix is
-kept only in the per-layer attention working set.
+The selected-list mode passes the current-query GPU selection directly from
+correction to `forward_decode_selected`; the CPU tuple from the same selection
+is used only for the prediction-gap and SSD correction decision. Setting exact
+restore to `0` unions predictions inside each configured layer window while
+keeping the per-layer attention sets exact. Prediction guard blocks expand
+only the previous-query prefetch and never change the actual attention budget.
+Correction remains unsupported with layer working-set ring overwrite mode.
+
+Run the complete 8K exact/union/guard ablation with:
+
+```bash
+bash evaluation/paper_reproduction/solidattention/scripts/run_dynamic_ablation.sh
+```
+
+The runner writes per-case summaries plus `ablation_summary.json` and
+`ablation_summary.csv`, and rejects output mismatches, residency errors, or a
+selected-list case that falls back to compact attention.
 
 ## Offline Prediction Oracle
 
@@ -58,6 +78,6 @@ PYTHONPATH=. /home/xhk/miniconda3/envs/pytorch-vllm/bin/python \
 ```
 
 The result reports predicted, actual, hit, miss, and wasted prefix blocks.
-Dynamic restore must be treated as a fail-fast experiment when the current
-query selects a prefix block that is not resident; it does not silently
-expand to dense attention or issue an on-demand correction read.
+Current experiments report prediction recall, prediction restore requests and
+bytes, guard size, correction blocks/bytes, submit time, wait time, and total
+correction blocking separately.

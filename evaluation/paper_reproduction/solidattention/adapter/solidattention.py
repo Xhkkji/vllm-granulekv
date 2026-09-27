@@ -13,6 +13,8 @@ from vllm.attention.ops.sparse_kv import (
     SparseKVDeviceSelection,
     build_page_representatives_from_paged_key_cache, )
 from vllm.attention.ops.sparse_kv import record_sparse_kv_selection
+from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
+    SparseKVActualSelection, )
 
 from ...common.selectors import ExplicitSelector, TailSelector
 
@@ -77,6 +79,8 @@ class SolidAttentionPolicy:
         self._seen: set[tuple[str, int]] = set()
         self._attention_selection_buffers: Dict[
             str, Dict[int, _AttentionSelectionState]] = defaultdict(dict)
+        self._dynamic_selection_buffers: Dict[
+            str, Dict[int, torch.Tensor]] = defaultdict(dict)
 
     @staticmethod
     def _normalize_query(query: torch.Tensor) -> torch.Tensor:
@@ -534,6 +538,90 @@ class SolidAttentionPolicy:
                               device=selected_prefix.device)
         return tuple(torch.cat((selected_prefix, suffix)).tolist())
 
+    def _select_actual_prefix_tensor(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        num_prefix_blocks: int,
+        block_budget: int,
+        output_device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        if num_prefix_blocks <= 0 or block_budget <= 0:
+            raise ValueError(
+                "num_prefix_blocks and block_budget must be positive")
+        metadata = self._get_prediction_representatives(
+            request_id, layer_index, num_prefix_blocks)
+        if metadata is None:
+            raise RuntimeError(
+                "SolidAttention actual selection lacks prefix metadata: "
+                f"request={request_id} layer={layer_index}")
+        logical, representatives = metadata
+        if output_device is not None and representatives.device != output_device:
+            representatives = representatives.to(device=output_device)
+            query = query.to(device=output_device)
+            page_index_key = self._page_index_keys.get(request_id, request_id)
+            self._prediction_representatives[page_index_key][layer_index] = (
+                _PredictionRepresentativeState(logical, representatives))
+        return self._select_prefix_with_logical_indices(
+            self._normalize_query(query), representatives, logical,
+            num_prefix_blocks, block_budget)
+
+    def select_actual_prefix_blocks(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        num_prefix_blocks: int,
+        block_budget: int,
+    ) -> tuple[int, ...]:
+        """Select only immutable prefix blocks for the current query."""
+        selected = self._select_actual_prefix_tensor(
+            request_id, layer_index, query, num_prefix_blocks, block_budget)
+        return tuple(int(index) for index in selected.tolist())
+
+    def select_actual_blocks_device(
+        self,
+        request_id: str,
+        layer_index: int,
+        query: torch.Tensor,
+        num_prefix_blocks: int,
+        num_blocks: int,
+        block_budget: int,
+    ) -> SparseKVActualSelection:
+        """Build one current-query selection for correction and attention."""
+        if num_blocks < num_prefix_blocks:
+            raise ValueError("num_blocks must cover the immutable prefix")
+        selected_prefix = self._select_actual_prefix_tensor(
+            request_id, layer_index, query, num_prefix_blocks, block_budget,
+            output_device=query.device)
+        if not selected_prefix.is_cuda:
+            raise RuntimeError(
+                "dynamic selected-list attention requires CUDA metadata")
+        suffix = torch.arange(num_prefix_blocks,
+                              num_blocks,
+                              dtype=torch.long,
+                              device=selected_prefix.device)
+        selected = torch.cat((selected_prefix, suffix))
+        count = int(selected.shape[0])
+        buffer = self._dynamic_selection_buffers[request_id].get(layer_index)
+        if (buffer is None or buffer.device != selected.device
+                or buffer.numel() < count):
+            capacity = count if buffer is None else max(count,
+                                                        buffer.numel() * 2)
+            buffer = torch.empty(capacity,
+                                 dtype=torch.int32,
+                                 device=selected.device)
+            self._dynamic_selection_buffers[request_id][layer_index] = buffer
+        buffer[:count].copy_(selected)
+        prefix_blocks = tuple(int(index) for index in selected_prefix.tolist())
+        return SparseKVActualSelection(
+            prefix_blocks=prefix_blocks,
+            attention=SparseKVDeviceSelection(
+                buffer, count, prefix_count=int(selected_prefix.shape[0])),
+            prefix_count=int(selected_prefix.shape[0]),
+        )
+
     def predict_restore_blocks(self, request_id: str, layer_index: int,
                                num_prefix_blocks: int,
                                block_budget: int) -> Optional[Tuple[int, ...]]:
@@ -545,8 +633,12 @@ class SolidAttentionPolicy:
         if metadata is None:
             return None
         logical, representatives = metadata
+        guard_blocks = envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS
+        if guard_blocks < 0:
+            raise ValueError("prediction guard blocks must be non-negative")
         selected = self._select_prefix_with_logical_indices(
-            history, representatives, logical, num_prefix_blocks, block_budget)
+            history, representatives, logical, num_prefix_blocks,
+            block_budget + guard_blocks)
         return tuple(int(index) for index in selected.tolist())
 
     def discard(self, request_id: str) -> None:
@@ -559,4 +651,5 @@ class SolidAttentionPolicy:
         if page_index_key is None or page_index_key == request_id:
             self._prediction_representatives.pop(request_id, None)
         self._attention_selection_buffers.pop(request_id, None)
+        self._dynamic_selection_buffers.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}

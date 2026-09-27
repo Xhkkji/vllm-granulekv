@@ -14,7 +14,7 @@ from typing import Callable, Optional, Sequence, Tuple
 import torch
 
 
-_SPARSE_STATS: dict[str, int] = {
+_SPARSE_STATS: dict[str, float | int] = {
     "calls": 0,
     "full_blocks": 0,
     "selected_blocks": 0,
@@ -26,6 +26,8 @@ _SPARSE_STATS: dict[str, int] = {
     "attention_selection_refreshes": 0,
     "attention_selection_cache_hits": 0,
     "attention_selected_blocks": 0,
+    "attention_selected_calls": 0,
+    "attention_compact_calls": 0,
     "prediction_calls": 0,
     "prediction_predicted_blocks": 0,
     "prediction_actual_blocks": 0,
@@ -33,6 +35,23 @@ _SPARSE_STATS: dict[str, int] = {
     "prediction_hit_blocks": 0,
     "prediction_miss_blocks": 0,
     "prediction_wasted_blocks": 0,
+    "prediction_checks": 0,
+    "prediction_gap_events": 0,
+    "predicted_blocks": 0,
+    "actual_blocks": 0,
+    "hit_blocks": 0,
+    "missing_blocks": 0,
+    "wasted_blocks": 0,
+    "actual_selection_ms": 0.0,
+    "correction_requests": 0,
+    "correction_blocks": 0,
+    "correction_fragments": 0,
+    "correction_bytes": 0,
+    "correction_submit_ms": 0.0,
+    "correction_wait_ms": 0.0,
+    "correction_total_ms": 0.0,
+    "correction_errors": 0,
+    "zero_miss_checks": 0,
 }
 
 
@@ -41,6 +60,8 @@ def sparse_kv_stats() -> dict[str, float | int]:
     payload: dict[str, float | int] = dict(_SPARSE_STATS)
     payload["selected_ratio"] = payload["selected_blocks"] / max(
         1, payload["full_blocks"])
+    payload["prediction_recall"] = payload["hit_blocks"] / max(
+        1, payload["actual_blocks"])
     return payload
 
 
@@ -58,7 +79,19 @@ def record_sparse_kv_selection(refresh: bool) -> None:
     _SPARSE_STATS["attention_selection_refreshes"] += 1
 
 
-def validate_sparse_kv_prediction(
+@dataclass(frozen=True)
+class SparseKVPredictionGap:
+    """Current-query prefix selection compared with prediction/residency."""
+
+    predicted_prefix_blocks: Tuple[int, ...]
+    actual_prefix_blocks: Tuple[int, ...]
+    resident_prefix_blocks: Tuple[int, ...]
+    hit_blocks: Tuple[int, ...]
+    missing_blocks: Tuple[int, ...]
+    wasted_blocks: Tuple[int, ...]
+
+
+def build_sparse_kv_prediction_gap(
     *,
     predicted_prefix_blocks: Sequence[int],
     actual_prefix_blocks: Sequence[int],
@@ -66,8 +99,8 @@ def validate_sparse_kv_prediction(
     num_prefix_blocks: int,
     request_id: str,
     layer_index: int,
-) -> None:
-    """Record and validate a frozen prefix prediction before consumption.
+) -> SparseKVPredictionGap:
+    """Build and record a frozen-prefix prediction comparison.
 
     This is intentionally a control-plane check for dynamic restore.  It is
     not called by the resident-only selected-list path.
@@ -86,20 +119,90 @@ def validate_sparse_kv_prediction(
     predicted = normalize(predicted_prefix_blocks)
     actual = normalize(actual_prefix_blocks)
     resident = normalize(resident_blocks)
+    hit = actual.intersection(resident)
     missing = actual.difference(resident)
+    wasted = predicted.difference(actual)
+    gap = SparseKVPredictionGap(
+        predicted_prefix_blocks=tuple(sorted(predicted)),
+        actual_prefix_blocks=tuple(sorted(actual)),
+        resident_prefix_blocks=tuple(sorted(resident)),
+        hit_blocks=tuple(sorted(hit)),
+        missing_blocks=tuple(sorted(missing)),
+        wasted_blocks=tuple(sorted(wasted)),
+    )
     _SPARSE_STATS["prediction_calls"] += 1
     _SPARSE_STATS["prediction_predicted_blocks"] += len(predicted)
     _SPARSE_STATS["prediction_actual_blocks"] += len(actual)
-    _SPARSE_STATS["prediction_hit_blocks"] += len(actual.intersection(resident))
+    _SPARSE_STATS["prediction_hit_blocks"] += len(hit)
     _SPARSE_STATS["prediction_miss_blocks"] += len(missing)
-    _SPARSE_STATS["prediction_wasted_blocks"] += len(predicted.difference(actual))
+    _SPARSE_STATS["prediction_wasted_blocks"] += len(wasted)
+    _SPARSE_STATS["prediction_checks"] += 1
+    _SPARSE_STATS["predicted_blocks"] += len(predicted)
+    _SPARSE_STATS["actual_blocks"] += len(actual)
+    _SPARSE_STATS["hit_blocks"] += len(hit)
+    _SPARSE_STATS["missing_blocks"] += len(missing)
+    _SPARSE_STATS["wasted_blocks"] += len(wasted)
     if missing:
         _SPARSE_STATS["prediction_miss"] += 1
-        missing_indices = tuple(sorted(missing))
+        _SPARSE_STATS["prediction_gap_events"] += 1
+    else:
+        _SPARSE_STATS["zero_miss_checks"] += 1
+    return gap
+
+
+def validate_sparse_kv_prediction(
+    *,
+    predicted_prefix_blocks: Sequence[int],
+    actual_prefix_blocks: Sequence[int],
+    resident_blocks: Sequence[int],
+    num_prefix_blocks: int,
+    request_id: str,
+    layer_index: int,
+) -> None:
+    """Compatibility fail-fast wrapper used when correction is disabled."""
+    gap = build_sparse_kv_prediction_gap(
+        predicted_prefix_blocks=predicted_prefix_blocks,
+        actual_prefix_blocks=actual_prefix_blocks,
+        resident_blocks=resident_blocks,
+        num_prefix_blocks=num_prefix_blocks,
+        request_id=request_id,
+        layer_index=layer_index,
+    )
+    if gap.missing_blocks:
         raise RuntimeError(
             "SolidAttention prediction_miss: "
             f"request={request_id} layer={layer_index} "
-            f"missing_prefix_blocks={missing_indices}")
+            f"missing_prefix_blocks={gap.missing_blocks}")
+
+
+def record_sparse_kv_actual_selection(elapsed_ms: float) -> None:
+    if elapsed_ms < 0:
+        raise ValueError("actual selection time must be non-negative")
+    _SPARSE_STATS["actual_selection_ms"] += elapsed_ms
+
+
+def record_sparse_kv_correction(
+    *,
+    blocks: int,
+    fragments: int,
+    read_bytes: int,
+    submit_ms: float,
+    wait_ms: float,
+    total_ms: float,
+) -> None:
+    if min(blocks, fragments, read_bytes) < 0:
+        raise ValueError("correction counters must be non-negative")
+    _SPARSE_STATS["correction_requests"] += 1
+    _SPARSE_STATS["correction_blocks"] += blocks
+    _SPARSE_STATS["correction_fragments"] += fragments
+    _SPARSE_STATS["correction_bytes"] += read_bytes
+    _SPARSE_STATS["correction_submit_ms"] += submit_ms
+    _SPARSE_STATS["correction_wait_ms"] += wait_ms
+    _SPARSE_STATS["correction_total_ms"] += total_ms
+
+
+def record_sparse_kv_correction_error() -> None:
+    _SPARSE_STATS["correction_errors"] += 1
 
 
 def validate_sparse_kv_policy_prediction(
@@ -145,6 +248,12 @@ def record_sparse_kv_attention(full_blocks: int, selected_blocks: int,
     _SPARSE_STATS["full_blocks"] += full_blocks
     _SPARSE_STATS["selected_blocks"] += selected_blocks
     _SPARSE_STATS["selected_tokens"] += selected_tokens
+    _SPARSE_STATS["attention_selected_calls"] += 1
+
+
+def record_sparse_kv_compact_attention() -> None:
+    """Record one sparse decode that rebuilt a compact block table."""
+    _SPARSE_STATS["attention_compact_calls"] += 1
 
 
 @dataclass(frozen=True)
@@ -175,6 +284,7 @@ class SparseKVDeviceSelection:
 
     logical_block_indices: torch.Tensor
     count: int
+    prefix_count: int | None = None
 
 
 def validate_sparse_kv_device_selection(
@@ -195,6 +305,10 @@ def validate_sparse_kv_device_selection(
         raise TypeError("selected logical block count must be a Python int")
     if selection.count <= 0 or selection.count > indices.numel():
         raise ValueError("selected logical block count is outside the buffer")
+    if selection.prefix_count is not None and (
+            selection.prefix_count <= 0 or
+            selection.prefix_count > selection.count):
+        raise ValueError("selected prefix count is outside the selection")
     _SPARSE_STATS["attention_selection_calls"] += 1
     _SPARSE_STATS["attention_selected_blocks"] += selection.count
     return selection
