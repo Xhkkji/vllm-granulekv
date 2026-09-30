@@ -354,6 +354,21 @@ class PrefetchResidencyDirectory:
         resident.update(key.logical_index
                         for key in projection.logical_blocks)
 
+    def mark_blocks_resident(self, plan_id: str, layer_index: int,
+                             logical_blocks: Sequence[int]) -> None:
+        """Mark blocks copied from an already completed host cache."""
+        plan = self._correction_plans.get(plan_id)
+        if plan is None:
+            raise RuntimeError("sparse correction plan was discarded")
+        resident = plan.resident_by_layer.get(layer_index)
+        if resident is None:
+            raise RuntimeError("sparse correction layer is not registered")
+        blocks = tuple(sorted(set(int(index) for index in logical_blocks)))
+        if any(index < 0 or index >= plan.num_prefix_blocks
+               for index in blocks):
+            raise ValueError("host-resident block is outside immutable prefix")
+        resident.update(blocks)
+
     def _register_correction_plan(
         self,
         request: AsyncKVTransferRequest,

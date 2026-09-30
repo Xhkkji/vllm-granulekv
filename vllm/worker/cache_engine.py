@@ -63,6 +63,14 @@ class CacheEngine:
                 "GranuleKV connector currently requires TP=1 and PP=1")
 
         self.granulekv_connector = None
+        self.granulekv_host_staging = (
+            self.granulekv_enabled
+            and envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE)
+        if self.granulekv_host_staging and (
+                envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS <= 0):
+            raise ValueError(
+                "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS must be positive "
+                "when CPU staging is enabled")
         # legacy deferred swap-in 仍是单个 model-execution dependency；新的
         # AsyncKVScheduler 使用下面按 request_id 索引的多槽 trace 表。
         self._granulekv_transfer_started_at: float | None = None
@@ -99,7 +107,9 @@ class CacheEngine:
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = (
-            [] if self.granulekv_enabled else
+            (self.granulekv_connector.host_cache
+             if self.granulekv_host_staging
+             else []) if self.granulekv_enabled else
             self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
         )
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
@@ -180,6 +190,12 @@ class CacheEngine:
                                  or self.num_attention_layers),
                 num_gpu_blocks=num_blocks,
                 num_storage_blocks=self.num_cpu_blocks,
+                num_host_blocks=(
+                    envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS
+                    if self.granulekv_host_staging else 0),
+                num_host_regions=(
+                    self.num_attention_layers
+                    if self.granulekv_host_staging else 0),
             )
             return self.granulekv_connector.gpu_cache
 
@@ -248,6 +264,7 @@ class CacheEngine:
         operation: AsyncKVTransferOperation,
         src_to_dst: torch.Tensor,
         layer_range: Optional[Tuple[int, int]] = None,
+        destination: str = "gpu",
     ) -> AsyncKVTransferEvent:
         """把 Scheduler 的异步 read/write 提交给 resident GranuleKV。
 
@@ -284,7 +301,8 @@ class CacheEngine:
                 request_id,
                 src_to_dst,
                 operation=operation.value,
-                layer_range=layer_range)
+                layer_range=layer_range,
+                destination=destination)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
@@ -431,6 +449,36 @@ class CacheEngine:
 
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
+
+    def copy_host_blocks_to_gpu(self, layer_index: int,
+                                host_to_gpu: torch.Tensor) -> None:
+        """Copy selected host-cache blocks into the current GPU working set."""
+        if not self.granulekv_host_staging:
+            raise RuntimeError("GranuleKV host staging is not enabled")
+        if host_to_gpu.numel() == 0:
+            return
+        if host_to_gpu.ndim != 2 or host_to_gpu.shape[1] != 2:
+            raise ValueError("host_to_gpu must have shape [N, 2]")
+        self.attn_backend.swap_blocks(
+            self.cpu_cache[layer_index],
+            self.gpu_cache[layer_index],
+            host_to_gpu,
+        )
+
+    def copy_gpu_blocks_to_host(self, layer_index: int,
+                                gpu_to_host: torch.Tensor) -> None:
+        """Preserve a consumed GPU working-set block in the host cache."""
+        if not self.granulekv_host_staging:
+            raise RuntimeError("GranuleKV host staging is not enabled")
+        if gpu_to_host.numel() == 0:
+            return
+        if gpu_to_host.ndim != 2 or gpu_to_host.shape[1] != 2:
+            raise ValueError("gpu_to_host must have shape [N, 2]")
+        self.attn_backend.swap_blocks(
+            self.gpu_cache[layer_index],
+            self.cpu_cache[layer_index],
+            gpu_to_host,
+        )
 
     @staticmethod
     def get_cache_block_size(

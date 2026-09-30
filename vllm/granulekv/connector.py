@@ -33,14 +33,20 @@ class GranuleKVRequestSpec:
     operation: str
     gpu_block_ids: tuple[int, ...]
     storage_block_ids: tuple[int, ...]
+    destination: str = "gpu"
+    host_block_ids: tuple[int, ...] = ()
     layer_range: Optional[Tuple[int, int]] = None
     gpu_region_start: Optional[int] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "gpu_block_ids": list(self.gpu_block_ids),
             "storage_block_ids": list(self.storage_block_ids),
         }
+        if self.destination == "host":
+            payload["destination"] = "host"
+            payload["host_block_ids"] = list(self.host_block_ids)
+        else:
+            payload["gpu_block_ids"] = list(self.gpu_block_ids)
         if self.layer_range is not None:
             payload["layer_start"], payload["layer_end"] = self.layer_range
         if self.gpu_region_start is not None:
@@ -93,6 +99,8 @@ class GranuleKVConnector:
         num_gpu_regions: int,
         num_gpu_blocks: int,
         num_storage_blocks: int,
+        num_host_blocks: int = 0,
+        num_host_regions: int = 0,
     ) -> None:
         if not envs.VLLM_GRANULEKV_IOSTACK_ROOT:
             raise ValueError("VLLM_GRANULEKV_IOSTACK_ROOT is required")
@@ -113,6 +121,8 @@ class GranuleKVConnector:
             num_gpu_blocks=num_gpu_blocks,
             num_storage_blocks=num_storage_blocks,
             device_index=device_index,
+            num_host_blocks=num_host_blocks,
+            num_host_regions=num_host_regions,
         )
         self.bridge = self._load_torch_bridge()
         self.client = client_module.GranuleKVClient(
@@ -125,6 +135,7 @@ class GranuleKVConnector:
         self.max_blocks_per_pool = 0
         self.max_in_flight = 0
         self.gpu_cache: list[torch.Tensor] = []
+        self.host_cache: list[torch.Tensor] = []
         self._pending_transfers: dict[str, _PendingTransfer] = {}
         try:
             self.gpu_cache = self._allocate_and_wrap()
@@ -161,7 +172,7 @@ class GranuleKVConnector:
                 "GranuleKV request-slot mismatch: daemon="
                 f"{self.max_in_flight}, vLLM={envs.VLLM_GRANULEKV_MAX_IN_FLIGHT}")
         physical_regions: list[torch.Tensor] = []
-        for region in result.regions:
+        for region in result.gpu_regions:
             tensor = self.bridge.tensor_from_cuda_ptr(
                 region.region_ptr,
                 list(self.layout.tensor_shape),
@@ -182,6 +193,35 @@ class GranuleKVConnector:
             physical_regions[layer % self.layout.num_gpu_regions]
             for layer in range(self.layout.num_layers)
         ]
+        host_tensors: list[torch.Tensor] = []
+        if self.layout.num_host_blocks:
+            for region in result.host_regions:
+                host_mappings = result.manifest["host_regions"]
+                mapping = host_mappings[region.region_index]
+                host_mapping = region.host_buffer
+                if host_mapping is None:
+                    raise RuntimeError("GranuleKV host mapping was not imported")
+                tensor = torch.frombuffer(
+                    host_mapping,
+                    dtype=self.layout_dtype,
+                    count=(int(mapping["allocation_bytes"])
+                           // self.layout.element_size),
+                )
+                tensor = torch.as_strided(
+                    tensor,
+                    size=self.layout.host_tensor_shape,
+                    stride=self.layout.host_tensor_strides,
+                )
+                if (tensor.data_ptr() != region.region_ptr
+                        or tensor.numel() < self.layout.num_host_blocks):
+                    raise RuntimeError("imported GranuleKV host tensor mismatch")
+                host_tensors.append(tensor)
+            if len(host_tensors) != self.layout.num_host_regions:
+                raise RuntimeError("GranuleKV host region count mismatch")
+        self.host_cache = [
+            host_tensors[layer % self.layout.num_host_regions]
+            for layer in range(self.layout.num_layers)
+        ] if host_tensors else []
         logger.info(
             "[GRANULEKV] imported KV cache layers=%d gpu_regions=%d "
             "gpu_blocks=%d storage_blocks=%d fragment_bytes=%d "
@@ -192,6 +232,15 @@ class GranuleKVConnector:
             self.max_blocks_per_pool, self.max_in_flight)
         return tensors
 
+    @property
+    def layout_dtype(self) -> torch.dtype:
+        return {
+            "uint8": torch.uint8,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }[self.layout.dtype_name]
+
     def start(self) -> None:
         self.client.start()
         logger.info("[GRANULEKV] resident async service enabled after model warmup")
@@ -201,6 +250,7 @@ class GranuleKVConnector:
         if self._pending_transfers:
             raise RuntimeError(
                 "cannot close GranuleKV connector with active requests")
+        self.host_cache.clear()
         self.client.close()
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
@@ -216,18 +266,25 @@ class GranuleKVConnector:
         *,
         operation: str,
         layer_range: Optional[Tuple[int, int]] = None,
+        destination: str = "gpu",
     ) -> GranuleKVTransferStatus:
         """Submit one active request through the canonical lifecycle."""
         if not request_id:
             raise ValueError("request_id must not be empty")
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported GranuleKV operation: {operation}")
+        destination = destination.lower()
+        if destination not in ("gpu", "host"):
+            raise ValueError(f"unsupported GranuleKV destination: {destination}")
+        if destination == "host" and not self.layout.num_host_blocks:
+            raise RuntimeError("GranuleKV host cache is not enabled")
         layer_range = self._validate_layer_range(layer_range)
         if src_to_dst.numel() == 0:
             return GranuleKVTransferStatus(
                 request_id, GranuleKVTransferState.READY, operation)
         spec = self._request_spec(
-            src_to_dst, operation=operation, layer_range=layer_range)
+            src_to_dst, operation=operation, layer_range=layer_range,
+            destination=destination)
 
         pending = self._pending_transfers.get(request_id)
         if pending is not None:
@@ -307,31 +364,45 @@ class GranuleKVConnector:
         *,
         operation: str,
         layer_range: Optional[Tuple[int, int]] = None,
+        destination: str = "gpu",
     ) -> GranuleKVRequestSpec:
         mappings = tuple(
             (int(source), int(destination))
             for source, destination in src_to_dst.to(
                 device="cpu", dtype=torch.int64).tolist())
-        source_ids = [mapping[0] for mapping in mappings]
-        destination_ids = [mapping[1] for mapping in mappings]
-        if operation == "write":
-            gpu_ids, storage_ids = source_ids, destination_ids
-        elif operation == "read":
-            storage_ids, gpu_ids = source_ids, destination_ids
+        if destination == "host":
+            if operation != "read":
+                raise ValueError("host destination currently supports reads only")
+            storage_ids = [mapping[0] for mapping in mappings]
+            host_ids = [mapping[1] for mapping in mappings]
+            gpu_ids = []
+            if any(block < 0 or block >= self.layout.num_host_blocks
+                   for block in host_ids):
+                raise ValueError("host block id is outside host cache")
         else:
-            raise ValueError(f"unsupported GranuleKV operation: {operation}")
+            source_ids = [mapping[0] for mapping in mappings]
+            destination_ids = [mapping[1] for mapping in mappings]
+            if operation == "write":
+                gpu_ids, storage_ids = source_ids, destination_ids
+            elif operation == "read":
+                storage_ids, gpu_ids = source_ids, destination_ids
+            else:
+                raise ValueError(f"unsupported GranuleKV operation: {operation}")
+            host_ids = []
         gpu_region_start: Optional[int] = None
-        if layer_range is not None:
+        if destination == "gpu" and layer_range is not None:
             if self.layout.num_gpu_regions < self.layout.num_layers:
                 gpu_region_start = (
                     layer_range[0] % self.layout.num_gpu_regions)
-        elif self.layout.num_gpu_regions < self.layout.num_layers:
+        elif destination == "gpu" and self.layout.num_gpu_regions < self.layout.num_layers:
             raise RuntimeError(
                 "layer working-set mode only supports layer-ranged GranuleKV I/O")
         return GranuleKVRequestSpec(
             operation=operation,
             gpu_block_ids=tuple(gpu_ids),
             storage_block_ids=tuple(storage_ids),
+            destination=destination,
+            host_block_ids=tuple(host_ids),
             layer_range=layer_range,
             gpu_region_start=gpu_region_start,
         )

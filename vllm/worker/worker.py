@@ -76,6 +76,32 @@ class Worker(LocalOrDistributedWorkerBase):
         # identity；mapping 已经在 submit 时交给 CacheEngine，poll 不再依赖
         # 或复制它。prefetch unit 则由下面的 Worker-local runtime 持有。
         self._async_kv_transfer_ids: Set[Tuple[int, str]] = set()
+        self._host_async_kv_transfers: Dict[
+            Tuple[int, str], Tuple[str, str, Tuple[int, ...], Tuple[int, int]]
+        ] = {}
+        self._host_ready_blocks: Set[Tuple[int, str, int, int]] = set()
+        self._host_failed_blocks: Set[Tuple[int, str, int, int]] = set()
+        self._host_staged_blocks: Set[Tuple[int, str, int, int]] = set()
+        self._discarded_host_transfers: Set[Tuple[int, str]] = set()
+        self._host_staging_owner: Optional[Tuple[int, str]] = None
+        self._host_stats: Dict[str, int] = {
+            "gpu_direct_read_requests": 0,
+            "gpu_direct_read_blocks": 0,
+            "gpu_direct_read_bytes": 0,
+            "cpu_direct_read_requests": 0,
+            "cpu_direct_read_blocks": 0,
+            "cpu_direct_read_bytes": 0,
+            "gpu_to_cpu_blocks": 0,
+            "gpu_to_cpu_bytes": 0,
+            "cpu_to_gpu_blocks": 0,
+            "cpu_to_gpu_bytes": 0,
+            "cpu_cache_ready_blocks": 0,
+            "cpu_cache_hit_blocks": 0,
+            "cpu_cache_loading_waits": 0,
+            "ssd_fallback_correction_requests": 0,
+            "duplicate_ssd_read_blocks": 0,
+            "host_transfer_errors": 0,
+        }
         # layer-window 和未来 sparse unit 共用一个 plan runtime。Scheduler
         # 仍是 block/reservation 的唯一所有者；这里仅保存预授权 mapping，
         # 根据 model progress 激活 GranuleKV handle，并缓存 completion event。
@@ -159,6 +185,10 @@ class Worker(LocalOrDistributedWorkerBase):
             "window_union")
         result["prediction_guard_blocks"] = (
             envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS)
+        result.update(self._host_stats)
+        if reset:
+            for name in self._host_stats:
+                self._host_stats[name] = 0
         return result
 
     def start_profile(self):
@@ -565,6 +595,66 @@ class Worker(LocalOrDistributedWorkerBase):
                         [block.logical_index for block in request.logical_blocks],
                         mapping[:, 0].tolist(),
                     )
+            def stage_host_blocks() -> None:
+                if not envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE:
+                    return
+                host_stages = (
+                    ("bulk", request.host_block_mapping,
+                     request.host_layer_range),
+                    ("tail", request.host_tail_block_mapping,
+                     request.host_tail_layer_range),
+                )
+                for suffix, block_mapping, layer_range in host_stages:
+                    if block_mapping is None or layer_range is None:
+                        continue
+                    host_mapping = torch.tensor(
+                        block_mapping, device="cpu", dtype=torch.int64).view(-1, 2)
+                    if not host_mapping.numel():
+                        continue
+                    owner = (virtual_engine, request.seq_group_id)
+                    if (self._host_staging_owner is not None
+                            and self._host_staging_owner != owner):
+                        raise RuntimeError(
+                            "CPU KV staging currently supports one active "
+                            "request; refusing to overwrite shared host slots")
+                    self._host_staging_owner = owner
+                    block_bytes = CacheEngine.get_cache_block_size(
+                        self.cache_config, self.model_config,
+                        self.parallel_config)
+                    self._host_stats["cpu_direct_read_requests"] += 1
+                    self._host_stats["cpu_direct_read_blocks"] += int(
+                        host_mapping.shape[0])
+                    self._host_stats["cpu_direct_read_bytes"] += (
+                        int(host_mapping.shape[0]) * block_bytes)
+                    host_request_id = (
+                        f"host-stage-{request.request_id}-{suffix}")
+                    host_event = cache_engine.submit_async_kv_transfer(
+                        host_request_id,
+                        AsyncKVTransferOperation.READ,
+                        host_mapping,
+                        layer_range=layer_range,
+                        destination="host",
+                    )
+                    host_blocks = tuple(
+                        int(pair[1]) for pair in block_mapping)
+                    host_record = (host_request_id, request.seq_group_id,
+                                   host_blocks,
+                                   layer_range)
+                    for layer in range(*layer_range):
+                        self._host_staged_blocks.update(
+                            (virtual_engine, request.seq_group_id, layer, block)
+                            for block in host_blocks)
+                    if host_event.state == AsyncKVTransferState.PENDING:
+                        self._host_async_kv_transfers[
+                            (virtual_engine, host_request_id)] = host_record
+                    elif host_event.state == AsyncKVTransferState.ERROR:
+                        self._host_stats["host_transfer_errors"] += 1
+                        for layer in range(*layer_range):
+                            self._host_failed_blocks.update(
+                                (virtual_engine, request.seq_group_id, layer,
+                                 block) for block in host_blocks)
+                    else:
+                        self._mark_host_ready(virtual_engine, host_record)
             if request.prefetch_plan_id is not None:
                 events.extend(self._prefetch_runtime.submit_or_stage(
                     virtual_engine,
@@ -575,18 +665,33 @@ class Worker(LocalOrDistributedWorkerBase):
                         unit.request_id,
                         unit.operation,
                         unit_mapping,
-                        layer_range=unit.layer_range),
+                        layer_range=unit.layer_range,
+                        destination=unit.destination),
                 ))
+                stage_host_blocks()
                 continue
 
             event = cache_engine.submit_async_kv_transfer(
                 request.request_id,
                 request.operation,
                 mapping,
-                layer_range=request.layer_range)
+                layer_range=request.layer_range,
+                destination=request.destination)
             events.append(event)
+            if (request.destination == "gpu"
+                    and request.operation == AsyncKVTransferOperation.READ
+                    and mapping.numel()):
+                block_bytes = CacheEngine.get_cache_block_size(
+                    self.cache_config, self.model_config,
+                    self.parallel_config)
+                self._host_stats["gpu_direct_read_requests"] += 1
+                self._host_stats["gpu_direct_read_blocks"] += int(
+                    mapping.shape[0])
+                self._host_stats["gpu_direct_read_bytes"] += (
+                    int(mapping.shape[0]) * block_bytes)
             if event.state == AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_ids.add(key)
+            stage_host_blocks()
         return events
 
     def poll_async_kv_transfers(
@@ -607,8 +712,151 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_ids.remove(key)
+        for key, record in tuple(self._host_async_kv_transfers.items()):
+            if key[0] != virtual_engine:
+                continue
+            host_request_id = key[1]
+            event = cache_engine.poll_async_kv_transfer(host_request_id)
+            if event.state == AsyncKVTransferState.PENDING:
+                continue
+            del self._host_async_kv_transfers[key]
+            discard = key in self._discarded_host_transfers
+            self._discarded_host_transfers.discard(key)
+            if discard:
+                owner = (virtual_engine, record[1])
+                if (self._host_staging_owner == owner
+                        and not any(value[1] == record[1]
+                                    and active_key[0] == virtual_engine
+                                    for active_key, value in
+                                    self._host_async_kv_transfers.items())):
+                    self._host_staging_owner = None
+                continue
+            if event.state == AsyncKVTransferState.READY:
+                self._mark_host_ready(virtual_engine, record)
+            else:
+                self._host_stats["host_transfer_errors"] += 1
+                self._mark_host_failed(virtual_engine, record)
         self._log_prefetch_runtime_traces()
         return events
+
+    def _mark_host_ready(
+        self,
+        virtual_engine: int,
+        record: Tuple[str, str, Tuple[int, ...], Tuple[int, int]],
+    ) -> None:
+        _, seq_group_id, blocks, layer_range = record
+        self._host_stats["cpu_cache_ready_blocks"] += len(blocks)
+        for layer in range(*layer_range):
+            self._host_ready_blocks.update(
+                (virtual_engine, seq_group_id, layer, block)
+                for block in blocks)
+
+    def _mark_host_failed(
+        self,
+        virtual_engine: int,
+        record: Tuple[str, str, Tuple[int, ...], Tuple[int, int]],
+    ) -> None:
+        _, seq_group_id, blocks, layer_range = record
+        for layer in range(*layer_range):
+            self._host_failed_blocks.update(
+                (virtual_engine, seq_group_id, layer, block)
+                for block in blocks)
+
+    def host_blocks_ready(self, virtual_engine: int, seq_group_id: str,
+                          layer_index: int,
+                          logical_blocks: Sequence[int]) -> bool:
+        return all((virtual_engine, seq_group_id, layer_index, int(block))
+                   in self._host_ready_blocks for block in logical_blocks)
+
+    def host_blocks_staged(self, virtual_engine: int, seq_group_id: str,
+                           layer_index: int,
+                           logical_blocks: Sequence[int]) -> Tuple[int, ...]:
+        return tuple(
+            int(block) for block in logical_blocks
+            if (virtual_engine, seq_group_id, layer_index, int(block))
+            in self._host_staged_blocks)
+
+    def host_blocks_failed(self, virtual_engine: int, seq_group_id: str,
+                           layer_index: int,
+                           logical_blocks: Sequence[int]) -> bool:
+        return any((virtual_engine, seq_group_id, layer_index, int(block))
+                   in self._host_failed_blocks for block in logical_blocks)
+
+    def wait_for_host_blocks(self, virtual_engine: int, seq_group_id: str,
+                             layer_index: int,
+                             logical_blocks: Sequence[int],
+                             timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        if not self.host_blocks_ready(virtual_engine, seq_group_id,
+                                       layer_index, logical_blocks):
+            self._host_stats["cpu_cache_loading_waits"] += 1
+        while not self.host_blocks_ready(virtual_engine, seq_group_id,
+                                          layer_index, logical_blocks):
+            if any((virtual_engine, seq_group_id, layer_index, int(block))
+                   in self._host_failed_blocks for block in logical_blocks):
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            self.poll_async_kv_transfers(virtual_engine)
+            time.sleep(0.0001)
+        return True
+
+    def copy_host_blocks_to_gpu(self, virtual_engine: int, layer_index: int,
+                                mapping: torch.Tensor) -> None:
+        self.cache_engine[virtual_engine].copy_host_blocks_to_gpu(
+            layer_index, mapping)
+
+    def demote_hierarchical_layer_to_host(
+            self, virtual_engine: int, state: SparseKVLayerPredictionState,
+            layer_index: int) -> None:
+        """Preserve restored GPU blocks in host staging after attention use."""
+        if not envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE:
+            return
+        pairs = tuple(
+            (int(state.correction_mapping_by_logical[block][0]), int(block))
+            for block in state.resident_prefix_blocks
+            if 0 <= block < len(state.correction_mapping_by_logical)
+            and state.correction_mapping_by_logical[block][0] >= 0)
+        if not pairs:
+            return
+        mapping = torch.tensor(pairs, device="cpu", dtype=torch.int64).view(-1, 2)
+        self.cache_engine[virtual_engine].copy_gpu_blocks_to_host(
+            layer_index, mapping)
+        layer_block_bytes = (
+            CacheEngine.get_cache_block_size(
+                self.cache_config, self.model_config,
+                self.parallel_config) //
+            self.cache_engine[virtual_engine].num_attention_layers)
+        self._host_stats["gpu_to_cpu_blocks"] += len(pairs)
+        self._host_stats["gpu_to_cpu_bytes"] += len(pairs) * layer_block_bytes
+        self._host_staged_blocks.update(
+            (virtual_engine, state.seq_group_id, layer_index, block)
+            for _, block in pairs)
+        self._host_ready_blocks.update(
+            (virtual_engine, state.seq_group_id, layer_index, block)
+            for _, block in pairs)
+
+    def _forget_host_staging(self, virtual_engine: int,
+                             request_ids: Sequence[str]) -> None:
+        """Drop finished request metadata without cancelling active DMA."""
+        finished = frozenset(request_ids)
+        if not finished:
+            return
+        for key, record in tuple(self._host_async_kv_transfers.items()):
+            if key[0] == virtual_engine and record[1] in finished:
+                self._discarded_host_transfers.add(key)
+        for collection in (self._host_ready_blocks, self._host_failed_blocks,
+                           self._host_staged_blocks):
+            collection.difference_update(
+                item for item in collection
+                if item[0] == virtual_engine and item[1] in finished)
+        owner = self._host_staging_owner
+        if owner is not None and owner[0] == virtual_engine and owner[1] in finished:
+            active_for_owner = any(
+                key[0] == virtual_engine and record[1] == owner[1]
+                for key, record in self._host_async_kv_transfers.items())
+            if not active_for_owner:
+                self._host_staging_owner = None
 
     def discard_staged_async_kv_transfers(
         self,
@@ -688,10 +936,52 @@ class Worker(LocalOrDistributedWorkerBase):
             )
         record_sparse_kv_actual_selection(
             (time.perf_counter() - selection_started) * 1000.0)
+        resident_blocks = set(state.resident_prefix_blocks)
+        if envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE:
+            staged_blocks = self.host_blocks_staged(
+                virtual_engine, state.seq_group_id, layer_index, actual_prefix)
+            if staged_blocks:
+                host_ready = self.wait_for_host_blocks(
+                    virtual_engine,
+                    state.seq_group_id,
+                    layer_index,
+                    staged_blocks,
+                    envs.VLLM_GRANULEKV_TIMEOUT_SECONDS,
+                )
+                if not host_ready and not self.host_blocks_failed(
+                        virtual_engine, state.seq_group_id, layer_index,
+                        staged_blocks):
+                    raise TimeoutError(
+                        "timed out waiting for staged host KV blocks")
+                ready_blocks = tuple(
+                    block for block in staged_blocks
+                    if (virtual_engine, state.seq_group_id, layer_index, block)
+                    in self._host_ready_blocks)
+                if ready_blocks:
+                    layer_block_bytes = (
+                        CacheEngine.get_cache_block_size(
+                            self.cache_config, self.model_config,
+                            self.parallel_config) //
+                        self.cache_engine[virtual_engine].num_attention_layers)
+                    self._host_stats["cpu_cache_hit_blocks"] += len(
+                        ready_blocks)
+                    self._host_stats["cpu_to_gpu_blocks"] += len(ready_blocks)
+                    self._host_stats["cpu_to_gpu_bytes"] += (
+                        len(ready_blocks) * layer_block_bytes)
+                    host_to_gpu = torch.tensor(
+                        [(block,
+                          state.correction_mapping_by_logical[block][0])
+                         for block in ready_blocks],
+                        device="cpu", dtype=torch.int64).view(-1, 2)
+                    self.copy_host_blocks_to_gpu(
+                        virtual_engine, layer_index, host_to_gpu)
+                    self._prefetch_runtime.mark_host_resident(
+                        state, layer_index, ready_blocks)
+                    resident_blocks.update(ready_blocks)
         gap = build_sparse_kv_prediction_gap(
             predicted_prefix_blocks=state.predicted_prefix_blocks,
             actual_prefix_blocks=actual_prefix,
-            resident_blocks=state.resident_prefix_blocks,
+            resident_blocks=resident_blocks,
             num_prefix_blocks=state.num_prefix_blocks,
             request_id=state.seq_group_id,
             layer_index=layer_index,
@@ -768,6 +1058,12 @@ class Worker(LocalOrDistributedWorkerBase):
             # 读发生竞争。验证版在 window 边界显式同步，先保证语义正确；后续
             # 可改成 CUDA event -> MDS activation 的非阻塞依赖协议。
             torch.cuda.synchronize()
+        if envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE:
+            state = self._prefetch_runtime.prediction_state(
+                request_ids, layer_index)
+            if state is not None:
+                self.demote_hierarchical_layer_to_host(
+                    virtual_engine, state, layer_index)
         self._prefetch_runtime.release_layer(virtual_engine, request_ids,
                                              layer_index)
         self._log_prefetch_runtime_traces()
@@ -788,7 +1084,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 unit.request_id,
                 unit.operation,
                 mapping,
-                layer_range=unit.layer_range),
+                layer_range=unit.layer_range,
+                destination=unit.destination),
             lambda unit: cache_engine.poll_async_kv_transfer(unit.request_id),
             max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
         )
@@ -872,6 +1169,9 @@ class Worker(LocalOrDistributedWorkerBase):
             # I/O completion 与请求生命周期不同：长 prompt 在 restore 完成后
             # 仍可能经过多个 chunked-prefill iteration。只在 Engine 明确通知
             # finished/abort 时回收 sparse residency，避免提前丢失消费约束。
+            self._forget_host_staging(
+                execute_model_req.virtual_engine,
+                execute_model_req.finished_requests_ids)
             self._prefetch_runtime.forget_seq_groups(
                 execute_model_req.finished_requests_ids)
             new_seq_group_metadata_list = self._get_cached_seq_group_metadata(

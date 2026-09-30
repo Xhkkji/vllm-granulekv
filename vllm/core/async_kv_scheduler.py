@@ -469,15 +469,13 @@ class AsyncKVScheduler(Scheduler):
         selected_block_counts = []
         selected_logical_counts = []
         read_fragments_estimate = 0
+        host_stage_active = False
         for unit in plan.units:
             # dense layer plan 的 block_indices 为 None，投影结果与历史逻辑
             # 完全一致。sparse-style selector 只改变 unit 的 block 选择，不
             # 复制 reservation、队列和 GranuleKV 生命周期代码。
             block_mapping, logical_blocks = select_prefetch_unit_blocks(
                 unit, reservation.block_mapping, reservation.logical_blocks)
-            selected_block_counts.append(len(block_mapping))
-            selected_logical_counts.append(len(logical_blocks))
-            read_fragments_estimate += (len(block_mapping) * unit.num_layers * 2)
             if plan.consumer_enabled and plan.access_plan is None:
                 # Dense warmup is represented as a consumer-visible all-block
                 # residency set.  The I/O mapping may still omit blocks already
@@ -501,6 +499,48 @@ class AsyncKVScheduler(Scheduler):
             else:
                 consumer_block_indices = unit.block_indices
                 consumer_blocks_by_layer = unit.consumer_blocks_by_layer
+            host_block_mapping = None
+            host_layer_range = None
+            host_tail_block_mapping = None
+            host_tail_layer_range = None
+            host_staging = (
+                envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE
+                and plan.consumer_enabled and plan.access_plan is not None)
+            if host_staging and unit.index == 0:
+                gpu_prefix = frozenset(
+                    key.logical_index for key in logical_blocks)
+                host_block_mapping = tuple(
+                    (int(pair[0]), int(key.logical_index))
+                    for pair, key in zip(reservation.block_mapping,
+                                         reservation.logical_blocks)
+                    if key.logical_index not in gpu_prefix)
+                host_layer_range = (
+                    0, self.hierarchical_io_config.num_layers)
+                tail_start = unit.layer_range[1]
+                if tail_start < self.hierarchical_io_config.num_layers:
+                    host_tail_block_mapping = tuple(
+                        (int(pair[0]), int(key.logical_index))
+                        for pair, key in zip(reservation.block_mapping,
+                                             reservation.logical_blocks)
+                        if key.logical_index in gpu_prefix)
+                    if not host_tail_block_mapping:
+                        host_tail_block_mapping = None
+                    else:
+                        host_tail_layer_range = (
+                            tail_start,
+                            self.hierarchical_io_config.num_layers)
+                host_stage_active = bool(
+                    host_block_mapping or host_tail_block_mapping)
+            if host_stage_active and unit.index > 0:
+                # The first unit's complement is the single SSD -> host bulk
+                # transfer. Future units remain in the runtime so layer
+                # barriers keep their existing ordering, but must not issue a
+                # second SSD read for blocks that are now host-owned.
+                block_mapping = ()
+                logical_blocks = ()
+            selected_block_counts.append(len(block_mapping))
+            selected_logical_counts.append(len(logical_blocks))
+            read_fragments_estimate += len(block_mapping) * unit.num_layers * 2
             requests.append(
                 self.async_kv_policy.enqueue(
                     seq_group.request_id,
@@ -533,6 +573,10 @@ class AsyncKVScheduler(Scheduler):
                         if unit.index == 0 and plan.access_plan is not None
                         and plan.access_plan.source ==
                         "solidattention_dynamic" else None),
+                    host_block_mapping=host_block_mapping,
+                    host_layer_range=host_layer_range,
+                    host_tail_block_mapping=host_tail_block_mapping,
+                    host_tail_layer_range=host_tail_layer_range,
                 ))
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(

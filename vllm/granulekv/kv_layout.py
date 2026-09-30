@@ -39,6 +39,11 @@ class GranuleKVLayout:
     num_gpu_blocks: int
     num_storage_blocks: int
     device_index: int
+    num_host_blocks: int = 0
+    num_host_regions: int = 0
+    host_region_bytes: int = 0
+    host_kv_stride_elems: int = 0
+    host_block_stride_elems: int = 0
 
     @classmethod
     def from_allocation(
@@ -52,6 +57,8 @@ class GranuleKVLayout:
         num_gpu_blocks: int,
         num_storage_blocks: int,
         device_index: int,
+        num_host_blocks: int = 0,
+        num_host_regions: int = 0,
     ) -> "GranuleKVLayout":
         shape = tuple(int(value) for value in allocation_shape)
         order = tuple(int(value) for value in stride_order)
@@ -81,6 +88,24 @@ class GranuleKVLayout:
         fragment_bytes = tensor_strides[1] * element_size
         if fragment_bytes % 4096 != 0:
             raise ValueError("GranuleKV fragment must be 4KB aligned")
+        host_region_bytes = 0
+        host_kv_stride_elems = 0
+        host_block_stride_elems = 0
+        if num_host_blocks:
+            if num_host_blocks <= 0 or num_host_regions <= 0:
+                raise ValueError("host blocks and regions must be positive together")
+            host_block_stride_elems = int(tensor_strides[1])
+            host_kv_stride_elems = int(num_host_blocks * host_block_stride_elems)
+            host_shape = list(tensor_shape)
+            host_shape[1] = int(num_host_blocks)
+            host_strides = (host_kv_stride_elems, host_block_stride_elems,
+                            int(tensor_strides[2]))
+            host_storage_elements = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(host_shape, host_strides))
+            host_region_bytes = host_storage_elements * element_size
+        elif num_host_regions:
+            raise ValueError("host regions require host blocks")
         return cls(
             tensor_shape=tensor_shape,
             tensor_strides=tensor_strides,
@@ -93,7 +118,27 @@ class GranuleKVLayout:
             num_gpu_blocks=int(num_gpu_blocks),
             num_storage_blocks=int(num_storage_blocks),
             device_index=int(device_index),
+            num_host_blocks=int(num_host_blocks),
+            num_host_regions=int(num_host_regions),
+            host_region_bytes=int(host_region_bytes),
+            host_kv_stride_elems=int(host_kv_stride_elems),
+            host_block_stride_elems=int(host_block_stride_elems),
         )
+
+    @property
+    def host_tensor_shape(self) -> tuple[int, ...]:
+        if self.num_host_blocks <= 0:
+            return ()
+        shape = list(self.tensor_shape)
+        shape[1] = self.num_host_blocks
+        return tuple(shape)
+
+    @property
+    def host_tensor_strides(self) -> tuple[int, ...]:
+        if self.num_host_blocks <= 0:
+            return ()
+        return (self.host_kv_stride_elems, self.host_block_stride_elems,
+                self.tensor_strides[2])
 
     def allocation_payload(self, *, client_pid: int) -> dict[str, Any]:
         return {
@@ -109,6 +154,11 @@ class GranuleKVLayout:
             "kv_stride_elems": self.tensor_strides[0],
             "block_stride_elems": self.tensor_strides[1],
             "logical_block_bytes": self.num_layers * 2 * self.fragment_bytes,
+            "num_host_blocks": self.num_host_blocks,
+            "num_host_regions": self.num_host_regions,
+            "host_region_bytes": self.host_region_bytes,
+            "host_kv_stride_elems": self.host_kv_stride_elems,
+            "host_block_stride_elems": self.host_block_stride_elems,
             "tensor_shape": list(self.tensor_shape),
             "tensor_strides": list(self.tensor_strides),
             "dtype": self.dtype_name,
@@ -119,5 +169,11 @@ class GranuleKVLayout:
                 or tuple(manifest["tensor_strides"]) != self.tensor_strides
                 or manifest["dtype"] != self.dtype_name):
             raise RuntimeError("GranuleKV allocation manifest layout mismatch")
-        if len(manifest["regions"]) != self.num_gpu_regions:
+        expected_regions = self.num_gpu_regions + self.num_host_regions
+        if len(manifest["regions"]) != expected_regions:
             raise RuntimeError("GranuleKV allocation region count mismatch")
+        if self.num_host_blocks:
+            if len(manifest.get("gpu_regions", ())) != self.num_gpu_regions:
+                raise RuntimeError("GranuleKV GPU region count mismatch")
+            if len(manifest.get("host_regions", ())) != self.num_host_regions:
+                raise RuntimeError("GranuleKV host region count mismatch")

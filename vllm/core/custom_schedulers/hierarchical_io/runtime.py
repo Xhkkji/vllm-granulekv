@@ -323,6 +323,12 @@ class RollingPrefetchRuntime:
     ) -> Optional[SparseKVLayerPredictionState]:
         return self.residency.prediction_state(request_ids, layer_index)
 
+    def mark_host_resident(self, state: SparseKVLayerPredictionState,
+                            layer_index: int,
+                            logical_blocks: Sequence[int]) -> None:
+        self.residency.mark_blocks_resident(
+            state.plan_id, layer_index, logical_blocks)
+
     def correct_layer(
         self,
         virtual_engine: int,
