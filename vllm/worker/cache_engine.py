@@ -465,21 +465,6 @@ class CacheEngine:
             host_to_gpu,
         )
 
-    def copy_gpu_blocks_to_host(self, layer_index: int,
-                                gpu_to_host: torch.Tensor) -> None:
-        """Preserve a consumed GPU working-set block in the host cache."""
-        if not self.granulekv_host_staging:
-            raise RuntimeError("GranuleKV host staging is not enabled")
-        if gpu_to_host.numel() == 0:
-            return
-        if gpu_to_host.ndim != 2 or gpu_to_host.shape[1] != 2:
-            raise ValueError("gpu_to_host must have shape [N, 2]")
-        self.attn_backend.swap_blocks(
-            self.gpu_cache[layer_index],
-            self.cpu_cache[layer_index],
-            gpu_to_host,
-        )
-
     @staticmethod
     def get_cache_block_size(
         cache_config: CacheConfig,
