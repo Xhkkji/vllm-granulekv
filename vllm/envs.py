@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS: int = 0
     VLLM_GRANULEKV_SPARSE_CPU_PREFETCH_ENABLE: bool = False
     VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE: bool = False
+    VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE: bool = False
     VLLM_GRANULEKV_XFORMERS_PREFIX_FALLBACK_PROFILE: bool = False
     VLLM_GRANULEKV_XFORMERS_PREFIX_BACKEND: str = "auto"
     VLLM_GRANULEKV_XFORMERS_QUERY_BACKEND: str = "auto"
@@ -512,6 +513,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE":
     lambda: bool(int(os.getenv(
         "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE", "0"))),
+    "VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE":
+    lambda: bool(int(os.getenv(
+        "VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE", "0"))),
 
     # 是否为 xformers prefix fallback 打开细粒度阶段计时。
     # 默认关闭，避免在正常跑分时引入额外 synchronize 干扰口径。

@@ -137,6 +137,9 @@ class GranuleKVConnector:
         self.gpu_cache: list[torch.Tensor] = []
         self.host_cache: list[torch.Tensor] = []
         self._pending_transfers: dict[str, _PendingTransfer] = {}
+        self._status_query_calls = 0
+        self._complete_calls = 0
+        self._complete_requery_calls = 0
         try:
             self.gpu_cache = self._allocate_and_wrap()
         except Exception:
@@ -302,6 +305,7 @@ class GranuleKVConnector:
 
     def query_request(self, request_id: str) -> GranuleKVTransferStatus:
         """Observe one request without completing or releasing its slot."""
+        self._status_query_calls = getattr(self, "_status_query_calls", 0) + 1
         pending = self._pending_transfers.get(request_id)
         if pending is None:
             raise RuntimeError(
@@ -315,12 +319,24 @@ class GranuleKVConnector:
             io_elapsed_ns=client_status.io_elapsed_ns,
             error=error)
 
-    def complete_request(self, request_id: str) -> GranuleKVTransferStatus:
+    def complete_request(
+            self,
+            request_id: str,
+            ready_status: Optional[GranuleKVTransferStatus] = None,
+    ) -> GranuleKVTransferStatus:
         """Release a READY ordinary or prefetched request."""
+        self._complete_calls = getattr(self, "_complete_calls", 0) + 1
         pending = self._pending_transfers.get(request_id)
         if pending is None:
             raise RuntimeError(f"unknown GranuleKV transfer: {request_id}")
-        status = self.query_request(request_id)
+        if ready_status is None:
+            self._complete_requery_calls = getattr(
+                self, "_complete_requery_calls", 0) + 1
+            status = self.query_request(request_id)
+        else:
+            if ready_status.request_id != request_id:
+                raise RuntimeError("ready status belongs to another request")
+            status = ready_status
         if status.state is GranuleKVTransferState.ERROR:
             raise RuntimeError(status.error or "GranuleKV request failed")
         if not status.ready:
@@ -328,6 +344,19 @@ class GranuleKVConnector:
         self.client.complete(pending.handle)
         del self._pending_transfers[request_id]
         return status
+
+    def control_plane_stats(self, reset: bool = False) -> dict[str, int]:
+        stats = {
+            "status_query_calls": getattr(self, "_status_query_calls", 0),
+            "complete_calls": getattr(self, "_complete_calls", 0),
+            "complete_requery_calls": getattr(
+                self, "_complete_requery_calls", 0),
+        }
+        if reset:
+            self._status_query_calls = 0
+            self._complete_calls = 0
+            self._complete_requery_calls = 0
+        return stats
 
     def cancel_request(self, request_id: str) -> None:
         """Forget a request after failure; does not fake-cancel device I/O."""

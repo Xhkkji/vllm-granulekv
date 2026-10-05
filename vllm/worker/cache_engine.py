@@ -252,7 +252,8 @@ class CacheEngine:
                 raise RuntimeError(status.error or "GranuleKV swap-in failed")
             return False
         if src_to_dst.numel() != 0:
-            self.granulekv_connector.complete_request(request_id)
+            self.granulekv_connector.complete_request(
+                request_id, ready_status=status)
         elapsed_s = time.perf_counter() - self._granulekv_transfer_started_at
         self._granulekv_transfer_started_at = None
         self._log_swap_event("swap_in", src_to_dst, elapsed_s)
@@ -385,7 +386,8 @@ class CacheEngine:
             return AsyncKVTransferEvent(request_id,
                                         AsyncKVTransferState.PENDING)
         try:
-            self.granulekv_connector.complete_request(request_id)
+            self.granulekv_connector.complete_request(
+                request_id, ready_status=status)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,

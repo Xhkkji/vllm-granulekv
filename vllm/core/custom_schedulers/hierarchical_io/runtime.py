@@ -343,6 +343,7 @@ class RollingPrefetchRuntime:
         max_active: int,
         timeout_seconds: float,
         sleep_seconds: float = 0.0001,
+        poll_correction_only: bool = False,
     ) -> SparseKVCorrectionResult:
         """Synchronously close one layer gap through the async lifecycle."""
         if self.config.working_set_enabled:
@@ -380,7 +381,8 @@ class RollingPrefetchRuntime:
         submit_ms = (time.perf_counter() - submit_started) * 1000.0
         wait_started = time.perf_counter()
         while event.state == AsyncKVTransferState.PENDING:
-            self._progress(virtual_engine, poll)
+            if not poll_correction_only:
+                self._progress(virtual_engine, poll)
             event = poll(request)
             if event.state == AsyncKVTransferState.PENDING:
                 if time.monotonic() >= deadline:

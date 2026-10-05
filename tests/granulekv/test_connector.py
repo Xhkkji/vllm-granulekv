@@ -7,6 +7,7 @@ import torch
 from vllm.granulekv.connector import (
     GranuleKVConnector,
     GranuleKVRequestSpec,
+    GranuleKVTransferStatus,
     GranuleKVTransferState,
 )
 
@@ -98,6 +99,23 @@ def test_active_layer_window_uses_normal_request_without_staging():
     assert payload["layer_end"] == 2
     assert operation == "read"
     assert kwargs == {}
+
+
+def test_known_ready_status_does_not_query_again():
+    connector = _connector()
+    connector.submit_request(
+        "window-0", torch.tensor([[20, 2]], dtype=torch.int64), operation="read")
+    status = GranuleKVTransferStatus(
+        "window-0", GranuleKVTransferState.READY, "read")
+
+    connector.complete_request("window-0", ready_status=status)
+
+    assert connector.client.completed
+    assert connector.control_plane_stats() == {
+        "status_query_calls": 0,
+        "complete_calls": 1,
+        "complete_requery_calls": 0,
+    }
 
 
 def test_layer_window_sets_working_set_region_without_changing_descriptor_protocol():

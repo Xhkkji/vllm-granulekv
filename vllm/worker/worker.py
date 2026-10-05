@@ -94,6 +94,14 @@ class Worker(LocalOrDistributedWorkerBase):
         self._gpu_pending_transfers: Dict[
             Tuple[int, str], Tuple[str, Tuple[int, int], Tuple[Tuple[int, int], ...],
                                     Tuple[int, ...]]] = {}
+        # A CUDA event protects physical working-set slots after a window's
+        # attention has been enqueued.  The event is keyed by the destination
+        # slot, not by logical residency, because only slot reuse needs fencing.
+        self._gpu_region_release_events: Dict[
+            Tuple[int, int, int], Tuple[str, object]] = {}
+        self._gpu_transfer_regions: Dict[
+            Tuple[int, str], Tuple[str, Tuple[int, int],
+                                   Tuple[Tuple[int, int], ...]]] = {}
         self._ssd_read_blocks: Set[Tuple[int, str, int, int]] = set()
         self._host_stats: Dict[str, int] = {
             "gpu_direct_read_requests": 0,
@@ -119,6 +127,18 @@ class Worker(LocalOrDistributedWorkerBase):
             "host_cache_hits": 0,
             "host_cache_misses": 0,
             "host_transfer_errors": 0,
+            "layer_release_event_record_count": 0,
+            "layer_release_event_query_count": 0,
+            "layer_release_event_wait_count": 0,
+            "layer_release_event_wait_ms": 0,
+            "legacy_device_synchronize_count": 0,
+            "legacy_device_synchronize_ms": 0,
+            "targeted_gpu_poll_calls": 0,
+            "targeted_host_poll_calls": 0,
+            "targeted_correction_poll_calls": 0,
+            "unrelated_poll_requests": 0,
+            "poll_passes": 0,
+            "active_requests_per_poll": 0,
         }
         # layer-window 和未来 sparse unit 共用一个 plan runtime。Scheduler
         # 仍是 block/reservation 的唯一所有者；这里仅保存预授权 mapping，
@@ -204,6 +224,15 @@ class Worker(LocalOrDistributedWorkerBase):
         result["prediction_guard_blocks"] = (
             envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS)
         result.update(self._host_stats)
+        for cache_engine in self.cache_engine:
+            connector = cache_engine.granulekv_connector
+            if connector is None:
+                continue
+            result.update({
+                name: result.get(name, 0) + value
+                for name, value in connector.control_plane_stats(
+                    reset=reset).items()
+            })
         if reset:
             for name in self._host_stats:
                 self._host_stats[name] = 0
@@ -703,6 +732,11 @@ class Worker(LocalOrDistributedWorkerBase):
             self, virtual_engine: int) -> List[AsyncKVTransferEvent]:
         """非阻塞轮询当前 virtual engine 的全部 outstanding transfer。"""
         cache_engine = self.cache_engine[virtual_engine]
+        self._host_stats["poll_passes"] += 1
+        self._host_stats["active_requests_per_poll"] += (
+            sum(key[0] == virtual_engine for key in self._async_kv_transfer_ids)
+            + sum(key[0] == virtual_engine
+                  for key in self._host_async_kv_transfers))
         events = list(self._prefetch_runtime.poll_units(
             virtual_engine,
             lambda unit: self._poll_gpu_transfer(
@@ -718,11 +752,32 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_ids.remove(key)
+        events.extend(self._poll_host_transfers(virtual_engine))
+        for event in events:
+            self._observe_gpu_transfer(virtual_engine, event)
+        self._log_prefetch_runtime_traces()
+        return events
+
+    def _poll_host_transfers(
+            self,
+            virtual_engine: int,
+            request_ids: Optional[Set[str]] = None,
+    ) -> List[AsyncKVTransferEvent]:
+        """Poll only selected host requests, or all host requests if omitted."""
+        cache_engine = self.cache_engine[virtual_engine]
+        if request_ids is not None:
+            self._host_stats["targeted_host_poll_calls"] += 1
+            self._host_stats["unrelated_poll_requests"] += sum(
+                key[0] == virtual_engine and key[1] not in request_ids
+                for key in self._host_async_kv_transfers)
+        events: List[AsyncKVTransferEvent] = []
         for key, record in tuple(self._host_async_kv_transfers.items()):
-            if key[0] != virtual_engine:
+            if key[0] != virtual_engine or (
+                    request_ids is not None and key[1] not in request_ids):
                 continue
             host_request_id = key[1]
             event = cache_engine.poll_async_kv_transfer(host_request_id)
+            events.append(event)
             if event.state == AsyncKVTransferState.PENDING:
                 continue
             del self._host_async_kv_transfers[key]
@@ -742,9 +797,6 @@ class Worker(LocalOrDistributedWorkerBase):
             else:
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
-        for event in events:
-            self._observe_gpu_transfer(virtual_engine, event)
-        self._log_prefetch_runtime_traces()
         return events
 
     def _mark_host_ready(
@@ -775,16 +827,90 @@ class Worker(LocalOrDistributedWorkerBase):
     def _invalidate_gpu_destination(self, virtual_engine: int,
                                     layer_index: int,
                                     destination_block: int) -> None:
+        self._prepare_gpu_region_reuse(virtual_engine, layer_index,
+                                       destination_block)
         owner_key = (virtual_engine, layer_index, destination_block)
         old_key = self._gpu_destination_owners.pop(owner_key, None)
         if old_key is not None:
             self._gpu_resident_blocks.pop(old_key, None)
             self._host_stats["gpu_resident_released_blocks"] += 1
 
+    def _prepare_gpu_region_reuse(self, virtual_engine: int,
+                                  layer_index: int,
+                                  destination_block: int) -> None:
+        """Fence one physical KV slot before a new transfer overwrites it."""
+        if not envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
+            return
+        key = (virtual_engine, layer_index, int(destination_block))
+        entry = self._gpu_region_release_events.get(key)
+        if entry is None:
+            return
+        _, event = entry
+        self._host_stats["layer_release_event_query_count"] += 1
+        try:
+            ready = bool(event.query())
+        except Exception as exc:
+            # Event failure is an exceptional recovery path.  Preserve the
+            # old correctness guarantee without making synchronize normal.
+            logger.warning("CUDA event query failed for KV slot %s: %s", key,
+                           exc)
+            start = time.perf_counter()
+            torch.cuda.synchronize()
+            self._host_stats["legacy_device_synchronize_count"] += 1
+            self._host_stats["legacy_device_synchronize_ms"] += int(
+                (time.perf_counter() - start) * 1000.0)
+            ready = True
+        if not ready:
+            self._host_stats["layer_release_event_wait_count"] += 1
+            start = time.perf_counter()
+            event.synchronize()
+            self._host_stats["layer_release_event_wait_ms"] += int(
+                (time.perf_counter() - start) * 1000.0)
+        self._gpu_region_release_events.pop(key, None)
+
+    def _record_gpu_region_release_event(
+            self, virtual_engine: int, request_ids: Sequence[str],
+            layer_index: int) -> None:
+        """Fence all slots belonging to windows ending at this layer."""
+        if not (envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE
+                and envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE):
+            return
+        request_id_set = frozenset(request_ids)
+        matching = tuple(
+            (request_id, seq_group_id, layer_range, pairs)
+            for (engine, request_id),
+            (seq_group_id, layer_range, pairs) in
+            self._gpu_transfer_regions.items()
+            if engine == virtual_engine and seq_group_id in request_id_set
+            and layer_index + 1 == layer_range[1])
+        if not matching:
+            return
+        try:
+            event = torch.cuda.Event(blocking=False, interprocess=False)
+            event.record(torch.cuda.current_stream())
+        except Exception as exc:
+            logger.warning("failed to record KV release event: %s", exc)
+            start = time.perf_counter()
+            torch.cuda.synchronize()
+            self._host_stats["legacy_device_synchronize_count"] += 1
+            self._host_stats["legacy_device_synchronize_ms"] += int(
+                (time.perf_counter() - start) * 1000.0)
+            return
+        self._host_stats["layer_release_event_record_count"] += 1
+        for request_id, _, layer_range, pairs in matching:
+            for layer in range(*layer_range):
+                for _, destination_block in pairs:
+                    self._gpu_region_release_events[
+                        (virtual_engine, layer, int(destination_block))] = (
+                            request_id, event)
+
     def _register_gpu_transfer(self, virtual_engine: int,
                                request: AsyncKVTransferRequest,
                                mapping: torch.Tensor) -> None:
-        if (not envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE
+        track_residency = (
+            envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE)
+        track_events = envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE
+        if (not (track_residency or track_events)
                 or request.operation != AsyncKVTransferOperation.READ
                 or request.layer_range is None or not mapping.numel()):
             return
@@ -797,16 +923,21 @@ class Worker(LocalOrDistributedWorkerBase):
                 "GPU transfer request mapping and logical block count differ")
         key = (virtual_engine, request.request_id)
         layer_range = tuple(request.layer_range)
-        self._gpu_pending_transfers[key] = (
-            request.seq_group_id, layer_range, pairs,
-            tuple(int(block.logical_index) for block in request.logical_blocks))
-        self._record_ssd_reads(
-            virtual_engine, request.seq_group_id, layer_range,
-            tuple(int(block.logical_index) for block in request.logical_blocks))
-        for layer_index in range(*layer_range):
-            for _, destination_block in pairs:
-                self._invalidate_gpu_destination(
-                    virtual_engine, layer_index, int(destination_block))
+        logical_blocks = tuple(
+            int(block.logical_index) for block in request.logical_blocks)
+        if track_events:
+            self._gpu_transfer_regions[key] = (
+                request.seq_group_id, layer_range, pairs)
+        if track_residency:
+            self._gpu_pending_transfers[key] = (
+                request.seq_group_id, layer_range, pairs, logical_blocks)
+            self._record_ssd_reads(
+                virtual_engine, request.seq_group_id, layer_range,
+                logical_blocks)
+            for layer_index in range(*layer_range):
+                for _, destination_block in pairs:
+                    self._invalidate_gpu_destination(
+                        virtual_engine, layer_index, int(destination_block))
 
     def _observe_gpu_transfer(self, virtual_engine: int,
                               event: AsyncKVTransferEvent) -> None:
@@ -867,7 +998,12 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def _poll_gpu_transfer(self, virtual_engine: int,
                            cache_engine: CacheEngine,
-                           request_id: str) -> AsyncKVTransferEvent:
+                           request_id: str,
+                           poll_kind: str = "ordinary") -> AsyncKVTransferEvent:
+        if poll_kind == "window":
+            self._host_stats["targeted_gpu_poll_calls"] += 1
+        elif poll_kind == "correction":
+            self._host_stats["targeted_correction_poll_calls"] += 1
         event = cache_engine.poll_async_kv_transfer(request_id)
         self._observe_gpu_transfer(virtual_engine, event)
         return event
@@ -893,6 +1029,8 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError("host-to-GPU mapping and logical blocks differ")
         for logical_block, (_, destination_block) in zip(logical_blocks,
                                                          mapping):
+            self._prepare_gpu_region_reuse(virtual_engine, layer_index,
+                                           int(destination_block))
             self._invalidate_gpu_destination(
                 virtual_engine, layer_index, int(destination_block))
             owner_key = (virtual_engine, layer_index, int(destination_block))
@@ -930,7 +1068,18 @@ class Worker(LocalOrDistributedWorkerBase):
                 return False
             if time.monotonic() >= deadline:
                 return False
-            self.poll_async_kv_transfers(virtual_engine)
+            request_ids = {
+                key[1]
+                for key, record in self._host_async_kv_transfers.items()
+                if key[0] == virtual_engine and record[1] == seq_group_id
+                and layer_index >= record[3][0]
+                and layer_index < record[3][1]
+                and any(block in record[2] for block in logical_blocks)
+            }
+            if envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
+                self._poll_host_transfers(virtual_engine, request_ids)
+            else:
+                self.poll_async_kv_transfers(virtual_engine)
             time.sleep(0.0001)
         return True
 
@@ -962,6 +1111,10 @@ class Worker(LocalOrDistributedWorkerBase):
             if (key[0] == virtual_engine
                     and self._gpu_pending_transfers[key][0] in finished):
                 self._gpu_pending_transfers.pop(key, None)
+        for key in tuple(self._gpu_transfer_regions):
+            if (key[0] == virtual_engine
+                    and self._gpu_transfer_regions[key][0] in finished):
+                self._gpu_transfer_regions.pop(key, None)
         self._ssd_read_blocks.difference_update(
             key for key in self._ssd_read_blocks
             if key[0] == virtual_engine and key[1] in finished)
@@ -1113,6 +1266,11 @@ class Worker(LocalOrDistributedWorkerBase):
                           state.correction_mapping_by_logical[block][1])
                          for block in ready_blocks],
                         device="cpu", dtype=torch.int64).view(-1, 2)
+                    if envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
+                        for block in ready_blocks:
+                            self._prepare_gpu_region_reuse(
+                                virtual_engine, layer_index,
+                                state.correction_mapping_by_logical[block][1])
                     self.copy_host_blocks_to_gpu(
                         virtual_engine, layer_index, host_to_gpu)
                     if reuse_gpu_residency:
@@ -1162,11 +1320,14 @@ class Worker(LocalOrDistributedWorkerBase):
                     lambda request, mapping: self._submit_gpu_transfer(
                         virtual_engine, cache_engine, request, mapping),
                     lambda request: self._poll_gpu_transfer(
-                        virtual_engine, cache_engine, request.request_id),
+                        virtual_engine, cache_engine, request.request_id,
+                        "correction"),
                     lambda request: cache_engine.cancel_async_kv_transfer(
                         request.request_id),
                     max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
                     timeout_seconds=envs.VLLM_GRANULEKV_TIMEOUT_SECONDS,
+                    poll_correction_only=(
+                        envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE),
                 )
             except Exception:
                 record_sparse_kv_correction_error()
@@ -1213,12 +1374,16 @@ class Worker(LocalOrDistributedWorkerBase):
             layer_index: int,
     ) -> None:
         """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
-        if envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
-            # layer.forward 返回只表示 kernel 已入队。GranuleKV DMA 不属于 PyTorch
-            # stream，若此时立刻覆盖同一 region，可能与尚未结束的 attention
-            # 读发生竞争。验证版在 window 边界显式同步，先保证语义正确；后续
-            # 可改成 CUDA event -> MDS activation 的非阻塞依赖协议。
+        if (envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+                and envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE):
+            self._record_gpu_region_release_event(
+                virtual_engine, request_ids, layer_index)
+        elif envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE:
+            start = time.perf_counter()
             torch.cuda.synchronize()
+            self._host_stats["legacy_device_synchronize_count"] += 1
+            self._host_stats["legacy_device_synchronize_ms"] += int(
+                (time.perf_counter() - start) * 1000.0)
         # Immutable prefix blocks already have an SSD source of truth.  The
         # current staging experiment intentionally does not demote them back
         # to host memory; future newly generated KV writeback is a separate
@@ -1242,7 +1407,7 @@ class Worker(LocalOrDistributedWorkerBase):
             lambda unit, mapping: self._submit_gpu_transfer(
                 virtual_engine, cache_engine, unit, mapping),
             lambda unit: self._poll_gpu_transfer(
-                virtual_engine, cache_engine, unit.request_id),
+                virtual_engine, cache_engine, unit.request_id, "window"),
             max_active=envs.VLLM_GRANULEKV_MAX_IN_FLIGHT,
         )
             # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block
