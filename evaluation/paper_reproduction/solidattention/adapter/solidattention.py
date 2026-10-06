@@ -359,7 +359,8 @@ class SolidAttentionPolicy:
         representatives = page_representatives.detach()
         self._representatives[request_id][layer_index] = (
             len(logical), representatives)
-        self._prediction_representatives[request_id][layer_index] = (
+        page_index_key = self._page_index_keys.get(request_id, request_id)
+        self._prediction_representatives[page_index_key][layer_index] = (
             _PredictionRepresentativeState(logical, representatives))
 
     def bind_page_index_key(self, request_id: str, page_index_key: str) -> None:
@@ -368,6 +369,32 @@ class SolidAttentionPolicy:
         # This mapping is only read by prediction/validation.  The resident
         # selected-list path remains request-local and does not touch it.
         self._page_index_keys[request_id] = page_index_key
+
+    def seed_page_metadata_from_request(
+        self,
+        source_request_id: str,
+        page_index_key: str,
+        num_prefix_blocks: int,
+    ) -> int:
+        """Publish warmup representatives under a stable prefix identity.
+
+        Working-set experiments intentionally disable GPU -> SSD writeback, so
+        a metadata-only warmup is the source of SolidAttention representatives.
+        The data path remains unchanged; this only makes that already-built
+        control-plane metadata available to the subsequent restore request.
+        """
+        source = self._representatives.get(source_request_id, {})
+        published = 0
+        for layer_index, (_, representatives) in source.items():
+            count = min(int(num_prefix_blocks), int(representatives.shape[0]))
+            if count <= 0:
+                continue
+            logical = tuple(range(count))
+            self._prediction_representatives[page_index_key][layer_index] = (
+                _PredictionRepresentativeState(
+                    logical, representatives[:count].detach()))
+            published += 1
+        return published
 
     def _select_blocks_device_impl(
         self,

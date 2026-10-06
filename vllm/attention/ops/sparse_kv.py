@@ -462,6 +462,18 @@ def select_and_compact_decode_blocks(
     num_blocks = (sequence_length + block_size - 1) // block_size
     if num_blocks <= 0 or block_table.shape[1] < num_blocks:
         raise ValueError("block table is shorter than sequence_length")
+    # Dynamic restore supplies a frozen logical selection and therefore skips
+    # the normal selector branch.  The current decode still provides the
+    # metadata/history needed to build the next request's prediction plan.
+    physical_ids = tuple(int(value) for value in
+                         block_table[0, :num_blocks].detach().cpu().tolist())
+    representatives = build_page_representatives_from_paged_key_cache(
+        key_cache, physical_ids)
+    register_page_representatives(
+        request_id, layer_index, representatives, tuple(range(num_blocks)))
+    from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
+        observe_sparse_query, )
+    observe_sparse_query(layer_index, query.detach(), request_id)
     if selected_blocks_override is None:
         if select_blocks_device is not None:
             selected = select_blocks_device(
@@ -478,16 +490,6 @@ def select_and_compact_decode_blocks(
                 raise TypeError("GPU sparse selector must return a tensor")
             _SPARSE_STATS["gpu_selection_calls"] += 1
         else:
-            physical_ids = tuple(int(value) for value in
-                                block_table[0, :num_blocks].detach().cpu().tolist())
-            representatives = build_page_representatives_from_paged_key_cache(
-                key_cache, physical_ids)
-            register_page_representatives(
-                request_id,
-                layer_index,
-                representatives,
-                tuple(range(num_blocks)),
-            )
             selected = tuple(select_blocks(
                 request_id,
                 layer_index,

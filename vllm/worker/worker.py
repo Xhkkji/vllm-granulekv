@@ -17,6 +17,7 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVLayerSelection,
     activate_layer_barrier,
     bind_sparse_page_index_key, get_active_layer_sequence_lengths,
+    get_sparse_kv_policy,
     register_sparse_restore_context, select_actual_sparse_blocks_device,
     select_actual_sparse_prefix_blocks)
 from vllm.attention.ops.sparse_kv import (
@@ -237,6 +238,18 @@ class Worker(LocalOrDistributedWorkerBase):
             for name in self._host_stats:
                 self._host_stats[name] = 0
         return result
+
+    def seed_sparse_page_metadata(self, source_request_id: str,
+                                  page_index_key: str,
+                                  num_prefix_blocks: int) -> int:
+        """Expose test-runner metadata preparation without touching KV I/O."""
+        policy = get_sparse_kv_policy()
+        seed = (None if policy is None else
+                getattr(policy, "seed_page_metadata_from_request", None))
+        if not callable(seed):
+            raise RuntimeError(
+                "configured sparse policy does not support metadata seeding")
+        return int(seed(source_request_id, page_index_key, num_prefix_blocks))
 
     def start_profile(self):
         if self.profiler is None:
@@ -661,9 +674,10 @@ class Worker(LocalOrDistributedWorkerBase):
                     owner = (virtual_engine, request.seq_group_id)
                     if (self._host_staging_owner is not None
                             and self._host_staging_owner != owner):
-                        raise RuntimeError(
-                            "CPU KV staging currently supports one active "
-                            "request; refusing to overwrite shared host slots")
+                        old_owner = self._host_staging_owner
+                        self._drain_host_staging_owner(
+                            virtual_engine, old_owner[1],
+                            envs.VLLM_GRANULEKV_TIMEOUT_SECONDS)
                     self._host_staging_owner = owner
                     block_bytes = CacheEngine.get_cache_block_size(
                         self.cache_config, self.model_config,
@@ -752,7 +766,10 @@ class Worker(LocalOrDistributedWorkerBase):
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_ids.remove(key)
-        events.extend(self._poll_host_transfers(virtual_engine))
+        # Host staging requests have Worker-local ownership and are completed
+        # by targeted host polling.  They must not be returned to the
+        # scheduler's GPU async-request table, which has no host request entry.
+        self._poll_host_transfers(virtual_engine)
         for event in events:
             self._observe_gpu_transfer(virtual_engine, event)
         self._log_prefetch_runtime_traces()
@@ -798,6 +815,29 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
         return events
+
+    def _drain_host_staging_owner(self, virtual_engine: int,
+                                  seq_group_id: str,
+                                  timeout_seconds: float) -> None:
+        """Finish one owner's host DMA before reusing the shared host slots."""
+        deadline = time.monotonic() + timeout_seconds
+        while self._host_staging_owner == (virtual_engine, seq_group_id):
+            request_ids = {
+                key[1]
+                for key, record in self._host_async_kv_transfers.items()
+                if key[0] == virtual_engine and record[1] == seq_group_id
+            }
+            if request_ids:
+                self._poll_host_transfers(virtual_engine, request_ids)
+            if not request_ids or not any(
+                    key[0] == virtual_engine and record[1] == seq_group_id
+                    for key, record in self._host_async_kv_transfers.items()):
+                self._host_staging_owner = None
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "timed out waiting for previous CPU KV staging DMA")
+            time.sleep(0.0001)
 
     def _mark_host_ready(
         self,

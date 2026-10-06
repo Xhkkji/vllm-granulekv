@@ -38,6 +38,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--warmup-iterations", type=int, default=0)
     parser.add_argument("--dynamic-restore", action="store_true")
     parser.add_argument("--benchmark-third", action="store_true")
+    parser.add_argument(
+        "--seed-static-plan",
+        action="store_true",
+        help="inject a deterministic sparse plan to exercise host staging",
+    )
     parser.add_argument("--attention-mode",
                         choices=("sparse", "dense"),
                         default="sparse")
@@ -67,10 +72,43 @@ def _build_prompt(tokenizer: Any, token_count: int,
     return result
 
 
+def _seed_static_sparse_plan(llm: Any, prefix_tokens: list[int],
+                             block_size: int, num_layers: int,
+                             block_budget: int) -> None:
+    """Install a test-only plan so the restore consumer can be measured.
+
+    The normal producer is previous-step policy feedback.  Figure13's
+    output=1 workload has no prior dynamic restore request, so this explicit
+    adapter keeps the downstream CPU/GPU reuse path measurable without
+    changing GranuleKV request handling.
+    """
+    from vllm.core.custom_schedulers.hierarchical_io import (
+        SparseKVAccessPlan, )
+
+    num_prefix_blocks = len(prefix_tokens) // block_size
+    if num_prefix_blocks <= block_budget + 4:
+        raise ValueError("static sparse plan requires a longer prefix")
+    dynamic_end = min(num_prefix_blocks - 2, 2 + block_budget)
+    selected = tuple(sorted(set(
+        tuple(range(2))
+        + tuple(range(2, dynamic_end))
+        + tuple(range(num_prefix_blocks - 2, num_prefix_blocks)))))
+    plan = SparseKVAccessPlan.from_layer_selections(
+        num_blocks=num_prefix_blocks,
+        block_indices_by_layer=(selected,) * num_layers,
+        source="solidattention_dynamic",
+    )
+    page_index_key = hashlib.sha256(
+        repr((tuple(prefix_tokens), None, block_size,
+              num_prefix_blocks)).encode("utf-8")).hexdigest()
+    scheduler = llm.llm_engine.scheduler[0]
+    scheduler._sparse_restore_plans[page_index_key] = plan
+
+
 def main() -> None:
     args = _args()
-    if args.prefix_tokens <= 0 or args.suffix_tokens <= 0:
-        raise ValueError("prefix-tokens and suffix-tokens must be positive")
+    if args.prefix_tokens <= 0 or args.suffix_tokens < 0:
+        raise ValueError("prefix-tokens must be positive and suffix-tokens non-negative")
     if (args.decode_tokens <= 0 or args.block_budget <= 0
             or args.iterations <= 0 or args.warmup_iterations < 0):
         raise ValueError("decode-tokens and block-budget must be positive")
@@ -134,6 +172,8 @@ def main() -> None:
         raise RuntimeError("failed to clear GPU prefix cache")
 
     second_started = time.perf_counter()
+    if args.seed_static_plan:
+        _seed_static_sparse_plan(llm, prefix, 16, 28, args.block_budget)
     second = llm.generate([second_prompt], sampling, use_tqdm=False)
     second_elapsed_ms = (time.perf_counter() - second_started) * 1000.0
 
@@ -153,6 +193,9 @@ def main() -> None:
             if not llm.reset_prefix_cache(Device.GPU):
                 raise RuntimeError(
                     "failed to clear GPU prefix cache before dynamic restore")
+            if args.seed_static_plan:
+                _seed_static_sparse_plan(llm, prefix, 16, 28,
+                                         args.block_budget)
             third_started = time.perf_counter()
             third = llm.generate([third_prompt], sampling, use_tqdm=False)
             third_elapsed_samples_ms.append(
@@ -176,6 +219,7 @@ def main() -> None:
         "validated_scope": (
             "prefix_write_gpu_reset_hierarchical_restore_xformers_sparse_decode"),
         "dynamic_ssd_restore_selection": args.dynamic_restore,
+        "static_plan_seeded": args.seed_static_plan,
         "attention_mode": args.attention_mode,
         "correction_enabled": bool(int(os.getenv(
             "VLLM_GRANULEKV_SPARSE_CORRECTION_ENABLE", "0"))),
