@@ -112,6 +112,26 @@ class CacheEngine:
              else []) if self.granulekv_enabled else
             self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
         )
+        self.host_to_gpu_copy_stream: Optional[torch.cuda.Stream] = None
+        self._host_gpu_copy_timing_events: list[
+            tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        if envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+            if not self.granulekv_host_staging:
+                raise ValueError(
+                    "async host-to-GPU prefetch requires GranuleKV CPU "
+                    "staging")
+            if not (envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+                    and envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE):
+                raise ValueError(
+                    "async host-to-GPU prefetch requires layer working-set "
+                    "and event-fenced reuse")
+            if (self.granulekv_connector is None
+                    or not self.granulekv_connector.host_cache_cuda_pinned):
+                raise RuntimeError(
+                    "async host-to-GPU prefetch requires CUDA-pinned "
+                    "GranuleKV host regions")
+            self.host_to_gpu_copy_stream = torch.cuda.Stream(
+                device=self.device_config.device)
         self.swap_trace_enabled = envs.VLLM_V0_SWAP_TRACE
 
     def initialize_granulekv(self) -> None:
@@ -466,6 +486,62 @@ class CacheEngine:
             self.gpu_cache[layer_index],
             host_to_gpu,
         )
+
+    def copy_host_blocks_to_gpu_async(
+            self,
+            layer_index: int,
+            host_to_gpu: torch.Tensor,
+            release_events: Sequence[torch.cuda.Event] = (),
+    ) -> torch.cuda.Event:
+        """Enqueue one host-to-GPU copy and return its device-ready event.
+
+        The shared host region is registered once by the connector.  This
+        method only changes the CUDA stream used by the existing swap_blocks
+        implementation; GranuleKV request ownership and lifecycle are not
+        involved in the intra-GPU copy.
+        """
+        if self.host_to_gpu_copy_stream is None:
+            raise RuntimeError("async host-to-GPU copy stream is disabled")
+        if host_to_gpu.numel() == 0:
+            event = torch.cuda.Event(enable_timing=True,
+                                     blocking=False,
+                                     interprocess=False)
+            event.record(self.host_to_gpu_copy_stream)
+            return event
+        if host_to_gpu.ndim != 2 or host_to_gpu.shape[1] != 2:
+            raise ValueError("host_to_gpu must have shape [N, 2]")
+        stream = self.host_to_gpu_copy_stream
+        with torch.cuda.stream(stream):
+            for release_event in release_events:
+                stream.wait_event(release_event)
+            start_event = torch.cuda.Event(enable_timing=True,
+                                           blocking=False,
+                                           interprocess=False)
+            start_event.record(stream)
+            self.attn_backend.swap_blocks(
+                self.cpu_cache[layer_index],
+                self.gpu_cache[layer_index],
+                host_to_gpu,
+            )
+            ready_event = torch.cuda.Event(enable_timing=True,
+                                           blocking=False,
+                                           interprocess=False)
+            ready_event.record(stream)
+            self._host_gpu_copy_timing_events.append(
+                (start_event, ready_event))
+        return ready_event
+
+    def drain_host_to_gpu_copy_time_ms(self) -> float:
+        """Collect completed copy-stream intervals without synchronizing."""
+        elapsed_ms = 0.0
+        pending = []
+        for start_event, end_event in self._host_gpu_copy_timing_events:
+            if not end_event.query():
+                pending.append((start_event, end_event))
+                continue
+            elapsed_ms += start_event.elapsed_time(end_event)
+        self._host_gpu_copy_timing_events = pending
+        return elapsed_ms
 
     @staticmethod
     def get_cache_block_size(

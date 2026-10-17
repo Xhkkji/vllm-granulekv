@@ -1,0 +1,177 @@
+KV Cache 工作汇报
+
+时间范围：2026.09.24 - 2026.10.08
+
+
+工作概览
+
+本阶段围绕“如何将稀疏 KV 选择和分层恢复转化为端到端性能收益”完成了三项工作：
+
+1. 将 SolidAttention 预测选择、CPU staging、GPU residency reuse 和 rolling prefetch 接入统一恢复链路。
+2. 参考 Tutti 的实验口径，完成 Dense 与优化路径在统一 runner、统一 prompt 和统一 page identity 下的 32K 端到端对比。
+3. 独立测试 GranuleKV 在 16KB、32KB 和 64KB descriptor 粒度下的原始 SSD -> GPU I/O 性能。
+
+当前结论：
+
+• CPU staging + GPU residency reuse 在统一测试中取得 0.29%~43.66% 的 TTFT 收益。
+• 完整 output=2 耗时在 24K~31K prefix 下提升 1.74%~7.09%，但 16K 和 32K 仍分别慢 1.20% 和 17.13%。
+• 64KB descriptor 在固定 16 MiB submit 下达到 4.361 GiB/s，相对 16KB 提升 31.0%。
+• 当前系统链路统计已通过，但优化路径与 Dense 的输出仍需进一步对齐，因此性能数据暂作为链路验证和性能分析结果。
+
+
+一、CPU/GPU 分层 KV 恢复与复用
+
+1.1 当前链路
+
+首次恢复：
+
+预测/当前需要的 KV
+→ SSD -> GPU
+
+其余 immutable prefix
+→ SSD -> host
+
+当前层使用：
+
+GPU_READY
+→ 直接复用
+
+HOST_READY
+→ host -> GPU
+
+GPU/host 均未命中
+→ legacy SSD correction
+
+1.2 本阶段完成
+
+1. 继续复用 SolidAttention 已有的 prediction、Actual Selection 和 selected-list Attention，不增加第二套选择器。
+2. 按（request, layer, logical block）区分 GPU residency、host coverage 和物理 working set，避免仅依赖逻辑 resident 状态。
+3. immutable prefix 首次恢复后由 GPU 或 host 覆盖，后续 miss 优先从 host 恢复，SSD correction 只保留为异常兜底。
+4. rolling prefetch 以 layer window 为单位推进，当前 window READY 后即可计算，后续 window 继续恢复。
+5. working-set 回收使用 CUDA event 保护 GPU region，正常路径不再逐层调用全局 torch.cuda.synchronize()。
+6. 保持 GranuleKV native、MPS service、descriptor pool、CUDA IPC 和 submit/poll/complete 生命周期不变。
+
+该链路的核心变化是：不再让预测 miss 默认重新读取 SSD，而是先复用 GPU，再从已经准备好的 host KV cache 恢复。
+
+
+二、统一标准端到端测试
+
+2.1 测试配置
+
+模型：Qwen2.5-7B-Instruct
+数据集：Tutti 32K bucket
+总 prompt：32K
+prefix：16K、24K、28K、30K、31K、32K
+output：2
+batch size：1
+block size：16
+GPU blocks：2304
+层数：28
+window layers：4
+block budget：32
+
+Dense 与优化路径使用同一 Figure 13 runner、同一 base prompt、同一 token 序列和同一 page identity。准备阶段负责建立 SSD 数据和稀疏 metadata，不计入正式测量；测量前清空 GPU，并按每个 prefix 设置准确的 trusted block 范围。
+
+2.2 TTFT 结果
+
+Prefix	Suffix	Dense TTFT（ms）	CPU staging + GPU reuse TTFT（ms）	相对 Dense
+16K	16K	8467.34	8442.41	快 0.29%
+24K	8K	5151.86	4809.62	快 6.64%
+28K	4K	3146.65	2798.79	快 11.05%
+30K	2K	2079.20	1671.48	快 19.61%
+31K	1K	1524.62	1064.93	快 30.15%
+32K	0	1127.61	635.35	快 43.66%
+
+六个 prefix 点均获得 TTFT 收益。随着 suffix 缩短，Dense 可用于隐藏 SSD 恢复的计算减少，分层恢复和稀疏读取的优势更加明显。
+
+2.3 完整请求耗时
+
+Prefix	Dense elapsed（ms）	CPU staging + GPU reuse elapsed（ms）	相对 Dense
+16K	8742.55	8847.04	慢 1.20%
+24K	5313.50	5220.99	快 1.74%
+28K	3247.95	3168.84	快 2.44%
+30K	2151.04	2074.77	快 3.55%
+31K	1580.17	1468.09	快 7.09%
+32K	1165.43	1365.09	慢 17.13%
+
+完整 output=2 耗时与 TTFT 的趋势不同。24K~31K 已取得端到端收益；16K 的恢复规模较大，32K 没有 suffix，host -> GPU 调度和第二个 token 的 decode 开销无法被后续计算充分隐藏。
+
+2.4 链路验收
+
+六个测试点均进入 solidattention_dynamic，没有回退 Dense 或 Compact Attention，并满足：
+
+attention_selected_calls：28
+attention_compact_calls：0
+ssd_fallback_correction_requests：0
+duplicate_ssd_read_blocks：0
+host_coverage_missing_blocks：0
+correction_errors：0
+legacy_device_synchronize_count：0
+
+主要搬运统计如下，block 数量按 layer 累计：
+
+Prefix	SSD -> GPU	SSD -> host	host -> GPU	GPU hits	host hits	Event records
+16K	36	1024	7890	46	7890	17
+24K	36	1536	8986	26	8986	9
+28K	36	1792	9247	31	9247	5
+30K	36	1920	10258	21	10258	3
+31K	36	1984	9526	28	9526	2
+32K	36	2048	10469	21	10469	2
+
+以上数据证明 host cache 确实参与了正式调度，且正常路径没有重复 SSD 读取。但当前优化路径与 Dense 的输出 token 尚未完全一致，仍需继续排查 selection metadata、page identity 和恢复时序。
+
+
+三、性能结论与主要问题
+
+1. TTFT 已形成稳定收益。
+稀疏 GPU 直读和 rolling prefetch 允许首个 window READY 后提前推进模型，不必等待完整 prefix 全部进入 GPU。
+
+2. 完整 decode 尚未全面获益。
+当前 host -> GPU 搬运仍按层进入关键路径，第二个 token 会承担 CPU staging 尚未被隐藏的尾部开销。
+
+3. 32K/0 是当前主要瓶颈。
+该点没有 suffix compute 可用于重叠 host staging，TTFT 虽快 43.66%，完整请求却慢 17.13%。
+
+4. GPU reuse 命中率仍偏低。
+当前 host hits 远高于 GPU hits，说明大量 selected KV 仍需在每层从 CPU 搬回 GPU，预测保留和 GPU slot 生命周期还有优化空间。
+
+5. 正确性尚未最终闭环。
+residency、coverage 和 correction 指标均正常，但输出未与 Dense 完全一致，正式性能结论必须以输出对齐为前提。
+
+
+四、GranuleKV Descriptor 粒度 I/O 实验
+
+本实验只测试 GranuleKV 原生 SSD -> GPU I/O，不修改 native、executor、descriptor pool 或正式 KV 路径。每轮传输 256 MiB，descriptor pool 为 1024，执行 3 次 warmup 和 10 次正式采样。
+
+4.1 固定每次 Submit 的总字节数
+
+Submit 大小	16KB Descriptor	32KB Descriptor	64KB Descriptor
+1 MiB	1.338 GiB/s	1.400 GiB/s（+4.6%）	1.389 GiB/s（+3.8%）
+2 MiB	1.816 GiB/s	2.000 GiB/s（+10.1%）	2.020 GiB/s（+11.2%）
+4 MiB	2.293 GiB/s	2.593 GiB/s（+13.1%）	2.797 GiB/s（+22.0%）
+8 MiB	2.841 GiB/s	3.186 GiB/s（+12.1%）	3.508 GiB/s（+23.5%）
+16 MiB	3.329 GiB/s	3.877 GiB/s（+16.4%）	4.361 GiB/s（+31.0%）
+
+在相同 submit 字节数下，更大的 descriptor 可以减少元数据、提交和 completion 开销。64KB 在 submit 不小于 4 MiB 后优势最明显。
+
+4.2 固定每次 Submit 的 Descriptor 数量
+
+Descriptor 数量	16KB Descriptor	32KB Descriptor	64KB Descriptor
+64	1.338 GiB/s	1.983 GiB/s	2.739 GiB/s
+128	1.826 GiB/s	2.593 GiB/s	3.440 GiB/s
+256	2.298 GiB/s	3.196 GiB/s	4.381 GiB/s
+512	2.833 GiB/s	3.869 GiB/s	5.199 GiB/s
+1024	3.320 GiB/s	4.504 GiB/s	5.585 GiB/s
+
+固定 descriptor 数量时，更大粒度也会增大单次 submit 的数据量，因此该表同时包含更大 request 带来的收益。综合两组结果，原始 I/O 路径在 64KB descriptor、4~16 MiB submit 时表现最好。全部 3,727,360 个 descriptor 均正常完成并回收，没有 slot 泄漏或残留 transfer。
+
+该实验使用随机 SSD offset 和连续 synthetic GPU destination，用于判断 descriptor 粒度的 I/O 潜力，不代表当前分离的 K/V layout 已经能够直接合并为 32KB 或 64KB descriptor。
+
+
+五、下一步工作
+
+1. 优先定位优化路径与 Dense 输出不一致的问题，核对 selection metadata、page identity、layer/block 映射和异步恢复完成时序。
+2. 继续优化 host -> GPU 调度，使下一层 H2D copy 与当前层 GPU compute 真正重叠，降低 32K/0 的 decode tail。
+3. 提高 prediction keep set 的 GPU 命中率，减少同一 KV 在 CPU 和 GPU 之间重复搬运。
+4. 基于 64KB I/O 实验评估正式 KV layout 的可合并范围，先确认 SSD 源地址和 GPU 目标地址连续性，再决定是否适配正式路径。
+5. 输出对齐后重新执行统一 Figure 13 sweep，并补充多次采样、p50/p95 和正式质量测试。

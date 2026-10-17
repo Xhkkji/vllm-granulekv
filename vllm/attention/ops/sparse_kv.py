@@ -43,6 +43,8 @@ _SPARSE_STATS: dict[str, float | int] = {
     "missing_blocks": 0,
     "wasted_blocks": 0,
     "actual_selection_ms": 0.0,
+    "selection_d2h_wait_ms": 0.0,
+    "selection_tolist_calls": 0,
     "correction_requests": 0,
     "correction_blocks": 0,
     "correction_fragments": 0,
@@ -179,6 +181,18 @@ def record_sparse_kv_actual_selection(elapsed_ms: float) -> None:
     if elapsed_ms < 0:
         raise ValueError("actual selection time must be non-negative")
     _SPARSE_STATS["actual_selection_ms"] += elapsed_ms
+
+
+def record_sparse_kv_selection_d2h_wait(elapsed_ms: float) -> None:
+    """Record the explicit CPU dependency for selection metadata."""
+    if elapsed_ms < 0:
+        raise ValueError("selection D2H wait time must be non-negative")
+    _SPARSE_STATS["selection_d2h_wait_ms"] += elapsed_ms
+
+
+def record_sparse_kv_selection_tolist_call() -> None:
+    """Count the legacy implicit GPU-to-CPU selection conversion."""
+    _SPARSE_STATS["selection_tolist_calls"] += 1
 
 
 def record_sparse_kv_correction(

@@ -17,7 +17,9 @@ from typing import Any
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", choices=("dense", "quest"), required=True)
+    parser.add_argument("--mode",
+                        choices=("dense", "quest", "solidattention"),
+                        required=True)
     parser.add_argument("--task", choices=("passkey", "jsonl"), required=True)
     parser.add_argument("--contexts", default="8192")
     parser.add_argument("--depths", default="0,25,50,75,100")
@@ -31,6 +33,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.60)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--all-blocks", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -42,10 +45,21 @@ def _configure(args: argparse.Namespace, block_budget: int) -> None:
     os.environ["VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE"] = "0"
     os.environ["VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET"] = str(block_budget)
-    if args.mode == "quest":
+    os.environ["VLLM_GRANULEKV_SPARSE_VALIDATION_MODE"] = (
+        "all_blocks" if args.all_blocks else "off")
+    if args.mode != "dense":
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "1"
-        os.environ["VLLM_GRANULEKV_SPARSE_POLICY_MODULE"] = (
-            "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy")
+        os.environ["VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE"] = "1"
+        os.environ["VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE"] = (
+            "1" if args.mode == "solidattention" else "0")
+        modules = {
+            "quest": (
+                "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy"),
+            "solidattention": (
+                "evaluation.paper_reproduction.solidattention.adapter:"
+                "SolidAttentionPolicy"),
+        }
+        os.environ["VLLM_GRANULEKV_SPARSE_POLICY_MODULE"] = modules[args.mode]
     else:
         os.environ["VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE"] = "0"
         os.environ.pop("VLLM_GRANULEKV_SPARSE_POLICY_MODULE", None)
@@ -139,7 +153,7 @@ def main() -> None:
     args = _args()
     if args.page_size <= 0 or args.decode_tokens <= 0:
         raise ValueError("page-size and decode-tokens must be positive")
-    if args.mode == "quest":
+    if args.mode != "dense":
         if args.block_budget <= 0:
             if args.token_budget <= 0:
                 raise ValueError("Quest mode requires a positive budget")
@@ -172,18 +186,19 @@ def main() -> None:
     sampling = SamplingParams(temperature=0.0, max_tokens=args.decode_tokens)
     results = [_run_case(llm, case, sampling) for case in cases]
     sparse_stats = None
-    if args.mode == "quest":
+    if args.mode != "dense":
         worker_stats = llm.collective_rpc("get_sparse_kv_stats")
         sparse_stats = worker_stats[0] if worker_stats else None
     del llm
 
     payload = {
-        "strategy": "quest_resident_quality",
+        "strategy": f"{args.mode}_resident_quality",
         "task": args.task,
         "model": args.model,
         "mode": args.mode,
         "token_budget": args.token_budget,
         "block_budget": args.block_budget,
+        "all_blocks": args.all_blocks,
         "page_size": args.page_size,
         "samples": len(results),
         "accuracy": sum(int(item["correct"]) for item in results) / len(results),

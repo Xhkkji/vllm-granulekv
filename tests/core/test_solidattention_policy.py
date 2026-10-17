@@ -5,6 +5,8 @@ import torch
 
 from evaluation.paper_reproduction.solidattention.adapter import (
     SolidAttentionPolicy, )
+from evaluation.paper_reproduction.solidattention.adapter.reference import (
+    reference_solidattention_selection, )
 from vllm.core.custom_schedulers.hierarchical_io import (
     build_sparse_restore_plan_feedback, configure_sparse_kv_policy,
     discard_sparse_restore_context, register_sparse_restore_context)
@@ -287,3 +289,165 @@ def test_solidattention_feedback_compiles_per_layer_prefix_plan():
     finally:
         discard_sparse_restore_context(("request", ))
         configure_sparse_kv_policy(None)
+
+
+@pytest.mark.parametrize("query_heads,kv_heads,budget", [
+    (4, 4, 1),
+    (8, 2, 2),
+    (8, 1, 8),
+])
+def test_solidattention_selector_matches_independent_reference(
+        query_heads, kv_heads, budget):
+    torch.manual_seed(11)
+    policy = SolidAttentionPolicy(init_blocks=2, local_blocks=2)
+    query = torch.randn(query_heads, 4)
+    representatives = torch.randn(10, 2, kv_heads, 4)
+
+    actual = policy._select_prefix(query, representatives, 10, budget)
+    expected = reference_solidattention_selection(
+        query, representatives, 10, budget, init_blocks=2, local_blocks=2)
+
+    assert tuple(actual.tolist()) == expected
+
+
+def test_solidattention_selector_reference_handles_ties_and_logical_gaps():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    query = torch.ones(2, 2)
+    representatives = torch.ones(5, 2, 2, 2)
+    logical = (0, 2, 4, 5, 7)
+
+    actual = policy._select_prefix_with_logical_indices(
+        query, representatives, logical, 8, 2)
+    expected = reference_solidattention_selection(
+        query,
+        representatives,
+        8,
+        2,
+        init_blocks=1,
+        local_blocks=1,
+        logical_block_indices=logical,
+    )
+
+    assert tuple(actual.tolist()) == expected
+    assert actual.tolist() == sorted(set(actual.tolist()))
+
+
+def _validation_metadata(prompt: str = "prompt"):
+    return {
+        "model": "Qwen2.5-7B-Instruct",
+        "prompt_sha256": prompt,
+        "block_size": 16,
+        "prefix_blocks": 3,
+        "num_layers": 2,
+        "page_identity": "page",
+        "capture_trace": True,
+        "capture_layer_data": True,
+        "retain_report": True,
+    }
+
+
+def test_solidattention_validation_all_blocks_and_request_steps():
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.configure_validation("request", "all_blocks",
+                                _validation_metadata())
+
+    first = policy._apply_validation_selection(
+        "request", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    second_layer = policy._apply_validation_selection(
+        "request", 1, torch.tensor([0, 2]), 3, 4, 1, 3)
+    next_step = policy._apply_validation_selection(
+        "request", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    report = policy.validation_report("request")
+
+    assert first.tolist() == [0, 1, 2]
+    assert second_layer.tolist() == [0, 1, 2]
+    assert next_step.tolist() == [0, 1, 2]
+    assert [(item["decode_step"], item["layer_index"])
+            for item in report["records"]] == [(0, 0), (0, 1), (1, 0)]
+    assert all(item["attention_blocks"] == [0, 1, 2, 3]
+               for item in report["records"])
+
+
+def test_solidattention_validation_record_replay_checks_kv_and_attention():
+    metadata = _validation_metadata()
+    recorder = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    recorder.configure_validation("record", "record", metadata)
+    recorder._apply_validation_selection(
+        "record", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    key_cache = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    value_cache = key_cache + 100
+    block_table = torch.arange(4, dtype=torch.int32).view(1, -1)
+    output = torch.tensor([[1.0, 2.0]])
+    recorder.record_validation_attention("record", 0, key_cache, value_cache,
+                                         block_table, output)
+    trace = recorder.validation_report("record")
+
+    replay = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    replay.configure_validation("replay", "replay", metadata,
+                                trace["records"], trace["metadata"])
+    chosen = replay._apply_validation_selection(
+        "replay", 0, torch.tensor([0, 1]), 3, 4, 1, 3)
+    replay.record_validation_attention("replay", 0, key_cache, value_cache,
+                                       block_table, output)
+    report = replay.validation_report("replay")
+
+    assert chosen.tolist() == [0, 2]
+    assert report["replay_selection_mismatches"] == 1
+    assert report["kv_fingerprint_mismatches"] == 0
+    assert report["attention_output_mismatches"] == 0
+
+    replay_bad = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    replay_bad.configure_validation("replay-bad", "replay", metadata,
+                                    trace["records"], trace["metadata"])
+    replay_bad._apply_validation_selection(
+        "replay-bad", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    changed_key = key_cache.clone()
+    changed_key[2, 0, 0] += 1
+    replay_bad.record_validation_attention("replay-bad", 0, changed_key,
+                                           value_cache, block_table,
+                                           output + 0.1)
+    bad_report = replay_bad.validation_report("replay-bad")
+    assert bad_report["kv_fingerprint_mismatches"] == 1
+    assert bad_report["attention_output_mismatches"] == 1
+    assert bad_report["first_mismatch_step"] == 0
+    assert bad_report["first_mismatch_layer"] == 0
+
+
+def test_solidattention_replay_rejects_metadata_mismatch():
+    metadata = _validation_metadata()
+    record = {
+        "decode_step": 0,
+        "layer_index": 0,
+        "prefix_blocks": 3,
+        "selected_prefix_blocks": [0, 2],
+        "attention_blocks": [0, 2, 3],
+        "block_budget": 1,
+        "page_identity": "page",
+        "representative_count": 3,
+    }
+    mismatched = dict(metadata, block_size=32)
+    policy = SolidAttentionPolicy()
+    with pytest.raises(ValueError, match="block_size"):
+        policy.configure_validation("request", "replay", mismatched, [record],
+                                    metadata)
+
+
+def test_solidattention_all_block_validation_compares_dense_attention():
+    metadata = dict(_validation_metadata(), compare_dense_attention=True)
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    policy.configure_validation("request", "all_blocks", metadata)
+    policy._apply_validation_selection(
+        "request", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    key_cache = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    value_cache = key_cache + 100
+    block_table = torch.arange(4, dtype=torch.int32).view(1, -1)
+    selected_output = torch.tensor([[1.0, 2.0]])
+
+    policy.record_validation_attention(
+        "request", 0, key_cache, value_cache, block_table, selected_output,
+        selected_output + 0.5)
+    report = policy.validation_report("request")
+
+    assert report["attention_output_mismatches"] == 1
+    assert report["all_block_attention_rel_error"] > 0
+    assert report["all_block_attention_cosine"] < 1

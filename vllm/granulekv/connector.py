@@ -136,6 +136,8 @@ class GranuleKVConnector:
         self.max_in_flight = 0
         self.gpu_cache: list[torch.Tensor] = []
         self.host_cache: list[torch.Tensor] = []
+        self._cuda_host_regions: list[tuple[int, int]] = []
+        self._host_cache_cuda_pinned = False
         self._pending_transfers: dict[str, _PendingTransfer] = {}
         self._status_query_calls = 0
         self._complete_calls = 0
@@ -225,6 +227,8 @@ class GranuleKVConnector:
             host_tensors[layer % self.layout.num_host_regions]
             for layer in range(self.layout.num_layers)
         ] if host_tensors else []
+        self._register_cuda_host_regions(result.host_regions,
+                                         result.manifest)
         logger.info(
             "[GRANULEKV] imported KV cache layers=%d gpu_regions=%d "
             "gpu_blocks=%d storage_blocks=%d fragment_bytes=%d "
@@ -253,8 +257,66 @@ class GranuleKVConnector:
         if self._pending_transfers:
             raise RuntimeError(
                 "cannot close GranuleKV connector with active requests")
+        self.unregister_cuda_host_regions()
         self.host_cache.clear()
         self.client.close()
+
+    @property
+    def host_cache_cuda_pinned(self) -> bool:
+        return self._host_cache_cuda_pinned
+
+    @staticmethod
+    def _cuda_status_code(status: object) -> int:
+        if isinstance(status, tuple):
+            status = status[0]
+        if hasattr(status, "value"):
+            status = status.value
+        return int(status)
+
+    def unregister_cuda_host_regions(self) -> None:
+        """Release CUDA page-locks for the fixed shared host regions."""
+        if not self._cuda_host_regions:
+            self._host_cache_cuda_pinned = False
+            return
+        cudart = torch.cuda.cudart()
+        for address, _ in reversed(self._cuda_host_regions):
+            status = cudart.cudaHostUnregister(address)
+            if self._cuda_status_code(status) != 0:
+                raise RuntimeError(
+                    f"cudaHostUnregister failed: address=0x{address:x} "
+                    f"status={status}")
+        self._cuda_host_regions.clear()
+        self._host_cache_cuda_pinned = False
+
+    def _register_cuda_host_regions(self, regions: Sequence[Any],
+                                    manifest: dict[str, Any]) -> None:
+        """Register the existing shared host KV cache once."""
+        if not envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+            return
+        if self._host_cache_cuda_pinned:
+            return
+        if not regions:
+            raise RuntimeError(
+                "async host-to-GPU prefetch requires host KV regions")
+        try:
+            cudart = torch.cuda.cudart()
+            host_mappings = manifest.get("host_regions", ())
+            for region in regions:
+                mapping = host_mappings[region.region_index]
+                address = int(region.region_ptr)
+                size_bytes = int(mapping["allocation_bytes"])
+                status = cudart.cudaHostRegister(address, size_bytes, 0)
+                if self._cuda_status_code(status) != 0:
+                    raise RuntimeError(
+                        f"cudaHostRegister failed: address=0x{address:x} "
+                        f"size={size_bytes} status={status}")
+                self._cuda_host_regions.append((address, size_bytes))
+        except Exception:
+            self.unregister_cuda_host_regions()
+            raise RuntimeError(
+                "async host-to-GPU prefetch requires CUDA-pinned shared "
+                "host KV regions") from None
+        self._host_cache_cuda_pinned = True
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         self._run_sync_request(src_to_dst, operation="write")

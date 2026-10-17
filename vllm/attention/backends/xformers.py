@@ -1341,23 +1341,62 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     max_seq_len_arg = selected_seq_len
 
             if selected_attention is not None:
-                output[num_prefill_query_tokens:] = (
-                    PagedAttention.forward_decode_selected(
-                        decode_query,
+                selected_output = PagedAttention.forward_decode_selected(
+                    decode_query,
+                    key_cache,
+                    value_cache,
+                    block_tables_arg,
+                    seq_lens_arg,
+                    selected_attention.logical_block_indices,
+                    selected_attention.count,
+                    selected_attention_seq_len,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+                output[num_prefill_query_tokens:] = selected_output
+                policy = get_sparse_kv_policy()
+                validation_recorder = (
+                    None if policy is None else
+                    getattr(policy, "record_validation_attention", None))
+                if callable(validation_recorder):
+                    layer_index = self._layer_index_from_name(
+                        getattr(layer, "layer_name", ""))
+                    request_ids = get_active_layer_request_ids()
+                    if layer_index is None or len(request_ids) > 1:
+                        raise RuntimeError(
+                            "sparse validation requires one named layer request")
+                    request_id = request_ids[0] if request_ids else "default"
+                    dense_reference = None
+                    requires_dense = getattr(
+                        policy, "validation_requires_dense_reference", None)
+                    if callable(requires_dense) and requires_dense(request_id):
+                        dense_reference = PagedAttention.forward_decode(
+                            decode_query,
+                            key_cache,
+                            value_cache,
+                            block_tables_arg,
+                            seq_lens_arg,
+                            max_seq_len_arg,
+                            self.kv_cache_dtype,
+                            self.num_kv_heads,
+                            self.scale,
+                            self.alibi_slopes,
+                            layer._k_scale,
+                            layer._v_scale,
+                        )
+                    validation_recorder(
+                        request_id,
+                        layer_index,
                         key_cache,
                         value_cache,
                         block_tables_arg,
-                        seq_lens_arg,
-                        selected_attention.logical_block_indices,
-                        selected_attention.count,
-                        selected_attention_seq_len,
-                        self.kv_cache_dtype,
-                        self.num_kv_heads,
-                        self.scale,
-                        self.alibi_slopes,
-                        layer._k_scale,
-                        layer._v_scale,
-                    ))
+                        selected_output,
+                        dense_reference,
+                    )
             else:
                 output[num_prefill_query_tokens:] = PagedAttention.forward_decode(
                     decode_query,

@@ -156,3 +156,21 @@ def test_event_fenced_non_window_layer_does_not_record(monkeypatch):
     worker._register_gpu_transfer(0, _request(), _FakeMapping())
     worker._record_gpu_region_release_event(0, ("request-1", ), 1)
     assert worker._host_stats.get("layer_release_event_record_count", 0) == 0
+
+
+def test_async_copy_consumes_release_event_without_host_wait():
+    class _Event:
+
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = _Event()
+    worker = _worker()
+    worker._gpu_region_release_events[(0, 2, 3)] = ("request-1", event)
+
+    assert worker._take_gpu_region_release_event(0, 2, 3) is event
+    assert (0, 2, 3) not in worker._gpu_region_release_events
+    assert not event.synchronized

@@ -81,3 +81,43 @@ The result reports predicted, actual, hit, miss, and wasted prefix blocks.
 Current experiments report prediction recall, prediction restore requests and
 bytes, guard size, correction blocks/bytes, submit time, wait time, and total
 correction blocking separately.
+
+## Correctness and Quality Validation
+
+The test-only validation modes are disabled by default:
+
+```text
+off        normal inference
+all_blocks select the complete immutable prefix and compare selected-list
+           attention with the native dense paged-attention output
+record     save selected lists, selected KV fingerprints, and layer outputs
+replay     force a recorded selected list and compare the current data path
+```
+
+The Figure 13 runner accepts:
+
+```text
+--sparse-validation-mode
+--selection-trace
+--validation-output
+```
+
+`record` and `replay` validate model, prompt SHA-256, block size, prefix block
+count, layer count, and page identity before inference. The runner writes
+`correctness_summary.json` and `performance_summary.csv`; failed replay, KV,
+attention, residency, or correction checks mark the point as
+`invalid_for_comparison`.
+
+Passkey and JSONL quality sweeps reuse the existing resident-only runner:
+
+```bash
+TASK=passkey \
+  bash evaluation/paper_reproduction/solidattention/scripts/run_quality_validation.sh
+
+TASK=jsonl MANIFEST=/path/to/longbench.jsonl \
+  bash evaluation/paper_reproduction/solidattention/scripts/run_quality_validation.sh
+```
+
+The sweep evaluates block budgets 16, 32, 64, 128, plus all blocks, and writes
+`selection_quality.csv`. `output=1` Figure 13 runs are TTFT-only; use
+`output=64`, three warmups, and ten measured repetitions for TPOT conclusions.

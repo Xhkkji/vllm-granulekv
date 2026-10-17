@@ -113,3 +113,47 @@ def test_selected_paged_attention_matches_reference(sequence_length, selected):
                                      scale)
     torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(block_table, table_before)
+
+
+def test_selected_all_blocks_matches_dense_paged_attention():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    sequence_length = 257
+    block_size = 16
+    num_blocks = (sequence_length + block_size - 1) // block_size
+    num_heads, num_kv_heads, head_size = 8, 2, 32
+    x = 16 // 2
+    key_cache = torch.randn(num_blocks,
+                            num_kv_heads,
+                            head_size // x,
+                            block_size,
+                            x,
+                            device="cuda",
+                            dtype=torch.float16)
+    value_cache = torch.randn(num_blocks,
+                              num_kv_heads,
+                              head_size,
+                              block_size,
+                              device="cuda",
+                              dtype=torch.float16)
+    block_table = torch.randperm(num_blocks, device="cuda",
+                                 dtype=torch.int64).to(torch.int32).view(1, -1)
+    selected = torch.arange(num_blocks, device="cuda", dtype=torch.int32)
+    query = torch.randn(1, num_heads, head_size, device="cuda",
+                        dtype=torch.float16)
+    seq_lens = torch.tensor([sequence_length], device="cuda", dtype=torch.int32)
+    scale = 1.0 / math.sqrt(head_size)
+    k_scale = v_scale = torch.tensor(1.0, device="cuda")
+
+    selected_output = PagedAttention.forward_decode_selected(
+        query, key_cache, value_cache, block_table, seq_lens, selected,
+        num_blocks, sequence_length, "auto", num_kv_heads, scale, None,
+        k_scale, v_scale)
+    dense_output = PagedAttention.forward_decode(
+        query, key_cache, value_cache, block_table, seq_lens, sequence_length,
+        "auto", num_kv_heads, scale, None, k_scale, v_scale)
+
+    torch.testing.assert_close(selected_output,
+                               dense_output,
+                               rtol=2e-2,
+                               atol=2e-2)

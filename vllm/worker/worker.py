@@ -100,6 +100,8 @@ class Worker(LocalOrDistributedWorkerBase):
         # slot, not by logical residency, because only slot reuse needs fencing.
         self._gpu_region_release_events: Dict[
             Tuple[int, int, int], Tuple[str, object]] = {}
+        self._pending_h2d_transfers: Dict[
+            Tuple[int, str, int, int], object] = {}
         self._gpu_transfer_regions: Dict[
             Tuple[int, str], Tuple[str, Tuple[int, int],
                                    Tuple[Tuple[int, int], ...]]] = {}
@@ -115,6 +117,14 @@ class Worker(LocalOrDistributedWorkerBase):
             "gpu_to_cpu_bytes": 0,
             "cpu_to_gpu_blocks": 0,
             "cpu_to_gpu_bytes": 0,
+            "host_buffer_cuda_pinned": 0,
+            "host_gpu_submit_count": 0,
+            "host_gpu_copy_blocks": 0,
+            "host_gpu_copy_bytes": 0,
+            "host_gpu_ready_events": 0,
+            "host_gpu_event_wait_count": 0,
+            "host_gpu_event_wait_ms": 0,
+            "host_gpu_copy_stream_ms": 0,
             "cpu_cache_ready_blocks": 0,
             "cpu_cache_hit_blocks": 0,
             "cpu_cache_loading_waits": 0,
@@ -209,6 +219,9 @@ class Worker(LocalOrDistributedWorkerBase):
             self.profiler = None
 
     def get_sparse_kv_stats(self, reset: bool = False):
+        self._host_stats["host_gpu_copy_stream_ms"] += sum(
+            cache_engine.drain_host_to_gpu_copy_time_ms()
+            for cache_engine in self.cache_engine)
         result = super().get_sparse_kv_stats(reset=reset)
         result.update(self._prefetch_runtime.residency_stats())
         restore = self._prefetch_runtime.prediction_restore_stats(reset=reset)
@@ -234,6 +247,10 @@ class Worker(LocalOrDistributedWorkerBase):
                 for name, value in connector.control_plane_stats(
                     reset=reset).items()
             })
+        result["host_buffer_cuda_pinned"] = any(
+            cache_engine.granulekv_connector is not None
+            and cache_engine.granulekv_connector.host_cache_cuda_pinned
+            for cache_engine in self.cache_engine)
         if reset:
             for name in self._host_stats:
                 self._host_stats[name] = 0
@@ -250,6 +267,33 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError(
                 "configured sparse policy does not support metadata seeding")
         return int(seed(source_request_id, page_index_key, num_prefix_blocks))
+
+    def configure_sparse_validation(
+        self,
+        request_id: str,
+        mode: str,
+        metadata: Optional[Dict[str, object]] = None,
+        replay_records: Optional[Sequence[Dict[str, object]]] = None,
+        replay_metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        policy = get_sparse_kv_policy()
+        configure = (None if policy is None else
+                     getattr(policy, "configure_validation", None))
+        if not callable(configure):
+            raise RuntimeError(
+                "configured sparse policy does not support validation")
+        configure(request_id, mode, metadata, replay_records, replay_metadata)
+
+    def get_sparse_validation_report(self,
+                                     request_id: str,
+                                     reset: bool = False):
+        policy = get_sparse_kv_policy()
+        report = (None if policy is None else
+                  getattr(policy, "validation_report", None))
+        if not callable(report):
+            raise RuntimeError(
+                "configured sparse policy does not support validation")
+        return report(request_id, reset=reset)
 
     def start_profile(self):
         if self.profiler is None:
@@ -908,6 +952,14 @@ class Worker(LocalOrDistributedWorkerBase):
                 (time.perf_counter() - start) * 1000.0)
         self._gpu_region_release_events.pop(key, None)
 
+    def _take_gpu_region_release_event(self, virtual_engine: int,
+                                       layer_index: int,
+                                       destination_block: int) -> Optional[object]:
+        """Transfer a slot fence to the copy stream without host waiting."""
+        key = (virtual_engine, layer_index, int(destination_block))
+        entry = self._gpu_region_release_events.pop(key, None)
+        return None if entry is None else entry[1]
+
     def _record_gpu_region_release_event(
             self, virtual_engine: int, request_ids: Sequence[str],
             layer_index: int) -> None:
@@ -1128,6 +1180,42 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_engine[virtual_engine].copy_host_blocks_to_gpu(
             layer_index, mapping)
 
+    def copy_host_blocks_to_gpu_async(
+            self,
+            virtual_engine: int,
+            seq_group_id: str,
+            layer_index: int,
+            mapping: torch.Tensor,
+            logical_blocks: Sequence[int],
+    ) -> None:
+        """Enqueue host->GPU copies and publish a compute-stream dependency."""
+        cache_engine = self.cache_engine[virtual_engine]
+        release_events = []
+        seen_events: Set[int] = set()
+        for _, destination_block in mapping.tolist():
+            release_event = self._take_gpu_region_release_event(
+                virtual_engine, layer_index, int(destination_block))
+            if (release_event is not None
+                    and id(release_event) not in seen_events):
+                release_events.append(release_event)
+                seen_events.add(id(release_event))
+        ready_event = cache_engine.copy_host_blocks_to_gpu_async(
+            layer_index, mapping, release_events)
+        self._host_stats["host_gpu_submit_count"] += 1
+        self._host_stats["host_gpu_copy_blocks"] += int(mapping.shape[0])
+        block_bytes = (CacheEngine.get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config) //
+                       cache_engine.num_attention_layers)
+        self._host_stats["host_gpu_copy_bytes"] += (
+            int(mapping.shape[0]) * block_bytes)
+        self._host_stats["host_gpu_ready_events"] += 1
+        for logical_block in logical_blocks:
+            self._pending_h2d_transfers[
+                (virtual_engine, seq_group_id, layer_index,
+                 int(logical_block))] = ready_event
+        torch.cuda.current_stream().wait_event(ready_event)
+        self._host_stats["host_gpu_event_wait_count"] += 1
+
     def _forget_host_staging(self, virtual_engine: int,
                              request_ids: Sequence[str]) -> None:
         """Drop finished request metadata without cancelling active DMA."""
@@ -1142,6 +1230,9 @@ class Worker(LocalOrDistributedWorkerBase):
             collection.difference_update(
                 item for item in collection
                 if item[0] == virtual_engine and item[1] in finished)
+        for key in tuple(self._pending_h2d_transfers):
+            if key[0] == virtual_engine and key[1] in finished:
+                self._pending_h2d_transfers.pop(key, None)
         for key in tuple(self._gpu_resident_blocks):
             if key[0] == virtual_engine and key[1] in finished:
                 destination = self._gpu_resident_blocks.pop(key)
@@ -1306,13 +1397,18 @@ class Worker(LocalOrDistributedWorkerBase):
                           state.correction_mapping_by_logical[block][1])
                          for block in ready_blocks],
                         device="cpu", dtype=torch.int64).view(-1, 2)
-                    if envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
-                        for block in ready_blocks:
-                            self._prepare_gpu_region_reuse(
-                                virtual_engine, layer_index,
-                                state.correction_mapping_by_logical[block][1])
-                    self.copy_host_blocks_to_gpu(
-                        virtual_engine, layer_index, host_to_gpu)
+                    if envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+                        self.copy_host_blocks_to_gpu_async(
+                            virtual_engine, state.seq_group_id, layer_index,
+                            host_to_gpu, ready_blocks)
+                    else:
+                        if envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
+                            for block in ready_blocks:
+                                self._prepare_gpu_region_reuse(
+                                    virtual_engine, layer_index,
+                                    state.correction_mapping_by_logical[block][1])
+                        self.copy_host_blocks_to_gpu(
+                            virtual_engine, layer_index, host_to_gpu)
                     if reuse_gpu_residency:
                         self._mark_gpu_blocks_ready(
                             virtual_engine, state.seq_group_id, layer_index,

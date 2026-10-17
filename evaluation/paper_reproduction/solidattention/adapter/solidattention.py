@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -12,7 +15,9 @@ import vllm.envs as envs
 from vllm.attention.ops.sparse_kv import (
     SparseKVDeviceSelection,
     build_page_representatives_from_paged_key_cache, )
-from vllm.attention.ops.sparse_kv import record_sparse_kv_selection
+from vllm.attention.ops.sparse_kv import (
+    record_sparse_kv_selection, record_sparse_kv_selection_d2h_wait,
+    record_sparse_kv_selection_tolist_call)
 from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
     SparseKVActualSelection, )
 
@@ -50,6 +55,29 @@ class _PredictionRepresentativeState:
     representatives: torch.Tensor
 
 
+@dataclass
+class _ValidationState:
+    mode: str
+    metadata: dict[str, Any]
+    replay: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    records_by_key: dict[tuple[int, int], dict[str, Any]] = field(
+        default_factory=dict)
+    current_layer_keys: dict[int, tuple[int, int]] = field(default_factory=dict)
+    decode_step: int = 0
+    last_layer_index: Optional[int] = None
+    selector_reference_mismatches: int = 0
+    replay_selection_mismatches: int = 0
+    kv_fingerprint_mismatches: int = 0
+    attention_output_mismatches: int = 0
+    attention_output_max_rel_error: float = 0.0
+    attention_output_min_cosine: float = 1.0
+    all_block_attention_rel_error: float = 0.0
+    all_block_attention_cosine: float = 1.0
+    first_mismatch_step: Optional[int] = None
+    first_mismatch_layer: Optional[int] = None
+
+
 class SolidAttentionPolicy:
     """Minimal SolidAttention-style policy for the shared sparse bridge.
 
@@ -60,6 +88,14 @@ class SolidAttentionPolicy:
     """
 
     name = "solidattention"
+    _REPLAY_METADATA_KEYS = (
+        "model",
+        "prompt_sha256",
+        "block_size",
+        "prefix_blocks",
+        "num_layers",
+        "page_identity",
+    )
 
     def __init__(self, init_blocks: int = 2, local_blocks: int = 2) -> None:
         if init_blocks < 0 or local_blocks < 0:
@@ -81,6 +117,370 @@ class SolidAttentionPolicy:
             str, Dict[int, _AttentionSelectionState]] = defaultdict(dict)
         self._dynamic_selection_buffers: Dict[
             str, Dict[int, torch.Tensor]] = defaultdict(dict)
+        self._selection_control_buffers: Dict[str, torch.Tensor] = {}
+        self._validation_states: Dict[str, _ValidationState] = {}
+        self._completed_validation_reports: Dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _normalize_validation_mode(mode: str) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized not in ("off", "all_blocks", "record", "replay"):
+            raise ValueError(f"unsupported sparse validation mode: {mode!r}")
+        return normalized
+
+    def configure_validation(
+        self,
+        request_id: str,
+        mode: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        replay_records: Optional[Sequence[Mapping[str, Any]]] = None,
+        replay_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if not request_id:
+            raise ValueError("validation request_id must not be empty")
+        normalized = self._normalize_validation_mode(mode)
+        replay: dict[tuple[int, int], dict[str, Any]] = {}
+        if normalized == "replay":
+            if not replay_records:
+                raise ValueError("replay validation requires selection records")
+            current_metadata = dict(metadata or {})
+            source_metadata = dict(replay_metadata or {})
+            for key in self._REPLAY_METADATA_KEYS:
+                if key not in current_metadata or key not in source_metadata:
+                    raise ValueError(
+                        f"replay validation metadata lacks required key: {key}")
+                if current_metadata[key] != source_metadata[key]:
+                    raise ValueError(
+                        "sparse replay metadata mismatch: "
+                        f"{key} expected={source_metadata[key]!r} "
+                        f"actual={current_metadata[key]!r}")
+            for raw in replay_records:
+                record = dict(raw)
+                decode_step = int(record["decode_step"])
+                layer_index = int(record["layer_index"])
+                key = (decode_step, layer_index)
+                if key in replay:
+                    raise ValueError(f"duplicate replay selection record: {key}")
+                if decode_step < 0:
+                    raise ValueError("replay decode_step must be non-negative")
+                if not 0 <= layer_index < int(current_metadata["num_layers"]):
+                    raise ValueError("replay layer_index is outside the model")
+                if int(record["prefix_blocks"]) != int(
+                        current_metadata["prefix_blocks"]):
+                    raise ValueError(
+                        "replay record prefix_blocks differs from metadata")
+                selected = tuple(int(index) for index in
+                                 record["selected_prefix_blocks"])
+                if (selected != tuple(sorted(set(selected)))
+                        or any(index < 0 or index >= int(
+                            current_metadata["prefix_blocks"])
+                               for index in selected)):
+                    raise ValueError(
+                        "replay selected prefix blocks must be sorted, unique, "
+                        "and inside the immutable prefix")
+                page_identity = record.get("page_identity")
+                if (page_identity is not None
+                        and page_identity != current_metadata["page_identity"]):
+                    raise ValueError(
+                        "sparse replay record uses a different page identity")
+                replay[key] = record
+        self._completed_validation_reports.pop(request_id, None)
+        self._validation_states[request_id] = _ValidationState(
+            mode=normalized,
+            metadata=dict(metadata or {}),
+            replay=replay,
+        )
+
+    def _validation_state(self, request_id: str) -> Optional[_ValidationState]:
+        state = self._validation_states.get(request_id)
+        if state is not None:
+            return state
+        default_mode = self._normalize_validation_mode(
+            envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE)
+        if default_mode == "off":
+            return None
+        state = _ValidationState(mode=default_mode, metadata={})
+        self._validation_states[request_id] = state
+        return state
+
+    @staticmethod
+    def _validation_report_payload(state: _ValidationState) -> dict[str, Any]:
+        replay_unconsumed = len(set(state.replay) - set(state.records_by_key))
+        return {
+            "mode": state.mode,
+            "metadata": dict(state.metadata),
+            "records": list(state.records),
+            "selector_reference_mismatches":
+            state.selector_reference_mismatches,
+            "replay_selection_mismatches":
+            state.replay_selection_mismatches,
+            "replay_unconsumed_records": replay_unconsumed,
+            "kv_fingerprint_mismatches": state.kv_fingerprint_mismatches,
+            "attention_output_mismatches": state.attention_output_mismatches,
+            "attention_output_max_rel_error":
+            state.attention_output_max_rel_error,
+            "attention_output_min_cosine":
+            state.attention_output_min_cosine,
+            "all_block_attention_rel_error":
+            state.all_block_attention_rel_error,
+            "all_block_attention_cosine": state.all_block_attention_cosine,
+            "logit_rel_error": None,
+            "greedy_token_match": None,
+            "first_mismatch_step": state.first_mismatch_step,
+            "first_mismatch_layer": state.first_mismatch_layer,
+        }
+
+    def validation_report(self, request_id: str,
+                          reset: bool = False) -> dict[str, Any]:
+        state = self._validation_states.get(request_id)
+        if state is not None:
+            report = self._validation_report_payload(state)
+        else:
+            report = dict(self._completed_validation_reports.get(
+                request_id, {
+                    "mode": "off",
+                    "metadata": {},
+                    "records": [],
+                    "selector_reference_mismatches": 0,
+                    "replay_selection_mismatches": 0,
+                    "replay_unconsumed_records": 0,
+                    "kv_fingerprint_mismatches": 0,
+                    "attention_output_mismatches": 0,
+                    "attention_output_max_rel_error": 0.0,
+                    "attention_output_min_cosine": 1.0,
+                    "all_block_attention_rel_error": 0.0,
+                    "all_block_attention_cosine": 1.0,
+                    "logit_rel_error": None,
+                    "greedy_token_match": None,
+                    "first_mismatch_step": None,
+                    "first_mismatch_layer": None,
+                }))
+        if reset:
+            self._validation_states.pop(request_id, None)
+            self._completed_validation_reports.pop(request_id, None)
+        return report
+
+    @staticmethod
+    def _mark_validation_mismatch(state: _ValidationState,
+                                  step: int,
+                                  layer_index: int) -> None:
+        if state.first_mismatch_step is None:
+            state.first_mismatch_step = step
+            state.first_mismatch_layer = layer_index
+
+    @staticmethod
+    def _next_validation_key(state: _ValidationState,
+                             layer_index: int) -> tuple[int, int]:
+        previous = state.last_layer_index
+        current_key = (state.decode_step, layer_index)
+        if (previous is not None
+                and (layer_index < previous
+                     or (layer_index == previous
+                         and current_key in state.records_by_key))):
+            state.decode_step += 1
+        state.last_layer_index = layer_index
+        key = (state.decode_step, layer_index)
+        state.current_layer_keys[layer_index] = key
+        return key
+
+    def _apply_validation_selection(
+        self,
+        request_id: str,
+        layer_index: int,
+        selected_prefix: torch.Tensor,
+        num_prefix_blocks: int,
+        num_blocks: int,
+        block_budget: int,
+        representative_count: int,
+    ) -> torch.Tensor:
+        state = self._validation_state(request_id)
+        if state is None or state.mode == "off":
+            return selected_prefix
+        key = self._next_validation_key(state, layer_index)
+        step, _ = key
+        natural = self._selection_indices_to_host(selected_prefix)
+        existing = state.records_by_key.get(key)
+        if existing is not None:
+            previous = tuple(int(index) for index in
+                             existing["selected_prefix_blocks"])
+            if previous != natural and state.mode == "record":
+                state.replay_selection_mismatches += 1
+                self._mark_validation_mismatch(state, step, layer_index)
+            if previous == natural:
+                return selected_prefix
+            return torch.tensor(previous,
+                                dtype=torch.long,
+                                device=selected_prefix.device)
+        chosen = natural
+        if state.mode == "all_blocks":
+            chosen = tuple(range(num_prefix_blocks))
+        elif state.mode == "replay":
+            record = state.replay.get((step, layer_index))
+            if record is None:
+                raise RuntimeError(
+                    "missing sparse replay selection: "
+                    f"request={request_id} step={step} layer={layer_index}")
+            expected_prefix = int(record["prefix_blocks"])
+            if expected_prefix != num_prefix_blocks:
+                raise RuntimeError(
+                    "sparse replay prefix mismatch: "
+                    f"expected={expected_prefix} actual={num_prefix_blocks}")
+            chosen = tuple(int(index)
+                           for index in record["selected_prefix_blocks"])
+            if natural != chosen:
+                state.replay_selection_mismatches += 1
+                self._mark_validation_mismatch(state, step, layer_index)
+        if any(index < 0 or index >= num_prefix_blocks for index in chosen):
+            raise RuntimeError(
+                "validation selection is outside the immutable prefix")
+        suffix = tuple(range(num_prefix_blocks, num_blocks))
+        record = {
+            "decode_step": step,
+            "layer_index": layer_index,
+            "prefix_blocks": num_prefix_blocks,
+            "selected_prefix_blocks": list(chosen),
+            "attention_blocks": list(chosen + suffix),
+            "block_budget": block_budget,
+            "page_identity": state.metadata.get("page_identity"),
+            "representative_count": representative_count,
+        }
+        if state.metadata.get("capture_trace", False):
+            state.records.append(record)
+        state.records_by_key[key] = record
+        if chosen == natural:
+            return selected_prefix
+        return torch.tensor(chosen,
+                            dtype=torch.long,
+                            device=selected_prefix.device)
+
+    @staticmethod
+    def _tensor_payload(tensor: torch.Tensor) -> dict[str, Any]:
+        host = tensor.detach().contiguous().cpu()
+        raw = host.view(torch.uint8).numpy().tobytes()
+        return {
+            "dtype": str(host.dtype).removeprefix("torch."),
+            "shape": list(host.shape),
+            "data_b64": base64.b64encode(raw).decode("ascii"),
+        }
+
+    @staticmethod
+    def _tensor_from_payload(payload: Mapping[str, Any]) -> torch.Tensor:
+        dtypes = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        dtype_name = str(payload["dtype"])
+        if dtype_name not in dtypes:
+            raise ValueError(
+                f"unsupported validation tensor dtype: {dtype_name}")
+        raw = bytearray(base64.b64decode(str(payload["data_b64"])))
+        return torch.frombuffer(raw, dtype=dtypes[dtype_name]).clone().reshape(
+            tuple(int(value) for value in payload["shape"]))
+
+    @staticmethod
+    def _kv_fingerprint(key: torch.Tensor, value: torch.Tensor) -> str:
+        digest = hashlib.sha256()
+        for tensor in (key, value):
+            host = tensor.detach().contiguous().cpu()
+            digest.update(str(host.dtype).encode("ascii"))
+            digest.update(repr(tuple(host.shape)).encode("ascii"))
+            digest.update(host.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def record_validation_attention(
+        self,
+        request_id: str,
+        layer_index: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        attention_output: torch.Tensor,
+        dense_attention_output: Optional[torch.Tensor] = None,
+    ) -> None:
+        state = self._validation_states.get(request_id)
+        if state is None or state.mode == "off":
+            return
+        if not state.metadata.get("capture_layer_data", False):
+            return
+        key = state.current_layer_keys.get(layer_index)
+        if key is None:
+            raise RuntimeError(
+                "validation attention has no matching selection record")
+        step, _ = key
+        record = state.records_by_key[key]
+        fingerprints = {}
+        if state.metadata.get("capture_kv_fingerprints", True):
+            for logical_block in record["attention_blocks"]:
+                physical_block = int(block_table[0, int(logical_block)].item())
+                fingerprints[str(logical_block)] = self._kv_fingerprint(
+                    key_cache[physical_block], value_cache[physical_block])
+        output_payload = self._tensor_payload(attention_output)
+        if dense_attention_output is not None:
+            actual = attention_output.detach().float().cpu()
+            dense = dense_attention_output.detach().float().cpu()
+            difference = torch.linalg.vector_norm(actual - dense)
+            denominator = torch.linalg.vector_norm(dense).clamp_min(1e-12)
+            relative_error = float((difference / denominator).item())
+            cosine = float(torch.nn.functional.cosine_similarity(
+                actual.flatten(), dense.flatten(), dim=0).item())
+            record["dense_attention_rel_error"] = relative_error
+            record["dense_attention_cosine"] = cosine
+            state.all_block_attention_rel_error = max(
+                state.all_block_attention_rel_error, relative_error)
+            state.all_block_attention_cosine = min(
+                state.all_block_attention_cosine, cosine)
+            if (state.mode == "all_blocks"
+                    and not torch.allclose(actual,
+                                           dense,
+                                           rtol=2e-2,
+                                           atol=2e-2)):
+                state.attention_output_mismatches += 1
+                self._mark_validation_mismatch(state, step, layer_index)
+        if state.mode != "replay":
+            record["kv_fingerprints"] = fingerprints
+            record["attention_output"] = output_payload
+            return
+
+        expected = state.replay[key]
+        expected_fingerprints = expected.get("kv_fingerprints")
+        if expected_fingerprints is None:
+            raise RuntimeError("replay trace lacks KV fingerprints")
+        mismatches = sum(
+            expected_fingerprints.get(name) != fingerprint
+            for name, fingerprint in fingerprints.items())
+        missing = set(expected_fingerprints) - set(fingerprints)
+        if mismatches or missing:
+            state.kv_fingerprint_mismatches += mismatches + len(missing)
+            self._mark_validation_mismatch(state, step, layer_index)
+
+        expected_output_payload = expected.get("attention_output")
+        if expected_output_payload is None:
+            raise RuntimeError("replay trace lacks attention output")
+        expected_output = self._tensor_from_payload(expected_output_payload)
+        actual_output = attention_output.detach().float().cpu()
+        reference = expected_output.float()
+        if actual_output.shape != reference.shape:
+            state.attention_output_mismatches += 1
+            self._mark_validation_mismatch(state, step, layer_index)
+            return
+        difference = torch.linalg.vector_norm(actual_output - reference)
+        denominator = torch.linalg.vector_norm(reference).clamp_min(1e-12)
+        relative_error = float((difference / denominator).item())
+        cosine = float(torch.nn.functional.cosine_similarity(
+            actual_output.flatten(), reference.flatten(), dim=0).item())
+        state.attention_output_max_rel_error = max(
+            state.attention_output_max_rel_error, relative_error)
+        state.attention_output_min_cosine = min(
+            state.attention_output_min_cosine, cosine)
+        if not torch.allclose(actual_output, reference, rtol=2e-3, atol=2e-3):
+            state.attention_output_mismatches += 1
+            self._mark_validation_mismatch(state, step, layer_index)
+
+    def validation_requires_dense_reference(self, request_id: str) -> bool:
+        state = self._validation_states.get(request_id)
+        return bool(state is not None
+                    and state.metadata.get("compare_dense_attention", False))
 
     @staticmethod
     def _normalize_query(query: torch.Tensor) -> torch.Tensor:
@@ -91,6 +491,37 @@ class SolidAttentionPolicy:
         if query.ndim != 2:
             raise ValueError("query must have shape [heads, head_dim]")
         return query
+
+    def _selection_indices_to_host(self, selected: torch.Tensor) -> tuple[int, ...]:
+        """Copy selection metadata explicitly at its CPU control dependency."""
+        if not selected.is_cuda:
+            return tuple(int(index) for index in selected)
+        if not envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+            record_sparse_kv_selection_tolist_call()
+            return tuple(int(index) for index in selected.tolist())
+        count = int(selected.shape[0])
+        buffer = self._selection_control_buffers.get("default")
+        if (buffer is None or buffer.numel() < count
+                or buffer.dtype != selected.dtype):
+            capacity = count if buffer is None else max(count, buffer.numel() * 2)
+            # The policy may be called under vLLM's inference mode.  Keep the
+            # reusable host control buffer as a normal tensor because later
+            # D2H copies can run outside that mode.
+            with torch.inference_mode(False):
+                buffer = torch.empty(capacity,
+                                     dtype=selected.dtype,
+                                     pin_memory=True)
+            self._selection_control_buffers["default"] = buffer
+        stream = torch.cuda.current_stream(selected.device)
+        with torch.cuda.stream(stream):
+            buffer[:count].copy_(selected, non_blocking=True)
+            ready = torch.cuda.Event(blocking=False, interprocess=False)
+            ready.record(stream)
+        start = time.perf_counter()
+        ready.synchronize()
+        record_sparse_kv_selection_d2h_wait(
+            (time.perf_counter() - start) * 1000.0)
+        return tuple(int(index) for index in buffer[:count])
 
     @staticmethod
     def _score_pages(query: torch.Tensor,
@@ -141,7 +572,10 @@ class SolidAttentionPolicy:
         if candidates.numel() == 0 or budget <= 0:
             return torch.empty(0, dtype=torch.long, device=scores.device)
         count = min(budget, candidates.numel())
-        topk = torch.topk(scores, count, dim=-1).indices
+        topk = torch.argsort(scores,
+                             dim=-1,
+                             descending=True,
+                             stable=True)[:, :count]
         mask = torch.zeros(candidates.numel(),
                            dtype=torch.bool,
                            device=scores.device)
@@ -415,10 +849,23 @@ class SolidAttentionPolicy:
         key = (request_id, layer_index)
         if key not in self._seen:
             self._seen.add(key)
-            return torch.arange(num_blocks, dtype=torch.long, device=query.device)
+            selected_prefix = torch.arange(prefix_count,
+                                           dtype=torch.long,
+                                           device=query.device)
+            selected_prefix = self._apply_validation_selection(
+                request_id, layer_index, selected_prefix, prefix_count,
+                num_blocks, block_budget, int(representatives.shape[0]))
+            suffix = torch.arange(prefix_count,
+                                  num_blocks,
+                                  dtype=torch.long,
+                                  device=query.device)
+            return torch.cat((selected_prefix, suffix))
 
         selected_prefix = self._select_prefix(query, representatives,
                                                prefix_count, block_budget)
+        selected_prefix = self._apply_validation_selection(
+            request_id, layer_index, selected_prefix, prefix_count, num_blocks,
+            block_budget, int(representatives.shape[0]))
         suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
                               device=query.device)
         return torch.cat((selected_prefix, suffix))
@@ -463,7 +910,9 @@ class SolidAttentionPolicy:
             self._prepare_device_selection(
                 request_id, layer_index, query, key_cache, physical_block_ids,
                 sequence_length, block_size, block_budget))
-        reuse = envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE
+        validation = self._validation_state(request_id)
+        reuse = (envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE
+                 and (validation is None or validation.mode == "off"))
         if (reuse and state is not None and state.ready
                 and state.prefix_count == prefix_count
                 and state.num_blocks == num_blocks
@@ -480,13 +929,25 @@ class SolidAttentionPolicy:
 
         if key not in self._seen:
             self._seen.add(key)
-            selected = torch.arange(num_blocks, dtype=torch.long,
-                                    device=query.device)
+            selected_prefix = torch.arange(prefix_count,
+                                           dtype=torch.long,
+                                           device=query.device)
+            selected_prefix = self._apply_validation_selection(
+                request_id, layer_index, selected_prefix, prefix_count,
+                num_blocks, block_budget, int(representatives.shape[0]))
+            suffix = torch.arange(prefix_count,
+                                  num_blocks,
+                                  dtype=torch.long,
+                                  device=query.device)
+            selected = torch.cat((selected_prefix, suffix))
             ready = False
         else:
             selected_prefix = self._select_prefix(query, representatives,
                                                    prefix_count, block_budget,
                                                    fixed_and_candidates)
+            selected_prefix = self._apply_validation_selection(
+                request_id, layer_index, selected_prefix, prefix_count,
+                num_blocks, block_budget, int(representatives.shape[0]))
             suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
                                   device=query.device)
             selected = torch.cat((selected_prefix, suffix))
@@ -528,9 +989,12 @@ class SolidAttentionPolicy:
         prefix_count = max(0, min(num_blocks - 1, representatives.shape[0]))
         selected = self._select_prefix(query, representatives, prefix_count,
                                        block_budget)
+        selected = self._apply_validation_selection(
+            request_id, layer_index, selected, prefix_count, num_blocks,
+            block_budget, int(representatives.shape[0]))
         suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
                               device=selected.device)
-        return tuple(torch.cat((selected, suffix)).tolist())
+        return self._selection_indices_to_host(torch.cat((selected, suffix)))
 
     def select_blocks_for_residency_check(
         self,
@@ -563,7 +1027,8 @@ class SolidAttentionPolicy:
                               num_blocks,
                               dtype=torch.long,
                               device=selected_prefix.device)
-        return tuple(torch.cat((selected_prefix, suffix)).tolist())
+        return self._selection_indices_to_host(
+            torch.cat((selected_prefix, suffix)))
 
     def _select_actual_prefix_tensor(
         self,
@@ -605,7 +1070,13 @@ class SolidAttentionPolicy:
         """Select only immutable prefix blocks for the current query."""
         selected = self._select_actual_prefix_tensor(
             request_id, layer_index, query, num_prefix_blocks, block_budget)
-        return tuple(int(index) for index in selected.tolist())
+        metadata = self._get_prediction_representatives(
+            request_id, layer_index, num_prefix_blocks)
+        representative_count = 0 if metadata is None else len(metadata[0])
+        selected = self._apply_validation_selection(
+            request_id, layer_index, selected, num_prefix_blocks,
+            num_prefix_blocks, block_budget, representative_count)
+        return self._selection_indices_to_host(selected)
 
     def select_actual_blocks_device(
         self,
@@ -622,6 +1093,12 @@ class SolidAttentionPolicy:
         selected_prefix = self._select_actual_prefix_tensor(
             request_id, layer_index, query, num_prefix_blocks, block_budget,
             output_device=query.device)
+        metadata = self._get_prediction_representatives(
+            request_id, layer_index, num_prefix_blocks)
+        representative_count = 0 if metadata is None else len(metadata[0])
+        selected_prefix = self._apply_validation_selection(
+            request_id, layer_index, selected_prefix, num_prefix_blocks,
+            num_blocks, block_budget, representative_count)
         if not selected_prefix.is_cuda:
             raise RuntimeError(
                 "dynamic selected-list attention requires CUDA metadata")
@@ -641,7 +1118,7 @@ class SolidAttentionPolicy:
                                  device=selected.device)
             self._dynamic_selection_buffers[request_id][layer_index] = buffer
         buffer[:count].copy_(selected)
-        prefix_blocks = tuple(int(index) for index in selected_prefix.tolist())
+        prefix_blocks = self._selection_indices_to_host(selected_prefix)
         return SparseKVActualSelection(
             prefix_blocks=prefix_blocks,
             attention=SparseKVDeviceSelection(
@@ -666,9 +1143,14 @@ class SolidAttentionPolicy:
         selected = self._select_prefix_with_logical_indices(
             history, representatives, logical, num_prefix_blocks,
             block_budget + guard_blocks)
-        return tuple(int(index) for index in selected.tolist())
+        return self._selection_indices_to_host(selected)
 
     def discard(self, request_id: str) -> None:
+        validation = self._validation_states.pop(request_id, None)
+        if (validation is not None
+                and validation.metadata.get("retain_report", False)):
+            self._completed_validation_reports[request_id] = (
+                self._validation_report_payload(validation))
         page_index_key = self._page_index_keys.pop(request_id, None)
         self._previous_queries.pop(request_id, None)
         self._representatives.pop(request_id, None)
