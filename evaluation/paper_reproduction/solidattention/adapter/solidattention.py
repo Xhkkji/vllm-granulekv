@@ -121,6 +121,8 @@ class SolidAttentionPolicy:
         self._dynamic_selection_buffers: Dict[
             str, Dict[int, torch.Tensor]] = defaultdict(dict)
         self._selection_control_buffers: Dict[str, torch.Tensor] = {}
+        self._actual_metadata: dict[tuple[str, int], tuple] = {}
+        self._actual_predictions: dict[tuple[str, int], tuple] = {}
         self._validation_states: Dict[str, _ValidationState] = {}
         self._completed_validation_reports: Dict[str, _ValidationState] = {}
 
@@ -649,7 +651,9 @@ class SolidAttentionPolicy:
             ready.synchronize()
         record_sparse_kv_selection_d2h_wait(
             (time.perf_counter() - start) * 1000.0)
-        return tuple(int(index) for index in buffer[:count])
+        values = buffer[:count].numpy()
+        valid_count = int((values >= 0).sum())
+        return tuple(map(int, values[:valid_count]))
 
     @staticmethod
     def _score_pages(query: torch.Tensor,
@@ -695,21 +699,72 @@ class SolidAttentionPolicy:
         return torch.cat((init, local)), candidates
 
     @staticmethod
-    def _union_topk(scores: torch.Tensor, candidates: torch.Tensor,
-                    budget: int) -> torch.Tensor:
+    def _topk_mask(scores: torch.Tensor, candidates: torch.Tensor,
+                   budget: int) -> torch.Tensor:
+        mask = torch.zeros(candidates.numel(), dtype=torch.bool,
+                           device=scores.device)
         if candidates.numel() == 0 or budget <= 0:
-            return torch.empty(0, dtype=torch.long, device=scores.device)
+            return mask
         count = min(budget, candidates.numel())
         topk = torch.argsort(scores,
                              dim=-1,
                              descending=True,
                              stable=True)[:, :count]
-        mask = torch.zeros(candidates.numel(),
-                           dtype=torch.bool,
-                           device=scores.device)
         mask.scatter_(0, topk.reshape(-1), True)
+        return mask
+
+    @staticmethod
+    def _union_topk(scores: torch.Tensor, candidates: torch.Tensor,
+                    budget: int) -> torch.Tensor:
+        if candidates.numel() == 0 or budget <= 0:
+            return torch.empty(0, dtype=torch.long, device=scores.device)
+        mask = SolidAttentionPolicy._topk_mask(scores, candidates, budget)
         selected = torch.nonzero(mask, as_tuple=False).flatten()
         return candidates.index_select(0, selected)
+
+    def _select_actual_prefix_fixed(self, request_id: str, layer_index: int,
+                                   query: torch.Tensor, prefix_count: int,
+                                   block_budget: int) -> torch.Tensor:
+        """Fixed-shape union; compact count is read at the existing control wait."""
+        page = self._page_index_keys.get(request_id, request_id)
+        source = self._prediction_representatives.get(page, {}).get(layer_index)
+        if source is None:
+            source = self._representatives.get(page, {}).get(layer_index)
+        elif source.representatives.device != query.device:
+            # Keep the existing page-scoped device metadata across requests;
+            # only the cheap logical-index view is request/prefix scoped.
+            source = _PredictionRepresentativeState(
+                source.logical_block_indices, source.representatives.to(query.device))
+            self._prediction_representatives[page][layer_index] = source
+        signature = (page, id(source), prefix_count, query.device)
+        key = (request_id, layer_index)
+        cached = self._actual_metadata.get(key)
+        if cached is None or cached[0] != signature:
+            metadata = self._get_prediction_representatives(
+                request_id, layer_index, prefix_count)
+            if metadata is None:
+                raise RuntimeError("SolidAttention actual selection lacks prefix metadata")
+            logical, representatives = metadata
+            init_end = min(self.init_blocks, prefix_count)
+            local_start = max(init_end, prefix_count - self.local_blocks)
+            positions = tuple(i for i, block in enumerate(logical)
+                              if init_end <= block < local_start)
+            candidates = tuple(logical[i] for i in positions)
+            fixed = (*range(init_end), *range(local_start, prefix_count))
+            cached = (signature, representatives.to(query.device),
+                      torch.tensor(positions, device=query.device, dtype=torch.long),
+                      torch.tensor(candidates, device=query.device, dtype=torch.long),
+                      torch.tensor(fixed, device=query.device, dtype=torch.long),
+                      torch.arange(prefix_count, device=query.device), len(logical))
+            self._actual_metadata[key] = cached
+        _, representatives, positions, candidates, fixed, indices, _ = cached
+        mask = torch.zeros(prefix_count, dtype=torch.bool, device=query.device)
+        mask.scatter_(0, fixed, True)
+        if candidates.numel():
+            scores = self._score_pages(query, representatives.index_select(0, positions))
+            mask.scatter_(0, candidates, self._topk_mask(scores, candidates, block_budget))
+        ordered = torch.where(mask, indices, prefix_count).sort().values
+        return ordered.masked_fill(ordered == prefix_count, -1)
 
     def _select_prefix(self, query: torch.Tensor,
                        representatives: torch.Tensor, prefix_count: int,
@@ -899,8 +954,16 @@ class SolidAttentionPolicy:
 
     def observe_query(self, request_id: str, layer_index: int,
                       query: torch.Tensor) -> None:
-        self._previous_queries[request_id][layer_index] = (
-            self._normalize_query(query).detach().clone())
+        query = self._normalize_query(query)
+        history = query.detach().clone()
+        self._previous_queries[request_id][layer_index] = history
+        key = (request_id, layer_index)
+        cached = self._actual_predictions.get(key)
+        if cached is not None:
+            if cached[3].data_ptr() == query.data_ptr():
+                self._actual_predictions[key] = (*cached[:3], history)
+            else:
+                self._actual_predictions.pop(key)
 
     def register_page_representatives(
         self,
@@ -929,6 +992,11 @@ class SolidAttentionPolicy:
         self._representatives[request_id][layer_index] = (
             len(logical), representatives)
         page_index_key = self._page_index_keys.get(request_id, request_id)
+        for collection in (self._actual_metadata, self._actual_predictions):
+            for key in tuple(collection):
+                if (key[1] == layer_index and
+                        self._page_index_keys.get(key[0], key[0]) == page_index_key):
+                    del collection[key]
         self._prediction_representatives[page_index_key][layer_index] = (
             _PredictionRepresentativeState(logical, representatives))
 
@@ -937,6 +1005,11 @@ class SolidAttentionPolicy:
             raise ValueError("request_id and page_index_key must not be empty")
         # This mapping is only read by prediction/validation.  The resident
         # selected-list path remains request-local and does not touch it.
+        if self._page_index_keys.get(request_id, request_id) != page_index_key:
+            for collection in (self._actual_metadata, self._actual_predictions):
+                for key in tuple(collection):
+                    if key[0] == request_id:
+                        del collection[key]
         self._page_index_keys[request_id] = page_index_key
 
     def seed_page_metadata_from_request(
@@ -1183,6 +1256,11 @@ class SolidAttentionPolicy:
             # _apply_validation_selection supplies the exact device list.
             return torch.empty(0, dtype=torch.long,
                                device=output_device or query.device)
+        if (query.is_cuda
+                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
+            return self._select_actual_prefix_fixed(
+                request_id, layer_index, self._normalize_query(query),
+                num_prefix_blocks, block_budget)
         metadata = self._get_prediction_representatives(
             request_id, layer_index, num_prefix_blocks)
         if metadata is None:
@@ -1211,6 +1289,12 @@ class SolidAttentionPolicy:
         """Select only immutable prefix blocks for the current query."""
         selected = self._select_actual_prefix_tensor(
             request_id, layer_index, query, num_prefix_blocks, block_budget)
+        if (selected.is_cuda
+                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
+            prefix_blocks = self._selection_indices_to_host(selected)
+            selected = selected[:len(prefix_blocks)]
+            if self._validation_state(request_id) is None:
+                return prefix_blocks
         metadata = self._get_prediction_representatives(
             request_id, layer_index, num_prefix_blocks)
         representative_count = 0 if metadata is None else len(metadata[0])
@@ -1234,9 +1318,14 @@ class SolidAttentionPolicy:
         selected_prefix = self._select_actual_prefix_tensor(
             request_id, layer_index, query, num_prefix_blocks, block_budget,
             output_device=query.device)
-        metadata = self._get_prediction_representatives(
-            request_id, layer_index, num_prefix_blocks)
-        representative_count = 0 if metadata is None else len(metadata[0])
+        prefix_blocks = self._selection_indices_to_host(selected_prefix)
+        selected_prefix = selected_prefix[:len(prefix_blocks)]
+        cached_metadata = self._actual_metadata.get((request_id, layer_index))
+        representative_count = cached_metadata[-1] if cached_metadata else 0
+        if cached_metadata is None and self._validation_state(request_id) is not None:
+            metadata = self._get_prediction_representatives(
+                request_id, layer_index, num_prefix_blocks)
+            representative_count = 0 if metadata is None else len(metadata[0])
         selected_prefix = self._apply_validation_selection(
             request_id, layer_index, selected_prefix, num_prefix_blocks,
             num_blocks, block_budget, representative_count)
@@ -1259,7 +1348,15 @@ class SolidAttentionPolicy:
                                  device=selected.device)
             self._dynamic_selection_buffers[request_id][layer_index] = buffer
         buffer[:count].copy_(selected)
-        prefix_blocks = self._selection_indices_to_host(selected_prefix)
+        # Validation may replace the selection; its extra work is not timed.
+        validation = self._validation_state(request_id)
+        if validation is not None:
+            prefix_blocks = self._selection_indices_to_host(selected_prefix)
+        if (validation is None
+                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
+            self._actual_predictions[request_id, layer_index] = (
+                num_prefix_blocks, block_budget, prefix_blocks,
+                self._normalize_query(query))
         return SparseKVActualSelection(
             prefix_blocks=prefix_blocks,
             attention=SparseKVDeviceSelection(
@@ -1273,14 +1370,18 @@ class SolidAttentionPolicy:
         history = self._previous_queries.get(request_id, {}).get(layer_index)
         if history is None:
             return None
+        guard_blocks = envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS
+        if guard_blocks < 0:
+            raise ValueError("prediction guard blocks must be non-negative")
+        cached = self._actual_predictions.get((request_id, layer_index))
+        if (cached is not None and cached[:2] == (num_prefix_blocks, block_budget)
+                and guard_blocks == 0 and cached[3] is history):
+            return cached[2]
         metadata = self._get_prediction_representatives(
             request_id, layer_index, num_prefix_blocks)
         if metadata is None:
             return None
         logical, representatives = metadata
-        guard_blocks = envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS
-        if guard_blocks < 0:
-            raise ValueError("prediction guard blocks must be non-negative")
         selected = self._select_prefix_with_logical_indices(
             history, representatives, logical, num_prefix_blocks,
             block_budget + guard_blocks)
@@ -1293,6 +1394,10 @@ class SolidAttentionPolicy:
             self._completed_validation_reports[request_id] = validation
         page_index_key = self._page_index_keys.pop(request_id, None)
         self._previous_queries.pop(request_id, None)
+        for collection in (self._actual_metadata, self._actual_predictions):
+            for key in tuple(collection):
+                if key[0] == request_id:
+                    del collection[key]
         self._representatives.pop(request_id, None)
         # Stable-prefix metadata is shared by requests using the same page
         # key.  Request-local metadata is always removed; the stable entry is

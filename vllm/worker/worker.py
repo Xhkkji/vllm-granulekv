@@ -265,6 +265,12 @@ class Worker(LocalOrDistributedWorkerBase):
         result["prediction_guard_blocks"] = (
             envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS)
         result.update(self._host_stats)
+        # Stream dependency duration is not measured by the legacy counter.
+        result["host_gpu_event_wait_ms"] = None
+        result["gpu_direct_read_layer_blocks"] = (
+            self._host_stats["gpu_direct_read_bytes"] // (fragment_bytes * 2))
+        result["cpu_direct_read_layer_blocks"] = (
+            self._host_stats["cpu_direct_read_bytes"] // (fragment_bytes * 2))
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
             result["host_write_backlog"] = sum(
                 request.destination == "host"
@@ -781,7 +787,9 @@ class Worker(LocalOrDistributedWorkerBase):
                     self._host_stats["cpu_direct_read_blocks"] += int(
                         host_mapping.shape[0])
                     self._host_stats["cpu_direct_read_bytes"] += (
-                        int(host_mapping.shape[0]) * block_bytes)
+                        int(host_mapping.shape[0]) * block_bytes
+                        * (layer_range[1] - layer_range[0])
+                        // cache_engine.num_attention_layers)
                     host_request_id = (
                         f"host-stage-{request.request_id}-{suffix}")
                     host_event = cache_engine.submit_async_kv_transfer(
@@ -1295,7 +1303,11 @@ class Worker(LocalOrDistributedWorkerBase):
             self._host_stats["gpu_direct_read_blocks"] += int(
                 mapping.shape[0])
             self._host_stats["gpu_direct_read_bytes"] += (
-                int(mapping.shape[0]) * block_bytes)
+                int(mapping.shape[0]) * block_bytes
+                * ((request.layer_range[1] - request.layer_range[0])
+                   if request.layer_range is not None else
+                   cache_engine.num_attention_layers)
+                // cache_engine.num_attention_layers)
         event = cache_engine.submit_async_kv_transfer(
             request.request_id,
             request.operation,

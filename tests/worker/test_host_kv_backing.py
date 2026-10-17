@@ -30,10 +30,10 @@ class Fence:
 
 @pytest.fixture
 def worker(monkeypatch):
-    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE", "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE", "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", "2304")
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_HOST_BACKING_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 2304)
     result = object.__new__(Worker)
     for name in ("_gpu_resident_blocks", "_gpu_destination_owners",
                  "_gpu_region_release_events", "_pending_gpu_to_host",
@@ -138,8 +138,8 @@ def test_host_capacity_checked_before_region_allocation(monkeypatch):
                  "VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE",
                  "VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE",
                  "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE"):
-        monkeypatch.setenv(name, "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", "2048")
+        monkeypatch.setattr(module.envs, name, True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 2048)
     with pytest.raises(ValueError, match="capacity must cover 2052 blocks"):
         CacheEngine(SimpleNamespace(block_size=16),
                     SimpleNamespace(max_model_len=32832),
@@ -168,7 +168,8 @@ def test_standard_worker_input_initializes_backing_metadata(worker):
     assert worker._host_staging_owner == (0, "r")
 
 
-def test_native_read_is_deferred_until_backup_source_is_released(worker):
+@pytest.mark.parametrize("layer_range", [(8, 9), (8, 12), (0, 28)])
+def test_native_read_is_deferred_until_backup_source_is_released(worker, layer_range):
     fence = Fence()
     worker._gpu_region_release_events[0, 0, 3] = ("r", fence)
     request = AsyncKVTransferRequest(
@@ -176,7 +177,7 @@ def test_native_read_is_deferred_until_backup_source_is_released(worker):
         operation=AsyncKVTransferOperation.READ,
         priority=AsyncKVTransferPriority.CRITICAL_READ,
         logical_blocks=(LogicalBlockKey(0, 0),),
-        block_mapping=((10, 3),), layer_range=(8, 9))
+        block_mapping=((10, 3),), layer_range=layer_range)
     mapping = torch.tensor(request.block_mapping)
     engine = worker.cache_engine[0]
     submitted = []
@@ -188,6 +189,8 @@ def test_native_read_is_deferred_until_backup_source_is_released(worker):
     fence.ready = True
     assert worker._poll_gpu_transfer(0, engine, "io").state == AsyncKVTransferState.READY
     assert len(submitted) == 1
+    assert worker._host_stats["gpu_direct_read_bytes"] == (
+        32768 * (layer_range[1] - layer_range[0]))
 
 
 def test_host_write_waits_for_d2h_then_uses_existing_native_request(worker):
@@ -212,3 +215,22 @@ def test_host_write_waits_for_d2h_then_uses_existing_native_request(worker):
     assert worker._poll_gpu_transfer(0, engine, "write").state == AsyncKVTransferState.READY
     assert calls == [{"layer_range": (0, 1), "destination": "host"}]
     assert worker._host_stats["host_to_ssd_submit_count"] == 1
+
+
+def test_rewind_remains_explicitly_rejected(worker):
+    from array import array
+    from vllm.sequence import SequenceData, SequenceGroupMetadata
+    from vllm import SamplingParams
+    worker._host_staging_owner = (0, "r")
+    worker._seq_group_metadata_cache = {}
+    worker._prefetch_runtime = SimpleNamespace(forget_seq_groups=lambda ids: None)
+    worker._backing_forward[0, "r"] = ((3, 4), 32, 33, False)
+    data = SequenceData(array("l", range(32)))
+    metadata = SequenceGroupMetadata(
+        request_id="r", is_prompt=True, seq_data={0: data},
+        sampling_params=SamplingParams(max_tokens=8), block_tables={0: [3, 4]},
+        token_chunk_size=1)
+    with pytest.raises(RuntimeError, match="request rewind"):
+        worker._prepare_host_backing_forward(SimpleNamespace(
+            virtual_engine=0, finished_requests_ids=[],
+            seq_group_metadata_list=[metadata]))

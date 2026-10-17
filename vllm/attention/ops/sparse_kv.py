@@ -62,7 +62,9 @@ def sparse_kv_stats() -> dict[str, float | int]:
     payload: dict[str, float | int] = dict(_SPARSE_STATS)
     payload["selected_ratio"] = payload["selected_blocks"] / max(
         1, payload["full_blocks"])
-    payload["prediction_recall"] = payload["hit_blocks"] / max(
+    payload["prediction_recall"] = payload["prediction_hit_blocks"] / max(
+        1, payload["prediction_actual_blocks"])
+    payload["resident_coverage"] = payload["hit_blocks"] / max(
         1, payload["actual_blocks"])
     return payload
 
@@ -123,6 +125,7 @@ def build_sparse_kv_prediction_gap(
     resident = normalize(resident_blocks)
     hit = actual.intersection(resident)
     missing = actual.difference(resident)
+    prediction_missing = actual.difference(predicted)
     wasted = predicted.difference(actual)
     gap = SparseKVPredictionGap(
         predicted_prefix_blocks=tuple(sorted(predicted)),
@@ -135,8 +138,8 @@ def build_sparse_kv_prediction_gap(
     _SPARSE_STATS["prediction_calls"] += 1
     _SPARSE_STATS["prediction_predicted_blocks"] += len(predicted)
     _SPARSE_STATS["prediction_actual_blocks"] += len(actual)
-    _SPARSE_STATS["prediction_hit_blocks"] += len(hit)
-    _SPARSE_STATS["prediction_miss_blocks"] += len(missing)
+    _SPARSE_STATS["prediction_hit_blocks"] += len(predicted.intersection(actual))
+    _SPARSE_STATS["prediction_miss_blocks"] += len(prediction_missing)
     _SPARSE_STATS["prediction_wasted_blocks"] += len(wasted)
     _SPARSE_STATS["prediction_checks"] += 1
     _SPARSE_STATS["predicted_blocks"] += len(predicted)
@@ -144,8 +147,9 @@ def build_sparse_kv_prediction_gap(
     _SPARSE_STATS["hit_blocks"] += len(hit)
     _SPARSE_STATS["missing_blocks"] += len(missing)
     _SPARSE_STATS["wasted_blocks"] += len(wasted)
-    if missing:
+    if prediction_missing:
         _SPARSE_STATS["prediction_miss"] += 1
+    if missing:
         _SPARSE_STATS["prediction_gap_events"] += 1
     else:
         _SPARSE_STATS["zero_miss_checks"] += 1

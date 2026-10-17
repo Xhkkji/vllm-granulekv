@@ -67,7 +67,8 @@ def test_dynamic_restore_selection_uses_frozen_plan():
 
 
 def test_gpu_selector_callback_keeps_tensor_selection_in_bridge():
-    table = torch.tensor([[11, 22, 33, 44]], dtype=torch.int32)
+    table = torch.tensor([[1, 3, 0, 2]], dtype=torch.int32)
+    metadata = []
     key_cache = torch.arange(4 * 1 * 4 * 1,
                              dtype=torch.float32).reshape(4, 1, 4, 1)
     selected_table, tokens, selected = select_and_compact_decode_blocks(
@@ -81,16 +82,17 @@ def test_gpu_selector_callback_keeps_tensor_selection_in_bridge():
         block_budget=1,
         select_blocks=lambda *args: (_ for _ in ()).throw(
             AssertionError("CPU selector should not be called")),
-        register_page_representatives=lambda *args: (_ for _ in ()).throw(
-            AssertionError("CPU metadata path should not be called")),
+        register_page_representatives=lambda *args: metadata.append(args),
         select_blocks_device=lambda *args: torch.tensor(
             [0, 2, 3], dtype=torch.long),
         resident_blocks=(0, 1, 2, 3),
     )
     assert isinstance(selected, torch.Tensor)
     assert selected.tolist() == [0, 2, 3]
-    assert selected_table.tolist() == [[11, 33, 44]]
+    assert selected_table.tolist() == [[1, 0, 2]]
     assert tokens == 10
+    assert len(metadata) == 1
+    assert metadata[0][:2] == ("request", 0)
 
 
 def test_mapping_rejects_batch_two_and_invalid_selection():
@@ -149,6 +151,20 @@ def test_prediction_gap_keeps_control_plane_sets_distinct():
     assert stats["prediction_checks"] == 1
     assert stats["prediction_gap_events"] == 1
     assert stats["prediction_recall"] == 0.5
+
+
+def test_host_correction_does_not_inflate_prediction_recall():
+    reset_sparse_kv_stats()
+    gap = build_sparse_kv_prediction_gap(
+        predicted_prefix_blocks=(0, 2), actual_prefix_blocks=(1, 2),
+        resident_blocks=(0, 1, 2), num_prefix_blocks=4,
+        request_id="r", layer_index=0)
+    assert gap.missing_blocks == ()
+    assert sparse_kv_stats()["prediction_recall"] == 0.5
+    assert sparse_kv_stats()["prediction_miss_blocks"] == 1
+    assert sparse_kv_stats()["prediction_miss"] == 1
+    assert sparse_kv_stats()["prediction_gap_events"] == 0
+    assert sparse_kv_stats()["resident_coverage"] == 1.0
 
 
 def test_page_representatives_from_four_dimensional_key_cache():

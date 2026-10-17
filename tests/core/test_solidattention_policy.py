@@ -18,6 +18,106 @@ def _representatives(num_pages: int = 8) -> torch.Tensor:
     return torch.stack((lower, upper), dim=1)
 
 
+@pytest.mark.parametrize("budget", [1, 4, 32])
+@pytest.mark.parametrize("heads", [2, 8])
+@pytest.mark.parametrize("tied", [False, True])
+def test_fixed_shape_actual_matches_reference_and_caches_indices(budget, heads, tied):
+    policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
+    logical = (0, 2, 3, 5, 7)
+    torch.manual_seed(11)
+    reps = (_representatives(len(logical)) if tied else
+            torch.randn(len(logical), 2, 2, 2))
+    policy.register_page_representatives("page", 0, reps, logical)
+    policy.bind_page_index_key("r", "page")
+    query = torch.ones(heads, 2)
+    expected = policy._select_prefix_with_logical_indices(
+        query, reps, logical, 8, budget)
+    padded = policy._select_actual_prefix_fixed("r", 0, query, 8, budget)
+    assert padded.shape == (8,)
+    assert torch.equal(padded[:expected.numel()], expected)
+    assert (padded[expected.numel():] == -1).all()
+    cached = policy._actual_metadata["r", 0]
+    policy._select_actual_prefix_fixed("r", 0, -query, 8, budget)
+    assert policy._actual_metadata["r", 0] is cached
+    policy.register_page_representatives("page", 0, reps * 2, logical)
+    policy._select_actual_prefix_fixed("r", 0, query, 8, budget)
+    assert policy._actual_metadata["r", 0] is not cached
+    policy.discard("r")
+    assert not policy._actual_metadata
+
+
+def test_metadata_seed_uses_stable_page_after_populate_cleanup():
+    policy = SolidAttentionPolicy(1, 1)
+    policy.bind_page_index_key("populate", "full-page")
+    policy.register_page_representatives("full-page", 0, _representatives())
+    policy.discard("populate")
+    assert policy.seed_page_metadata_from_request("populate", "short-page", 4) == 0
+    assert policy.seed_page_metadata_from_request("full-page", "short-page", 4) == 1
+    policy.bind_page_index_key("measured", "short-page")
+    logical, reps = policy._get_prediction_representatives("measured", 0, 4)
+    assert logical == (0, 1, 2, 3)
+    assert reps.shape[0] == 4
+
+
+def test_fixed_shape_cache_isolates_layer_prefix_and_page():
+    policy = SolidAttentionPolicy(1, 1)
+    query = torch.ones(2, 2)
+    for page in ("a", "b"):
+        for layer in (0, 1):
+            policy.register_page_representatives(page, layer, _representatives())
+    policy.bind_page_index_key("r", "a")
+    policy._select_actual_prefix_fixed("r", 0, query, 8, 1)
+    old = policy._actual_metadata["r", 0]
+    policy._select_actual_prefix_fixed("r", 1, query, 8, 1)
+    assert policy._actual_metadata["r", 0] is old
+    policy._select_actual_prefix_fixed("r", 0, query, 4, 1)
+    assert policy._actual_metadata["r", 0] is not old
+    old = policy._actual_metadata["r", 0]
+    policy.bind_page_index_key("r", "b")
+    policy._select_actual_prefix_fixed("r", 0, query, 4, 1)
+    assert policy._actual_metadata["r", 0] is not old
+
+
+def test_prediction_reuses_only_same_observed_query_and_budget(monkeypatch):
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("r", 0, _representatives())
+    query = torch.ones(2, 2)
+    policy._actual_predictions["r", 0] = (8, 2, (0, 2, 7), query)
+    policy.observe_query("r", 0, query)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    assert policy.predict_restore_blocks("r", 0, 8, 2) == (0, 2, 7)
+    policy.observe_query("r", 0, query.clone())
+    assert ("r", 0) not in policy._actual_predictions
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_async_actual_has_no_nonzero_and_feedback_does_not_rescore(monkeypatch):
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", True)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE", True)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    policy = SolidAttentionPolicy(1, 1)
+    reps = _representatives(12)
+    policy.register_page_representatives("page", 0, reps)
+    policy.bind_page_index_key("r", "page")
+    query = torch.ones(2, 2, device="cuda")
+    expected = tuple(policy._select_prefix_with_logical_indices(
+        query.cpu(), reps, tuple(range(12)), 12, 2).tolist())
+    monkeypatch.setattr(torch, "nonzero", lambda *a, **kw: pytest.fail("dynamic shape sync"))
+    tolist = torch.Tensor.tolist
+
+    def cpu_tolist(tensor):
+        assert not tensor.is_cuda, "async selection called CUDA tolist"
+        return tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", cpu_tolist)
+    actual = policy.select_actual_blocks_device("r", 0, query, 12, 13, 2)
+    assert actual.prefix_blocks == expected
+    assert actual.attention.logical_block_indices[:actual.attention.count].cpu().tolist() == [*expected, 12]
+    policy.observe_query("r", 0, query)
+    monkeypatch.setattr(policy, "_score_pages", lambda *a: pytest.fail("duplicate scoring"))
+    assert policy.predict_restore_blocks("r", 0, 12, 2) == expected
+
+
 def test_solidattention_cpu_warmup_and_fixed_blocks():
     policy = SolidAttentionPolicy(init_blocks=2, local_blocks=2)
     reps = _representatives()
