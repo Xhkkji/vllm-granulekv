@@ -646,6 +646,20 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
     _cached_prefill_metadata: Optional["XFormersMetadata"] = None
     _cached_decode_metadata: Optional["XFormersMetadata"] = None
 
+    def single_token_sparse_prefill(self) -> "XFormersMetadata":
+        """Use the paged single-query kernel without changing scheduler state."""
+        if (self.num_prefills != 1 or self.num_prefill_tokens != 1
+                or self.num_decode_tokens != 0
+                or self.block_tables is None
+                or self.block_tables.numel() == 0):
+            return self
+        from dataclasses import replace
+        return replace(self, num_prefills=0, num_prefill_tokens=0,
+                       num_decode_tokens=1, max_prefill_seq_len=0,
+                       max_decode_seq_len=self.max_prefill_seq_len,
+                       use_cuda_graph=False, _cached_prefill_metadata=None,
+                       _cached_decode_metadata=None)
+
     # Begin encoder attn & enc/dec cross-attn fields...
 
     # Encoder sequence lengths representation

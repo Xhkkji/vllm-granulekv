@@ -39,6 +39,37 @@ def _create_scheduler(enable_prefix_caching: bool = False) -> AsyncKVScheduler:
     return AsyncKVScheduler(scheduler_config, cache_config, None)
 
 
+def test_host_prefix_write_excludes_partial_and_uncomputed_blocks(monkeypatch):
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+    seq, group = create_dummy_prompt("808", prompt_tokens=list(range(10)),
+                                     block_size=4)
+    scheduler.add_seq_group(group)
+    schedule_and_update_computed_tokens(scheduler)
+    seq.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(seq)
+    scheduler.free_finished_seq_groups()
+    requests = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.destination == "host"
+    assert [key.logical_index for key in request.logical_blocks] == [0, 1]
+    assert [pair[0] for pair in request.block_mapping] == [0, 1]
+    assert seq.seq_id in scheduler.block_manager.block_tables
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+        request.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert seq.seq_id not in scheduler.block_manager.block_tables
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+    reuse, reuse_group = create_dummy_prompt(
+        "809", prompt_tokens=list(range(10)), block_size=4)
+    scheduler.add_seq_group(reuse_group)
+    assert scheduler._maybe_start_granulekv_prefix_restore()
+    restore = scheduler.drain_async_kv_transfers_to_submit()[0]
+    assert len(restore.block_mapping) == 2
+
+
 def test_granulekv_prefix_store_restore_uses_native_computed_semantics(
         monkeypatch):
     """GranuleKV prefix 应完成 populate -> SSD read -> 跳过 prefill 闭环。"""

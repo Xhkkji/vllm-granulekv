@@ -66,6 +66,16 @@ class CacheEngine:
         self.granulekv_host_staging = (
             self.granulekv_enabled
             and envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE)
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and not (envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
+                         and self.granulekv_host_staging
+                         and envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE)):
+            raise ValueError("host backing requires async pinned host transfers")
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            required = ((model_config.max_model_len + cache_config.block_size - 1)
+                        // cache_config.block_size)
+            if envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS < required:
+                raise ValueError(f"host KV capacity must cover {required} blocks")
         if self.granulekv_host_staging and (
                 envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS <= 0):
             raise ValueError(
@@ -340,6 +350,7 @@ class CacheEngine:
         page_index_key: str,
         logical_block_indices: Sequence[int],
         source_physical_block_ids: Sequence[int],
+        source: str = "gpu",
     ) -> None:
         """Capture query-independent page metadata before a GPU -> SSD write."""
         if get_sparse_kv_policy() is None:
@@ -349,7 +360,8 @@ class CacheEngine:
                 "logical and physical page ids must have the same length")
         if not logical_block_indices:
             return
-        for layer_index, layer_cache in enumerate(self.gpu_cache):
+        caches = self.cpu_cache if source == "host" else self.gpu_cache
+        for layer_index, layer_cache in enumerate(caches):
             key_cache, _ = PagedAttention.split_kv_cache(
                 layer_cache, self.num_kv_heads, self.head_size)
             representatives = build_page_representatives_from_paged_key_cache(
@@ -529,6 +541,48 @@ class CacheEngine:
             ready_event.record(stream)
             self._host_gpu_copy_timing_events.append(
                 (start_event, ready_event))
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self.granulekv_connector.host_copy_ready_event = ready_event
+        return ready_event
+
+    def copy_gpu_blocks_to_host_async(
+            self,
+            layer_index: int,
+            gpu_to_host: torch.Tensor,
+            release_events: Sequence[torch.cuda.Event] = (),
+    ) -> torch.cuda.Event:
+        """Snapshot GPU KV blocks into the fixed pinned host cache.
+
+        The copy is ordered after the layer release fence on the existing
+        transfer stream.  The returned event is the only publication point for
+        the host backing; callers must not mark the host block ready earlier.
+        """
+        if self.host_to_gpu_copy_stream is None:
+            raise RuntimeError("async GPU-to-host copy stream is disabled")
+        if not self.granulekv_host_staging:
+            raise RuntimeError("GranuleKV host staging is not enabled")
+        if gpu_to_host.numel() == 0:
+            event = torch.cuda.Event(enable_timing=True,
+                                     blocking=False,
+                                     interprocess=False)
+            event.record(self.host_to_gpu_copy_stream)
+            return event
+        if gpu_to_host.ndim != 2 or gpu_to_host.shape[1] != 2:
+            raise ValueError("gpu_to_host must have shape [N, 2]")
+        stream = self.host_to_gpu_copy_stream
+        with torch.cuda.stream(stream):
+            for release_event in release_events:
+                stream.wait_event(release_event)
+            self.attn_backend.swap_blocks(
+                self.gpu_cache[layer_index],
+                self.cpu_cache[layer_index],
+                gpu_to_host,
+            )
+            ready_event = torch.cuda.Event(enable_timing=False,
+                                           blocking=False,
+                                           interprocess=False)
+            ready_event.record(stream)
+        self.granulekv_connector.host_copy_ready_event = ready_event
         return ready_event
 
     def drain_host_to_gpu_copy_time_ms(self) -> float:

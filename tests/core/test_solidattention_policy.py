@@ -368,6 +368,23 @@ def test_solidattention_validation_all_blocks_and_request_steps():
                for item in report["records"])
 
 
+def test_resident_validation_keeps_trace_prefix_boundary(monkeypatch):
+    policy = SolidAttentionPolicy()
+    policy.configure_validation("request", "record", _validation_metadata())
+    monkeypatch.setattr(policy, "_cached_representatives",
+                        lambda request, layer, cache, ids, count, device:
+                        torch.zeros(count, 2, 1, 4))
+    for length in (12, 13):
+        result = policy._prepare_device_selection(
+            "request", 0, torch.ones(1, 1, 4), torch.empty(4, 1, 1, 4, 4),
+            torch.arange((length + 3) // 4), length, 4, 1)
+        assert result[2] == 3
+    result = policy._prepare_device_selection(
+        "normal", 0, torch.ones(1, 1, 4), torch.empty(4, 1, 1, 4, 4),
+        torch.arange(3), 12, 4, 1)
+    assert result[2] == 2
+
+
 def test_solidattention_validation_record_replay_checks_kv_and_attention():
     metadata = _validation_metadata()
     recorder = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
@@ -430,6 +447,35 @@ def test_solidattention_replay_rejects_metadata_mismatch():
     with pytest.raises(ValueError, match="block_size"):
         policy.configure_validation("request", "replay", mismatched, [record],
                                     metadata)
+    with pytest.raises(ValueError, match="position cache"):
+        policy.configure_validation(
+            "request", "replay", dict(metadata, position_cache_length=33792),
+            [record], metadata)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_backing_selection_control_uses_query_not_cpu_synchronize(monkeypatch):
+    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", "1")
+    real_event = torch.cuda.Event
+
+    class QueryOnlyEvent:
+        def __init__(self, **kwargs):
+            self.event = real_event(**kwargs)
+
+        def record(self, stream):
+            self.event.record(stream)
+
+        def query(self):
+            return self.event.query()
+
+        def synchronize(self):
+            pytest.fail("selection control must use event query")
+
+    monkeypatch.setattr(torch.cuda, "Event", QueryOnlyEvent)
+    policy = SolidAttentionPolicy()
+    assert policy._selection_indices_to_host(
+        torch.tensor([0, 3, 7], device="cuda")) == (0, 3, 7)
 
 
 def test_solidattention_all_block_validation_compares_dense_attention():

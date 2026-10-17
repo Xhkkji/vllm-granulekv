@@ -296,7 +296,11 @@ class AsyncKVScheduler(Scheduler):
 
     def _num_async_read_sequence_slots(self) -> int:
         """返回 read reservation 已占用、但父类 budget 看不到的 seq 数。"""
-        return sum(
+        # The fixed host cache has a single owner. A finished host write
+        # retains its admission slot until DMA completes, just like a read.
+        host_write_slots = (len(self.prefix_saving)
+                            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE else 0)
+        return host_write_slots + sum(
             group.get_max_num_running_seqs()
             for group in (*self.loading.values(),
                           *self.prefix_loading.values(),
@@ -799,13 +803,20 @@ class AsyncKVScheduler(Scheduler):
                     sequences[0], self.cache_config.block_size)
             page_index_key = _prefix_page_index_key(
                 seq_group, self.cache_config.block_size, num_prefix_blocks)
+        host_write = (prefix and operation == AsyncKVTransferOperation.WRITE
+                      and envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE)
+        mapping = (tuple((key.logical_index, pair[1]) for key, pair in zip(
+            reservation.logical_blocks, reservation.block_mapping))
+                   if host_write else reservation.block_mapping)
         request = self.async_kv_policy.enqueue(
             seq_group.request_id,
             reservation.reservation_id,
             operation,
-            reservation.block_mapping,
+            mapping,
             reservation.logical_blocks,
             sparse_page_index_key=page_index_key,
+            destination="host" if host_write else "gpu",
+            consumer_num_blocks=num_prefix_blocks if host_write else None,
         )
         if prefix:
             lifecycle = (self.prefix_loading
@@ -1258,8 +1269,9 @@ class AsyncKVScheduler(Scheduler):
         ``prefix_saving`` 继续推进空调度轮次，不会提前复用 DMA source。
         """
         if (not self.granulekv_prefix_enabled or not seq_group.is_finished()
-                or envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
-                or seq_group.request_id in self._sparse_restore_seq_group_ids):
+                or (not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and (
+                    envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+                    or seq_group.request_id in self._sparse_restore_seq_group_ids))):
             # working-set 已覆盖早期层，不能从当前 HBM regions 回写完整 KV。
             # 该验证模式直接丢弃结果，已有 SSD prefix 仍由 source replica 保留。
             return False
@@ -1268,7 +1280,9 @@ class AsyncKVScheduler(Scheduler):
             seq.status in (SequenceStatus.FINISHED_STOPPED,
                            SequenceStatus.FINISHED_LENGTH_CAPPED)
             for seq in seqs)
-        has_full_block = any(seq.get_len() >= self.cache_config.block_size
+        has_full_block = any((seq.data.get_num_computed_tokens()
+                              if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                              else seq.get_len()) >= self.cache_config.block_size
                              for seq in seqs)
         has_block_table = all(seq.seq_id in self.block_manager.block_tables
                               for seq in seqs)

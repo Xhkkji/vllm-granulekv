@@ -68,6 +68,12 @@ class Worker(LocalOrDistributedWorkerBase):
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
     ) -> None:
         WorkerBase.__init__(self, vllm_config)
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and vllm_config.scheduler_config.max_num_seqs != 1):
+            raise ValueError("fixed host KV backing requires max_num_seqs=1")
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and vllm_config.scheduler_config.num_scheduler_steps != 1):
+            raise ValueError("host KV backing requires single-step scheduling")
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
@@ -83,6 +89,16 @@ class Worker(LocalOrDistributedWorkerBase):
         self._host_ready_blocks: Set[Tuple[int, str, int, int]] = set()
         self._host_failed_blocks: Set[Tuple[int, str, int, int]] = set()
         self._host_staged_blocks: Set[Tuple[int, str, int, int]] = set()
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._pending_gpu_to_host: Dict[
+                Tuple[int, str, int, int], object] = {}
+            self._backing_forward: Dict[Tuple[int, str],
+                                       Tuple[Tuple[int, ...], int, int, bool]] = {}
+            self._deferred_gpu_transfers: Dict[
+                Tuple[int, str], Tuple[AsyncKVTransferRequest, torch.Tensor]] = {}
+            self._pending_host_writes: Dict[
+                Tuple[int, str], AsyncKVTransferRequest] = {}
+            self._backing_retired: Set[Tuple[int, str]] = set()
         self._discarded_host_transfers: Set[Tuple[int, str]] = set()
         self._host_staging_owner: Optional[Tuple[int, str]] = None
         # GPU residency is a worker-local cache of physical destinations.  A
@@ -115,6 +131,17 @@ class Worker(LocalOrDistributedWorkerBase):
             "cpu_direct_read_bytes": 0,
             "gpu_to_cpu_blocks": 0,
             "gpu_to_cpu_bytes": 0,
+            "gpu_to_host_submit_count": 0,
+            "gpu_to_host_blocks": 0,
+            "gpu_to_host_bytes": 0,
+            "gpu_to_host_ready_events": 0,
+            "host_backing_hits": 0,
+            "host_backing_misses": 0,
+            "stale_gpu_owner_hits": 0,
+            "host_to_ssd_submit_count": 0,
+            "host_to_ssd_blocks": 0,
+            "host_to_ssd_bytes": 0,
+            "host_write_deferred_count": 0,
             "cpu_to_gpu_blocks": 0,
             "cpu_to_gpu_bytes": 0,
             "host_buffer_cuda_pinned": 0,
@@ -238,6 +265,12 @@ class Worker(LocalOrDistributedWorkerBase):
         result["prediction_guard_blocks"] = (
             envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS)
         result.update(self._host_stats)
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            result["host_write_backlog"] = sum(
+                request.destination == "host"
+                and request.operation == AsyncKVTransferOperation.WRITE
+                for request, _ in self._deferred_gpu_transfers.values()) + len(
+                    self._pending_host_writes)
         for cache_engine in self.cache_engine:
             connector = cache_engine.granulekv_connector
             if connector is None:
@@ -571,6 +604,8 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._prepare_host_backing_forward(execute_model_req)
         virtual_engine = execute_model_req.virtual_engine
         num_steps = execute_model_req.num_steps
         num_seq_groups = len(execute_model_req.seq_group_metadata_list)
@@ -708,7 +743,8 @@ class Worker(LocalOrDistributedWorkerBase):
                         request.consumer_local_block_start,
                         request.layer_range,
                     )
-                if request.operation == AsyncKVTransferOperation.WRITE:
+                if (request.operation == AsyncKVTransferOperation.WRITE
+                        and request.destination == "gpu"):
                     cache_engine.register_sparse_page_representatives(
                         request.sparse_page_index_key,
                         [block.logical_index for block in request.logical_blocks],
@@ -788,7 +824,8 @@ class Worker(LocalOrDistributedWorkerBase):
 
             event = (self._submit_gpu_transfer(
                 virtual_engine, cache_engine, request, mapping)
-                     if request.destination == "gpu" else
+                     if (request.destination == "gpu" or
+                         envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE) else
                      cache_engine.submit_async_kv_transfer(
                          request.request_id,
                          request.operation,
@@ -821,7 +858,8 @@ class Worker(LocalOrDistributedWorkerBase):
         ]
         for key in keys:
             _, request_id = key
-            event = cache_engine.poll_async_kv_transfer(request_id)
+            event = self._poll_gpu_transfer(
+                virtual_engine, cache_engine, request_id)
             events.append(event)
             if event.state != AsyncKVTransferState.PENDING:
                 self._async_kv_transfer_ids.remove(key)
@@ -840,6 +878,8 @@ class Worker(LocalOrDistributedWorkerBase):
             request_ids: Optional[Set[str]] = None,
     ) -> List[AsyncKVTransferEvent]:
         """Poll only selected host requests, or all host requests if omitted."""
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._poll_gpu_to_host_backing(virtual_engine)
         cache_engine = self.cache_engine[virtual_engine]
         if request_ids is not None:
             self._host_stats["targeted_host_poll_calls"] += 1
@@ -865,7 +905,9 @@ class Worker(LocalOrDistributedWorkerBase):
                         and not any(value[1] == record[1]
                                     and active_key[0] == virtual_engine
                                     for active_key, value in
-                                    self._host_async_kv_transfers.items())):
+                                    self._host_async_kv_transfers.items())
+                        and not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and any(
+                            item[:2] == owner for item in self._pending_gpu_to_host))):
                     self._host_staging_owner = None
                 continue
             if event.state == AsyncKVTransferState.READY:
@@ -874,6 +916,93 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
         return events
+
+    def _poll_gpu_to_host_backing(self, virtual_engine: int) -> None:
+        completed = {}
+        for key, event in tuple(self._pending_gpu_to_host.items()):
+            if key[0] != virtual_engine:
+                continue
+            if id(event) not in completed:
+                completed[id(event)] = event.query()
+            if completed[id(event)]:
+                if key[:2] not in self._backing_retired:
+                    self._host_ready_blocks.add(key)
+                del self._pending_gpu_to_host[key]
+        pending_owners = {key[:2] for key in self._pending_gpu_to_host}
+        self._backing_retired.difference_update(
+            owner for owner in tuple(self._backing_retired)
+            if owner[0] == virtual_engine and owner not in pending_owners)
+
+    def _back_up_layer(self, virtual_engine: int, request_ids: Tuple[str, ...],
+                       layer_index: int) -> None:
+        """Preserve GPU-only and newly computed KV before physical reuse."""
+        cache_engine = self.cache_engine[virtual_engine]
+        self._poll_gpu_to_host_backing(virtual_engine)
+        for request_id in request_ids:
+            forward = self._backing_forward.get((virtual_engine, request_id))
+            if forward is None:
+                continue
+            table, computed, end, _ = forward
+            # Dirty token ranges come from scheduler CPU metadata, never a
+            # CUDA .tolist().  Full-block copies also preserve partial tails.
+            dirty = range(computed // self.cache_config.block_size,
+                          (end + self.cache_config.block_size - 1)
+                          // self.cache_config.block_size)
+            self._mark_gpu_blocks_ready(
+                virtual_engine, request_id, layer_index, tuple(dirty),
+                tuple((block, table[block]) for block in dirty))
+            candidates = {}
+            for block, destination in enumerate(table):
+                key = (virtual_engine, request_id, layer_index, block)
+                if (self._gpu_resident_blocks.get(key) == destination
+                        and self._gpu_destination_owners.get(self._gpu_slot_key(
+                            virtual_engine, layer_index, destination)) == key):
+                    candidates[key] = destination
+            if not candidates:
+                continue
+            released = torch.cuda.Event(blocking=False, interprocess=False)
+            released.record(torch.cuda.current_stream())
+            self._host_stats["layer_release_event_record_count"] += 1
+            to_copy = {key: destination for key, destination in candidates.items()
+                       if key[3] in dirty or (
+                           key not in self._host_staged_blocks
+                           and key not in self._host_ready_blocks)}
+            for key, destination in candidates.items():
+                self._gpu_region_release_events[self._gpu_slot_key(
+                    virtual_engine, layer_index, destination)] = (
+                        request_id, released)
+            if not to_copy:
+                continue
+            # Never race a background SSD read writing the same host block.
+            staged = tuple(key[3] for key in to_copy
+                           if key in self._host_staged_blocks
+                           and key not in self._host_ready_blocks
+                           and key not in self._pending_gpu_to_host)
+            if staged and not self.wait_for_host_blocks(
+                    virtual_engine, request_id, layer_index, staged,
+                    envs.VLLM_GRANULEKV_TIMEOUT_SECONDS):
+                raise RuntimeError("host staging failed before KV backing")
+            mapping = torch.tensor(
+                [(destination, key[3]) for key, destination in to_copy.items()],
+                dtype=torch.int64, device="cpu")
+            ready = cache_engine.copy_gpu_blocks_to_host_async(
+                layer_index, mapping, (released,))
+            block_bytes = (CacheEngine.get_cache_block_size(
+                self.cache_config, self.model_config, self.parallel_config)
+                           // cache_engine.num_attention_layers)
+            self._host_stats["gpu_to_host_submit_count"] += 1
+            self._host_stats["gpu_to_host_ready_events"] += 1
+            for key, destination in to_copy.items():
+                self._host_ready_blocks.discard(key)
+                self._host_staged_blocks.add(key)
+                self._pending_gpu_to_host[key] = ready
+                self._gpu_region_release_events[self._gpu_slot_key(
+                    virtual_engine, layer_index, destination)] = (
+                        request_id, ready)
+            self._host_stats["gpu_to_host_blocks"] += len(to_copy)
+            self._host_stats["gpu_to_host_bytes"] += len(to_copy) * block_bytes
+            self._host_stats["gpu_to_cpu_blocks"] += len(to_copy)
+            self._host_stats["gpu_to_cpu_bytes"] += len(to_copy) * block_bytes
 
     def _drain_host_staging_owner(self, virtual_engine: int,
                                   seq_group_id: str,
@@ -888,6 +1017,23 @@ class Worker(LocalOrDistributedWorkerBase):
             }
             if request_ids:
                 self._poll_host_transfers(virtual_engine, request_ids)
+            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+                self._poll_gpu_to_host_backing(virtual_engine)
+                pending_copies = False
+                for key, event in tuple(self._pending_h2d_transfers.items()):
+                    if key[:2] != (virtual_engine, seq_group_id):
+                        continue
+                    if event.query():
+                        del self._pending_h2d_transfers[key]
+                    else:
+                        pending_copies = True
+                if pending_copies or any(
+                        key[:2] == (virtual_engine, seq_group_id)
+                        for key in self._pending_gpu_to_host):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out draining host KV backup")
+                    time.sleep(0.0001)
+                    continue
             if not request_ids or not any(
                     key[0] == virtual_engine and record[1] == seq_group_id
                     for key, record in self._host_async_kv_transfers.items()):
@@ -957,6 +1103,8 @@ class Worker(LocalOrDistributedWorkerBase):
             ready = bool(event.query())
         except Exception as exc:
             # Event failure is an exceptional recovery path.  Preserve the
+            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+                raise RuntimeError("GPU slot fence query failed") from exc
             # old correctness guarantee without making synchronize normal.
             logger.warning("CUDA event query failed for KV slot %s: %s", key,
                            exc)
@@ -967,6 +1115,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 (time.perf_counter() - start) * 1000.0)
             ready = True
         if not ready:
+            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+                raise RuntimeError("GPU slot fence was not resolved before submit")
             self._host_stats["layer_release_event_wait_count"] += 1
             start = time.perf_counter()
             event.synchronize()
@@ -1091,7 +1241,51 @@ class Worker(LocalOrDistributedWorkerBase):
                              cache_engine: CacheEngine,
                              request: AsyncKVTransferRequest,
                              mapping: torch.Tensor) -> AsyncKVTransferEvent:
-        self._register_gpu_transfer(virtual_engine, request, mapping)
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and request.destination == "host"
+                and request.operation == AsyncKVTransferOperation.WRITE):
+            self._poll_host_transfers(virtual_engine)
+            layers = request.layer_range or (0, cache_engine.num_attention_layers)
+            keys = tuple((virtual_engine, request.seq_group_id, layer, source)
+                         for layer in range(*layers)
+                         for source, _ in request.block_mapping)
+            if not all(key in self._host_ready_blocks for key in keys):
+                if any(key not in self._host_staged_blocks for key in keys):
+                    return AsyncKVTransferEvent(
+                        request.request_id, AsyncKVTransferState.ERROR,
+                        error="host write has no backing for a complete KV block")
+                key = (virtual_engine, request.request_id)
+                if key not in self._deferred_gpu_transfers:
+                    self._host_stats["host_write_deferred_count"] += 1
+                self._deferred_gpu_transfers[key] = (request, mapping)
+                return AsyncKVTransferEvent(
+                    request.request_id, AsyncKVTransferState.PENDING)
+            self._pending_host_writes[virtual_engine, request.request_id] = request
+            self._host_stats["host_to_ssd_submit_count"] += bool(request.block_mapping)
+            self._host_stats["host_to_ssd_blocks"] += len(request.block_mapping)
+            self._host_stats["host_to_ssd_bytes"] += (
+                len(request.block_mapping) * CacheEngine.get_cache_block_size(
+                    self.cache_config, self.model_config, self.parallel_config)
+                * (layers[1] - layers[0]) // cache_engine.num_attention_layers)
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and request.destination == "gpu"
+                and request.operation == AsyncKVTransferOperation.READ
+                and request.layer_range is not None):
+            for layer in range(*request.layer_range):
+                for _, destination in request.block_mapping:
+                    entry = self._gpu_region_release_events.get(
+                        self._gpu_slot_key(virtual_engine, layer, destination))
+                    owner = self._gpu_destination_owners.get(
+                        self._gpu_slot_key(virtual_engine, layer, destination))
+                    unread = (owner is not None and owner[2] != layer
+                              and entry is None)
+                    if unread or (entry is not None and not entry[1].query()):
+                        self._deferred_gpu_transfers[
+                            virtual_engine, request.request_id] = (request, mapping)
+                        return AsyncKVTransferEvent(
+                            request.request_id, AsyncKVTransferState.PENDING)
+        if request.destination == "gpu":
+            self._register_gpu_transfer(virtual_engine, request, mapping)
         if (request.destination == "gpu"
                 and request.operation == AsyncKVTransferOperation.READ
                 and mapping.numel()):
@@ -1109,18 +1303,46 @@ class Worker(LocalOrDistributedWorkerBase):
             layer_range=request.layer_range,
             destination=request.destination)
         self._observe_gpu_transfer(virtual_engine, event)
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._complete_host_write(virtual_engine, cache_engine, event)
         return event
+
+    def _complete_host_write(self, virtual_engine: int, cache_engine: CacheEngine,
+                             event: AsyncKVTransferEvent) -> None:
+        if event.state == AsyncKVTransferState.PENDING:
+            return
+        request = self._pending_host_writes.pop(
+            (virtual_engine, event.request_id), None)
+        if request is None or event.state != AsyncKVTransferState.READY:
+            return
+        prefix = request.consumer_num_blocks or 0
+        # Generated suffix writes do not replace immutable prompt metadata.
+        # A new prompt is published as one complete CPU-built index, after
+        # every layer's SSD write has completed.
+        if (request.sparse_page_index_key is not None and any(
+                block.logical_index < prefix for block in request.logical_blocks)):
+            cache_engine.register_sparse_page_representatives(
+                request.sparse_page_index_key, tuple(range(prefix)),
+                tuple(range(prefix)), source="host")
 
     def _poll_gpu_transfer(self, virtual_engine: int,
                            cache_engine: CacheEngine,
                            request_id: str,
                            poll_kind: str = "ordinary") -> AsyncKVTransferEvent:
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            deferred = self._deferred_gpu_transfers.pop(
+                (virtual_engine, request_id), None)
+            if deferred is not None:
+                return self._submit_gpu_transfer(
+                    virtual_engine, cache_engine, *deferred)
         if poll_kind == "window":
             self._host_stats["targeted_gpu_poll_calls"] += 1
         elif poll_kind == "correction":
             self._host_stats["targeted_correction_poll_calls"] += 1
         event = cache_engine.poll_async_kv_transfer(request_id)
         self._observe_gpu_transfer(virtual_engine, event)
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._complete_host_write(virtual_engine, cache_engine, event)
         return event
 
     def host_blocks_ready(self, virtual_engine: int, seq_group_id: str,
@@ -1132,10 +1354,19 @@ class Worker(LocalOrDistributedWorkerBase):
     def gpu_blocks_ready(self, virtual_engine: int, seq_group_id: str,
                          layer_index: int,
                          logical_blocks: Sequence[int]) -> Tuple[int, ...]:
-        return tuple(
-            int(block) for block in logical_blocks
-            if (virtual_engine, seq_group_id, layer_index, int(block))
-            in self._gpu_resident_blocks)
+        ready = []
+        for block in logical_blocks:
+            key = (virtual_engine, seq_group_id, layer_index, int(block))
+            destination = self._gpu_resident_blocks.get(key)
+            if destination is None:
+                continue
+            if self._gpu_destination_owners.get(self._gpu_slot_key(
+                    virtual_engine, layer_index, destination)) != key:
+                self._gpu_resident_blocks.pop(key)
+                self._host_stats["stale_gpu_owner_hits"] += 1
+                continue
+            ready.append(int(block))
+        return tuple(ready)
 
     def _mark_gpu_blocks_ready(self, virtual_engine: int, seq_group_id: str,
                                layer_index: int, logical_blocks: Sequence[int],
@@ -1144,12 +1375,17 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError("host-to-GPU mapping and logical blocks differ")
         for logical_block, (_, destination_block) in zip(logical_blocks,
                                                          mapping):
-            self._prepare_gpu_region_reuse(virtual_engine, layer_index,
-                                           int(destination_block))
-            self._invalidate_gpu_destination(
-                virtual_engine, layer_index, int(destination_block))
             owner_key = self._gpu_slot_key(virtual_engine, layer_index,
                                            destination_block)
+            # Async transfers have already armed the stream fence. Publishing
+            # ownership must not wait again on the CPU.
+            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+                old_key = self._gpu_destination_owners.pop(owner_key, None)
+                if old_key is not None:
+                    self._gpu_resident_blocks.pop(old_key, None)
+            else:
+                self._invalidate_gpu_destination(
+                    virtual_engine, layer_index, int(destination_block))
             resident_key = (virtual_engine, seq_group_id, layer_index,
                             int(logical_block))
             self._gpu_destination_owners[owner_key] = resident_key
@@ -1177,8 +1413,18 @@ class Worker(LocalOrDistributedWorkerBase):
         if not self.host_blocks_ready(virtual_engine, seq_group_id,
                                        layer_index, logical_blocks):
             self._host_stats["cpu_cache_loading_waits"] += 1
-        while not self.host_blocks_ready(virtual_engine, seq_group_id,
-                                          layer_index, logical_blocks):
+        def available() -> bool:
+            return all(
+                (virtual_engine, seq_group_id, layer_index, int(block))
+                in self._host_ready_blocks or (
+                    envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and
+                    (virtual_engine, seq_group_id, layer_index, int(block))
+                    in self._pending_gpu_to_host)
+                for block in logical_blocks)
+
+        # D2H and H2D use the same stream, so a pending backup is a device
+        # dependency, not a reason to block the CPU polling a CUDA event.
+        while not available():
             if any((virtual_engine, seq_group_id, layer_index, int(block))
                    in self._host_failed_blocks for block in logical_blocks):
                 return False
@@ -1239,6 +1485,11 @@ class Worker(LocalOrDistributedWorkerBase):
                  int(logical_block))] = ready_event
         torch.cuda.current_stream().wait_event(ready_event)
         self._host_stats["host_gpu_event_wait_count"] += 1
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            for _, destination in mapping.tolist():
+                self._gpu_region_release_events[self._gpu_slot_key(
+                    virtual_engine, layer_index, destination)] = (
+                        seq_group_id, ready_event)
 
     def _forget_host_staging(self, virtual_engine: int,
                              request_ids: Sequence[str]) -> None:
@@ -1246,17 +1497,24 @@ class Worker(LocalOrDistributedWorkerBase):
         finished = frozenset(request_ids)
         if not finished:
             return
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._backing_retired.update((virtual_engine, item)
+                                         for item in finished)
+            for item in finished:
+                self._backing_forward.pop((virtual_engine, item), None)
         for key, record in tuple(self._host_async_kv_transfers.items()):
             if key[0] == virtual_engine and record[1] in finished:
                 self._discarded_host_transfers.add(key)
         for collection in (self._host_ready_blocks, self._host_failed_blocks,
                            self._host_staged_blocks):
-            collection.difference_update(
+            collection.difference_update({
                 item for item in collection
-                if item[0] == virtual_engine and item[1] in finished)
+                if item[0] == virtual_engine and item[1] in finished})
         for key in tuple(self._pending_h2d_transfers):
             if key[0] == virtual_engine and key[1] in finished:
-                self._pending_h2d_transfers.pop(key, None)
+                if (not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                        or self._pending_h2d_transfers[key].query()):
+                    self._pending_h2d_transfers.pop(key, None)
         for key in tuple(self._gpu_resident_blocks):
             if key[0] == virtual_engine and key[1] in finished:
                 destination = self._gpu_resident_blocks.pop(key)
@@ -1276,16 +1534,19 @@ class Worker(LocalOrDistributedWorkerBase):
                     if slot[0] == virtual_engine and owner == transfer_id:
                         self._gpu_region_release_events.pop(slot)
                 self._gpu_transfer_regions.pop(key, None)
-        self._ssd_read_blocks.difference_update(
+        self._ssd_read_blocks.difference_update({
             key for key in self._ssd_read_blocks
-            if key[0] == virtual_engine and key[1] in finished)
+            if key[0] == virtual_engine and key[1] in finished})
         owner = self._host_staging_owner
         if (owner is not None and owner[0] == virtual_engine
                 and owner[1] in finished):
             active_for_owner = any(
                 key[0] == virtual_engine and record[1] == owner[1]
                 for key, record in self._host_async_kv_transfers.items())
-            if not active_for_owner:
+            pending_backup = (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and any(
+                key[:2] == owner for key in (
+                    *self._pending_gpu_to_host, *self._pending_h2d_transfers)))
+            if not active_for_owner and not pending_backup:
                 self._host_staging_owner = None
 
     def discard_staged_async_kv_transfers(
@@ -1295,6 +1556,9 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> None:
         """清理取消 plan 中从未激活的 Worker descriptor templates。"""
         self._prefetch_runtime.discard_units(virtual_engine, request_ids)
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            for request_id in request_ids:
+                self._deferred_gpu_transfers.pop((virtual_engine, request_id), None)
 
     def activate_hierarchical_layer_barrier(
             self, virtual_engine: int,
@@ -1409,7 +1673,10 @@ class Worker(LocalOrDistributedWorkerBase):
                 ready_blocks = tuple(
                     block for block in staged_blocks
                     if (virtual_engine, state.seq_group_id, layer_index, block)
-                    in self._host_ready_blocks)
+                    in self._host_ready_blocks or (
+                        envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and
+                        (virtual_engine, state.seq_group_id, layer_index, block)
+                        in self._pending_gpu_to_host))
                 if ready_blocks:
                     layer_block_bytes = (
                         CacheEngine.get_cache_block_size(
@@ -1452,7 +1719,10 @@ class Worker(LocalOrDistributedWorkerBase):
             host_ready_set = set(
                 block for block in staged_blocks
                 if (virtual_engine, state.seq_group_id, layer_index, block)
-                in self._host_ready_blocks)
+                in self._host_ready_blocks or (
+                    envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and
+                    (virtual_engine, state.seq_group_id, layer_index, block)
+                    in self._pending_gpu_to_host))
             host_missing = set(host_candidates).difference(host_ready_set)
             self._host_stats["host_cache_misses"] += len(host_missing)
             self._host_stats["host_coverage_missing_blocks"] += len(
@@ -1540,7 +1810,13 @@ class Worker(LocalOrDistributedWorkerBase):
             layer_index: int,
     ) -> None:
         """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
-        if (envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._back_up_layer(virtual_engine, request_ids, layer_index)
+            # The rolling runtime owns the initial SSD restore only.  From
+            # here on physical fences and CPU backing own slot reuse; do not
+            # mark the restore template as a one-forward-only eviction.
+            return
+        elif (envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
                 and envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE):
             self._record_gpu_region_release_event(
                 virtual_engine, request_ids, layer_index)
@@ -1584,8 +1860,52 @@ class Worker(LocalOrDistributedWorkerBase):
             layer_index,
             get_active_layer_sequence_lengths(),
             self.cache_config.block_size)
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            self._restore_live_backing(virtual_engine, request_ids, layer_index)
         self._log_prefetch_runtime_traces()
         return sparse_kv_blocks
+
+    def _restore_live_backing(self, virtual_engine: int,
+                              request_ids: Tuple[str, ...],
+                              layer_index: int) -> None:
+        """Restore live KV before QKV writes, and fence aliased dirty slots."""
+        stream = torch.cuda.current_stream()
+        state = self._prefetch_runtime.prediction_state(request_ids, layer_index)
+        for request_id in request_ids:
+            forward = self._backing_forward.get((virtual_engine, request_id))
+            if forward is None:
+                continue
+            table, computed, end, is_prompt = forward
+            block_size = self.cache_config.block_size
+            # Multi-token prefix prefill still uses dense prefix attention.
+            # The one-token entry instead restores prefix via Actual Selection.
+            first = (0 if is_prompt and end - computed > 1 else
+                     state.num_prefix_blocks if state is not None else 0)
+            cached = tuple(range(first, (computed + block_size - 1) // block_size))
+            if state is None and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE:
+                cached = ()
+            hits = set(self.gpu_blocks_ready(
+                virtual_engine, request_id, layer_index, cached))
+            missing = tuple(block for block in cached if block not in hits)
+            if missing:
+                if not self.wait_for_host_blocks(
+                        virtual_engine, request_id, layer_index, missing,
+                        envs.VLLM_GRANULEKV_TIMEOUT_SECONDS):
+                    self._host_stats["host_backing_misses"] += len(missing)
+                    raise RuntimeError("live KV has no completed host backing")
+                mapping = tuple((block, table[block]) for block in missing)
+                self.copy_host_blocks_to_gpu_async(
+                    virtual_engine, request_id, layer_index,
+                    torch.tensor(mapping, dtype=torch.int64, device="cpu"), missing)
+                self._mark_gpu_blocks_ready(
+                    virtual_engine, request_id, layer_index, missing, mapping)
+                self._host_stats["host_backing_hits"] += len(missing)
+            for block in range(computed // block_size,
+                               (end + block_size - 1) // block_size):
+                fence = self._take_gpu_region_release_event(
+                    virtual_engine, layer_index, table[block])
+                if fence is not None:
+                    stream.wait_event(fence)
 
     def _log_prefetch_runtime_traces(self) -> None:
         """输出 worker 物理 READY 与 barrier wait，避免混入 scheduler 延迟。"""
@@ -1644,15 +1964,61 @@ class Worker(LocalOrDistributedWorkerBase):
 
         # Clean up finished ids
         for finished_id in finished_request_ids:
-            del self._seq_group_metadata_cache[finished_id]
+            self._seq_group_metadata_cache.pop(finished_id, None)
         return new_seq_group_metadata_list
+
+    def _prepare_host_backing_forward(self, execute_model_req: ExecuteModelRequest
+                                      ) -> None:
+        ve = execute_model_req.virtual_engine
+        finished = execute_model_req.finished_requests_ids
+        self._forget_host_staging(ve, finished)
+        self._prefetch_runtime.forget_seq_groups(finished)
+        metadata_list = self._get_cached_seq_group_metadata(
+            execute_model_req.seq_group_metadata_list, finished)
+        execute_model_req.seq_group_metadata_list = metadata_list
+        if len(metadata_list) > 1:
+            raise ValueError("host backing requires batch size one")
+        for metadata in metadata_list:
+            if len(metadata.seq_data) != 1:
+                raise ValueError("host backing requires one sequence")
+            seq_id, data = next(iter(metadata.seq_data.items()))
+            owner = (ve, metadata.request_id)
+            if owner in self._backing_retired:
+                self._drain_host_staging_owner(
+                    ve, metadata.request_id,
+                    envs.VLLM_GRANULEKV_TIMEOUT_SECONDS)
+            if (self._host_staging_owner is not None
+                    and self._host_staging_owner != owner):
+                self._drain_host_staging_owner(
+                    ve, self._host_staging_owner[1],
+                    envs.VLLM_GRANULEKV_TIMEOUT_SECONDS)
+            self._host_staging_owner = owner
+            self._backing_retired.discard(owner)
+            computed = data.get_num_computed_tokens()
+            previous = self._backing_forward.get(owner)
+            if previous is not None and computed < previous[1]:
+                raise RuntimeError(
+                    "host backing does not support request rewind; "
+                    "restart with a fresh request generation")
+            end = min(data.get_len(), computed + int(metadata.token_chunk_size or 1))
+            required = (data.get_prompt_len() + metadata.sampling_params.max_tokens
+                        + self.cache_config.block_size - 1
+                        ) // self.cache_config.block_size
+            if required > envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS:
+                raise ValueError(
+                    f"host KV capacity {envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS} "
+                    f"cannot cover prompt and output ({required} blocks)")
+            self._backing_forward[owner] = (
+                tuple(metadata.block_tables[seq_id]), computed, end,
+                metadata.is_prompt)
 
     def _execute_model_spmd(
         self,
         execute_model_req: ExecuteModelRequest,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Optional[List[SamplerOutput]]:
-        if execute_model_req is not None:
+        if (execute_model_req is not None
+                and not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE):
             # I/O completion 与请求生命周期不同：长 prompt 在 restore 完成后
             # 仍可能经过多个 chunked-prefill iteration。只在 Engine 明确通知
             # finished/abort 时回收 sparse residency，避免提前丢失消费约束。

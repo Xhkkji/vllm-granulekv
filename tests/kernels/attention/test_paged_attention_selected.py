@@ -8,6 +8,25 @@ import torch
 from vllm.attention.ops.paged_attn import PagedAttention
 
 
+def test_single_token_prefill_metadata_is_a_local_view():
+    from vllm.attention.backends.xformers import XFormersMetadata
+    metadata = XFormersMetadata(
+        num_prefills=1, num_prefill_tokens=1, num_decode_tokens=0,
+        slot_mapping=torch.tensor([31]), seq_lens_tensor=torch.tensor([32]),
+        max_prefill_seq_len=32, max_decode_seq_len=0, use_cuda_graph=False,
+        multi_modal_placeholder_index_maps=None, enable_kv_scales_calculation=False,
+        block_tables=torch.tensor([[1, 0]]))
+    view = metadata.single_token_sparse_prefill()
+    assert view is not metadata
+    assert metadata.num_prefills == 1
+    assert view.num_prefills == 0 and view.num_decode_tokens == 1
+    assert view.max_decode_seq_len == 32
+    assert view.block_tables is metadata.block_tables
+    assert view.slot_mapping is metadata.slot_mapping
+    metadata.num_prefill_tokens = 2
+    assert metadata.single_token_sparse_prefill() is metadata
+
+
 def _reference_attention(query: torch.Tensor, key_cache: torch.Tensor,
                          value_cache: torch.Tensor, block_table: torch.Tensor,
                          sequence_length: int, selected: list[int],

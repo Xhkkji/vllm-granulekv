@@ -142,3 +142,37 @@ def test_close_rejects_active_requests_before_closing_client():
         connector.close()
 
     assert connector.client.completed == []
+
+
+def test_close_keeps_host_memory_pinned_until_copy_completes():
+    connector = _connector()
+    connector.host_copy_ready_event = SimpleNamespace(query=lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA copies are pending"):
+        connector.close()
+
+
+@pytest.mark.parametrize("operation,mapping", [
+    ("write", [[2, 30]]), ("read", [[30, 2]])])
+def test_host_mapping_uses_existing_request_lifecycle(operation, mapping):
+    connector = _connector()
+    connector.layout.num_host_blocks = 8
+    connector.layout.num_host_regions = 4
+    connector.submit_request(
+        "host-io", torch.tensor(mapping, dtype=torch.int64),
+        operation=operation, destination="host", layer_range=(1, 3))
+    connector.complete_request("host-io")
+    payload, submitted_operation, _, handle = connector.client.submitted[0]
+    assert payload["host_block_ids"] == [2]
+    assert payload["storage_block_ids"] == [30]
+    assert payload["destination"] == "host"
+    assert submitted_operation == operation
+    assert connector.client.completed == [handle]
+
+
+def test_host_write_rejects_out_of_range_source():
+    connector = _connector()
+    connector.layout.num_host_blocks = 8
+    connector.layout.num_host_regions = 4
+    with pytest.raises((ValueError, IndexError), match="host"):
+        connector._request_spec(torch.tensor([[8, 30]]), operation="write",
+                                destination="host")

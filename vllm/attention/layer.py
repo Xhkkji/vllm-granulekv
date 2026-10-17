@@ -35,6 +35,23 @@ def _layer_index_from_name(layer_name: str) -> Optional[int]:
     return None
 
 
+def _sparse_prefill_metadata(attn_metadata: Any) -> Any:
+    if not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+        if not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE:
+            return attn_metadata
+        policy = get_sparse_kv_policy()
+        uses_prefill = getattr(policy, "validation_uses_single_token_prefill", None)
+        request_ids = get_active_layer_request_ids()
+        if (not callable(uses_prefill) or len(request_ids) != 1
+                or not uses_prefill(request_ids[0])):
+            return attn_metadata
+    if (get_active_sparse_kv_blocks() is None
+            and not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):
+        return attn_metadata
+    convert = getattr(attn_metadata, "single_token_sparse_prefill", None)
+    return attn_metadata if convert is None else convert()
+
+
 def _observe_decode_query(layer_name: str, attn_metadata: Any,
                           query: torch.Tensor, num_heads: int,
                           head_size: int) -> None:
@@ -435,6 +452,7 @@ def unified_attention(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
                                   self.num_heads, self.head_size)
     output = self.impl.forward(self, query, key, value, kv_cache,
@@ -478,6 +496,7 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
                                   self.num_heads, self.head_size)
     self.impl.forward(self,

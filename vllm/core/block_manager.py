@@ -877,7 +877,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                                            SequenceStatus.FINISHED_LENGTH_CAPPED))
         if not finished:
             raise ValueError("prefix store requires a normally finished sequence")
-        return self._reserve_swap(seq_group, None, Device.GPU, Device.CPU)
+        return self._reserve_swap(
+            seq_group, None, Device.GPU, Device.CPU,
+            complete_only=envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE)
 
     def can_reserve_granulekv_prefix_store(self,
                                      seq_group: SequenceGroup) -> bool:
@@ -885,6 +887,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         required = 0
         for seq in seq_group.get_seqs():
             source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
+            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+                source_blocks = source_blocks[:
+                    seq.data.get_num_computed_tokens() // self.block_size]
             if any(
                     self._pinned_gpu_blocks.get(
                         LogicalBlockKey(seq.seq_id, logical_index), 0)
@@ -988,6 +993,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         sequence_status: Optional[SequenceStatus],
         source_device: Device,
         target_device: Device,
+        complete_only: bool = False,
     ) -> BlockSwapReservation:
         """建立一笔双副本 block 事务，并返回后端可直接执行的 mapping。
 
@@ -1006,10 +1012,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             for seq in sequences:
                 source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
                 if source_device == Device.GPU:
+                    stored_blocks = (source_blocks[:
+                        seq.data.get_num_computed_tokens() // self.block_size]
+                                     if complete_only else source_blocks)
                     (target_blocks, new_targets,
                      mapping_sources, mapping_targets, logical_keys,
                      reused_for_seq) = self._build_storage_targets(
-                         seq.seq_id, source_blocks, target_device)
+                         seq.seq_id, stored_blocks, target_device)
                     reused_blocks += reused_for_seq
                 else:
                     new_targets = tuple(

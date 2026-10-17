@@ -44,8 +44,10 @@ def main() -> None:
                    all_blocks[point]["generated_token_ids"])
         sample = all_blocks[point]
         report = sample.get("validation_report") or {}
-        expected = int(report.get("metadata", {}).get("num_layers", 0)) * max(
-            0, int(sample.get("generated_tokens", 0)) - 1)
+        metadata = report.get("metadata", {})
+        expected = int(metadata.get("num_layers", 0)) * (
+            max(0, int(sample.get("generated_tokens", 0)) - 1)
+            + int(metadata.get("prefill_attention_steps", 0)))
         checks = int(report.get("attention_checks", 0))
         valid = (matches and expected > 0 and checks == expected
                  and int(report.get("attention_output_mismatches", 0)) == 0
@@ -79,8 +81,10 @@ def main() -> None:
             report = record.get("validation_report") or {}
             counters = {name: int(report.get(name, 0) or 0)
                         for name in mismatch_names}
-            expected = int(report.get("metadata", {}).get("num_layers", 0)) * max(
-                0, int(record.get("generated_tokens", 0)) - 1)
+            metadata = report.get("metadata", {})
+            expected = int(metadata.get("num_layers", 0)) * (
+                max(0, int(record.get("generated_tokens", 0)) - 1)
+                + int(metadata.get("prefill_attention_steps", 0)))
             valid = (report.get("mode") == "replay" and expected > 0
                      and int(report.get("attention_checks", 0)) == expected
                      and record.get("greedy_token_match") is True

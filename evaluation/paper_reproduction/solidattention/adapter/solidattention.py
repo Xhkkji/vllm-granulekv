@@ -148,6 +148,12 @@ class SolidAttentionPolicy:
                 raise ValueError("replay validation requires selection records")
             current_metadata = dict(metadata or {})
             source_metadata = dict(replay_metadata or {})
+            if current_metadata.get("prefill_attention_steps", 0) != (
+                    source_metadata.get("prefill_attention_steps", 0)):
+                raise ValueError("sparse replay prefill entry differs from trace")
+            if current_metadata.get("position_cache_length") != (
+                    source_metadata.get("position_cache_length")):
+                raise ValueError("sparse replay position cache differs from trace")
             for key in self._REPLAY_METADATA_KEYS:
                 if key not in current_metadata or key not in source_metadata:
                     raise ValueError(
@@ -593,6 +599,11 @@ class SolidAttentionPolicy:
         return bool(state is not None
                     and state.metadata.get("compare_dense_attention", False))
 
+    def validation_uses_single_token_prefill(self, request_id: str) -> bool:
+        state = self._validation_states.get(request_id)
+        return bool(state is not None
+                    and state.metadata.get("prefill_attention_steps", 0))
+
     @staticmethod
     def _normalize_query(query: torch.Tensor) -> torch.Tensor:
         if query.ndim == 3:
@@ -629,7 +640,13 @@ class SolidAttentionPolicy:
             ready = torch.cuda.Event(blocking=False, interprocess=False)
             ready.record(stream)
         start = time.perf_counter()
-        ready.synchronize()
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            while not ready.query():
+                if time.perf_counter() - start > envs.VLLM_GRANULEKV_TIMEOUT_SECONDS:
+                    raise TimeoutError("selection control copy timed out")
+                time.sleep(0)
+        else:
+            ready.synchronize()
         record_sparse_kv_selection_d2h_wait(
             (time.perf_counter() - start) * 1000.0)
         return tuple(int(index) for index in buffer[:count])
@@ -868,6 +885,13 @@ class SolidAttentionPolicy:
         if physical_block_ids.ndim != 1 or physical_block_ids.numel() < num_blocks:
             raise ValueError("physical block ids do not cover the sequence")
         prefix_count = max(0, num_blocks - 1)
+        validation = self._validation_state(request_id)
+        if validation is not None:
+            # Resident validation must use the same immutable-prefix boundary
+            # as restore replay, including single-token prefix prefill.
+            prefix_count = int(validation.metadata.get("prefix_blocks", prefix_count))
+            if not 0 <= prefix_count <= num_blocks:
+                raise ValueError("validation prefix exceeds the current KV view")
         representatives = self._cached_representatives(
             request_id, layer_index, key_cache, physical_block_ids,
             prefix_count, query.device)

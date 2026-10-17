@@ -257,6 +257,9 @@ class GranuleKVConnector:
         if self._pending_transfers:
             raise RuntimeError(
                 "cannot close GranuleKV connector with active requests")
+        copy_event = getattr(self, "host_copy_ready_event", None)
+        if copy_event is not None and not copy_event.query():
+            raise RuntimeError("cannot unpin host KV while CUDA copies are pending")
         self.unregister_cuda_host_regions()
         self.host_cache.clear()
         self.client.close()
@@ -462,10 +465,14 @@ class GranuleKVConnector:
             for source, destination in src_to_dst.to(
                 device="cpu", dtype=torch.int64).tolist())
         if destination == "host":
-            if operation != "read":
-                raise ValueError("host destination currently supports reads only")
-            storage_ids = [mapping[0] for mapping in mappings]
-            host_ids = [mapping[1] for mapping in mappings]
+            if operation == "read":
+                storage_ids = [mapping[0] for mapping in mappings]
+                host_ids = [mapping[1] for mapping in mappings]
+            elif operation == "write":
+                host_ids = [mapping[0] for mapping in mappings]
+                storage_ids = [mapping[1] for mapping in mappings]
+            else:
+                raise ValueError(f"unsupported GranuleKV operation: {operation}")
             gpu_ids = []
             if any(block < 0 or block >= self.layout.num_host_blocks
                    for block in host_ids):
