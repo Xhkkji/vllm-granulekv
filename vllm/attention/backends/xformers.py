@@ -1269,7 +1269,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     if (envs.VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE
                             and not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
                             and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
-                            and not envs.VLLM_GRANULEKV_ENABLE
                             and policy is not None):
                         gpu_selector = getattr(policy, "select_blocks_device", None)
                         if envs.VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE:
@@ -1396,6 +1395,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                         block_tables_arg,
                         selected_output,
                         dense_reference,
+                        sequence_length=sequence_length,
                     )
             else:
                 output[num_prefill_query_tokens:] = PagedAttention.forward_decode(

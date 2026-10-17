@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
+from types import SimpleNamespace
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
@@ -8,6 +9,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
 from vllm.core.block_reservation import LogicalBlockKey
 from vllm.worker.worker import Worker
 import vllm.worker.worker as worker_module
+import torch
 
 
 class _FakeMapping:
@@ -27,6 +29,8 @@ def _worker():
     worker._gpu_transfer_regions = {}
     worker._ssd_read_blocks = set()
     worker._host_stats = defaultdict(int)
+    worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(
+        layout=SimpleNamespace(num_gpu_regions=28)))]
     return worker
 
 
@@ -74,6 +78,70 @@ def test_host_to_gpu_registration_replaces_old_owner(monkeypatch):
     worker._mark_gpu_blocks_ready(0, "request-1", 2, (9, ), ((0, 3), ))
 
     assert worker.gpu_blocks_ready(0, "request-1", 2, (7, 9)) == (9, )
+
+
+def test_aliased_layer_write_invalidates_old_physical_slot_owner(monkeypatch):
+    monkeypatch.setattr(worker_module.envs,
+                        "VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE", False)
+    worker = _worker()
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 8
+    worker._mark_gpu_blocks_ready(0, "request", 0, (7,), ((7, 3),))
+    worker._mark_gpu_blocks_ready(0, "request", 24, (7,), ((7, 3),))
+    assert worker.gpu_blocks_ready(0, "request", 0, (7,)) == ()
+    assert worker.gpu_blocks_ready(0, "request", 24, (7,)) == (7,)
+    assert len(worker._gpu_destination_owners) == 1
+
+
+def test_aliased_layer_takes_same_release_fence_without_cpu_wait():
+    worker = _worker()
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 8
+    event = object()
+    worker._gpu_region_release_events[worker._gpu_slot_key(0, 0, 3)] = (
+        "read", event)
+    assert worker._take_gpu_region_release_event(0, 24, 3) is event
+    assert not worker._gpu_region_release_events
+
+
+def test_finish_cleans_owner_and_release_fence_without_waiting():
+    worker = _worker()
+    worker._host_async_kv_transfers = {}
+    worker._host_ready_blocks = set()
+    worker._host_failed_blocks = set()
+    worker._host_staged_blocks = set()
+    worker._pending_h2d_transfers = {}
+    worker._host_staging_owner = None
+    slot = worker._gpu_slot_key(0, 0, 3)
+    owner = (0, "request", 0, 7)
+    worker._gpu_resident_blocks[owner] = 3
+    worker._gpu_destination_owners[slot] = owner
+    worker._gpu_transfer_regions[0, "read"] = ("request", (0, 1), ((7, 3),))
+    worker._gpu_region_release_events[slot] = ("read", object())
+    worker._forget_host_staging(0, ("request",))
+    assert not worker._gpu_resident_blocks
+    assert not worker._gpu_destination_owners
+    assert not worker._gpu_region_release_events
+
+
+def test_validation_logits_hook_is_removed_and_off_adds_no_hook(monkeypatch):
+    worker = _worker()
+    seen = []
+    policy = SimpleNamespace(
+        configure_validation=lambda *args: None,
+        validation_report=lambda *args, **kwargs: {},
+        record_validation_logits=lambda request, output: seen.append(request))
+    monkeypatch.setattr(worker_module, "get_sparse_kv_policy", lambda: policy)
+    processor = torch.nn.Identity()
+    worker.model_runner = SimpleNamespace(
+        get_model=lambda: SimpleNamespace(logits_processor=processor))
+    worker.configure_sparse_validation("request", "record")
+    processor(torch.ones(1))
+    assert seen == ["request"]
+    worker.get_sparse_validation_report("request", reset=True)
+    assert not processor._forward_hooks
+    worker.configure_sparse_validation("request", "off")
+    processor(torch.ones(1))
+    assert seen == ["request"]
+    assert not processor._forward_hooks
 
 
 def test_gpu_residency_disabled_keeps_index_empty(monkeypatch):

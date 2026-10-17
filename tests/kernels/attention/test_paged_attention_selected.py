@@ -115,13 +115,16 @@ def test_selected_paged_attention_matches_reference(sequence_length, selected):
     torch.testing.assert_close(block_table, table_before)
 
 
-def test_selected_all_blocks_matches_dense_paged_attention():
+@pytest.mark.parametrize("sequence_length,num_heads,num_kv_heads,head_size", [
+    (257, 8, 2, 32),
+    (32769, 28, 4, 128),
+])
+def test_selected_all_blocks_matches_dense_paged_attention(
+        sequence_length, num_heads, num_kv_heads, head_size):
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
-    sequence_length = 257
     block_size = 16
     num_blocks = (sequence_length + block_size - 1) // block_size
-    num_heads, num_kv_heads, head_size = 8, 2, 32
     x = 16 // 2
     key_cache = torch.randn(num_blocks,
                             num_kv_heads,

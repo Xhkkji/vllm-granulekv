@@ -283,6 +283,15 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError(
                 "configured sparse policy does not support validation")
         configure(request_id, mode, metadata, replay_records, replay_metadata)
+        old_hook = getattr(self, "_sparse_validation_logits_hook", None)
+        if old_hook is not None:
+            old_hook.remove()
+            self._sparse_validation_logits_hook = None
+        if mode != "off":
+            self._sparse_validation_logits_hook = (
+                self.model_runner.get_model().logits_processor.register_forward_hook(
+                    lambda module, inputs, output:
+                    policy.record_validation_logits(request_id, output)))
 
     def get_sparse_validation_report(self,
                                      request_id: str,
@@ -293,7 +302,13 @@ class Worker(LocalOrDistributedWorkerBase):
         if not callable(report):
             raise RuntimeError(
                 "configured sparse policy does not support validation")
-        return report(request_id, reset=reset)
+        result = report(request_id, reset=reset)
+        if reset:
+            hook = getattr(self, "_sparse_validation_logits_hook", None)
+            if hook is not None:
+                hook.remove()
+                self._sparse_validation_logits_hook = None
+        return result
 
     def start_profile(self):
         if self.profiler is None:
@@ -908,12 +923,19 @@ class Worker(LocalOrDistributedWorkerBase):
                 (virtual_engine, seq_group_id, layer, block)
                 for block in blocks)
 
+    def _gpu_slot_key(self, virtual_engine: int, layer_index: int,
+                      destination_block: int) -> Tuple[int, int, int]:
+        connector = self.cache_engine[virtual_engine].granulekv_connector
+        region = layer_index % connector.layout.num_gpu_regions
+        return virtual_engine, region, int(destination_block)
+
     def _invalidate_gpu_destination(self, virtual_engine: int,
                                     layer_index: int,
                                     destination_block: int) -> None:
         self._prepare_gpu_region_reuse(virtual_engine, layer_index,
                                        destination_block)
-        owner_key = (virtual_engine, layer_index, destination_block)
+        owner_key = self._gpu_slot_key(virtual_engine, layer_index,
+                                       destination_block)
         old_key = self._gpu_destination_owners.pop(owner_key, None)
         if old_key is not None:
             self._gpu_resident_blocks.pop(old_key, None)
@@ -925,7 +947,7 @@ class Worker(LocalOrDistributedWorkerBase):
         """Fence one physical KV slot before a new transfer overwrites it."""
         if not envs.VLLM_GRANULEKV_EVENT_FENCED_LAYER_REUSE_ENABLE:
             return
-        key = (virtual_engine, layer_index, int(destination_block))
+        key = self._gpu_slot_key(virtual_engine, layer_index, destination_block)
         entry = self._gpu_region_release_events.get(key)
         if entry is None:
             return
@@ -956,7 +978,7 @@ class Worker(LocalOrDistributedWorkerBase):
                                        layer_index: int,
                                        destination_block: int) -> Optional[object]:
         """Transfer a slot fence to the copy stream without host waiting."""
-        key = (virtual_engine, layer_index, int(destination_block))
+        key = self._gpu_slot_key(virtual_engine, layer_index, destination_block)
         entry = self._gpu_region_release_events.pop(key, None)
         return None if entry is None else entry[1]
 
@@ -993,7 +1015,8 @@ class Worker(LocalOrDistributedWorkerBase):
             for layer in range(*layer_range):
                 for _, destination_block in pairs:
                     self._gpu_region_release_events[
-                        (virtual_engine, layer, int(destination_block))] = (
+                        self._gpu_slot_key(virtual_engine, layer,
+                                           destination_block)] = (
                             request_id, event)
 
     def _register_gpu_transfer(self, virtual_engine: int,
@@ -1046,8 +1069,8 @@ class Worker(LocalOrDistributedWorkerBase):
         for layer_index in range(*layer_range):
             for ( _, destination_block), logical_block in zip(
                     pairs, logical_blocks):
-                owner_key = (virtual_engine, layer_index,
-                             int(destination_block))
+                owner_key = self._gpu_slot_key(virtual_engine, layer_index,
+                                               destination_block)
                 resident_key = (virtual_engine, seq_group_id, layer_index,
                                 int(logical_block))
                 self._gpu_destination_owners[owner_key] = resident_key
@@ -1125,7 +1148,8 @@ class Worker(LocalOrDistributedWorkerBase):
                                            int(destination_block))
             self._invalidate_gpu_destination(
                 virtual_engine, layer_index, int(destination_block))
-            owner_key = (virtual_engine, layer_index, int(destination_block))
+            owner_key = self._gpu_slot_key(virtual_engine, layer_index,
+                                           destination_block)
             resident_key = (virtual_engine, seq_group_id, layer_index,
                             int(logical_block))
             self._gpu_destination_owners[owner_key] = resident_key
@@ -1236,8 +1260,9 @@ class Worker(LocalOrDistributedWorkerBase):
         for key in tuple(self._gpu_resident_blocks):
             if key[0] == virtual_engine and key[1] in finished:
                 destination = self._gpu_resident_blocks.pop(key)
-                self._gpu_destination_owners.pop(
-                    (virtual_engine, key[2], destination), None)
+                owner_key = self._gpu_slot_key(virtual_engine, key[2], destination)
+                if self._gpu_destination_owners.get(owner_key) == key:
+                    self._gpu_destination_owners.pop(owner_key)
         for key in tuple(self._gpu_pending_transfers):
             if (key[0] == virtual_engine
                     and self._gpu_pending_transfers[key][0] in finished):
@@ -1245,6 +1270,11 @@ class Worker(LocalOrDistributedWorkerBase):
         for key in tuple(self._gpu_transfer_regions):
             if (key[0] == virtual_engine
                     and self._gpu_transfer_regions[key][0] in finished):
+                transfer_id = key[1]
+                for slot, (owner, _) in tuple(
+                        self._gpu_region_release_events.items()):
+                    if slot[0] == virtual_engine and owner == transfer_id:
+                        self._gpu_region_release_events.pop(slot)
                 self._gpu_transfer_regions.pop(key, None)
         self._ssd_read_blocks.difference_update(
             key for key in self._ssd_read_blocks

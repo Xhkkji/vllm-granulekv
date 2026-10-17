@@ -392,7 +392,7 @@ def test_solidattention_validation_record_replay_checks_kv_and_attention():
     report = replay.validation_report("replay")
 
     assert chosen.tolist() == [0, 2]
-    assert report["replay_selection_mismatches"] == 1
+    assert report["replay_selection_mismatches"] == 0
     assert report["kv_fingerprint_mismatches"] == 0
     assert report["attention_output_mismatches"] == 0
 
@@ -451,3 +451,126 @@ def test_solidattention_all_block_validation_compares_dense_attention():
     assert report["attention_output_mismatches"] == 1
     assert report["all_block_attention_rel_error"] > 0
     assert report["all_block_attention_cosine"] < 1
+
+
+def test_validation_defers_comparison_without_waiting(monkeypatch):
+    class Ready:
+        done = False
+
+        def query(self):
+            return self.done
+
+    ready = Ready()
+    policy = SolidAttentionPolicy()
+    monkeypatch.setattr(policy, "_validation_event", lambda _: ready)
+    monkeypatch.setattr(policy, "_selection_indices_to_host",
+                        lambda _: pytest.fail("validation added a selection wait"))
+    policy.configure_validation("request", "record", _validation_metadata())
+    policy._apply_validation_selection(
+        "request", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    cache = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    output = torch.tensor([[1., 2.]])
+    policy.record_validation_attention("request", 0, cache, cache,
+                                       torch.arange(4).view(1, -1), output)
+    cache.zero_()
+    output.zero_()
+    with pytest.raises(RuntimeError, match="snapshot pending"):
+        policy.validation_report("request")
+    ready.done = True
+    report = policy.validation_report("request")
+    assert report["attention_checks"] == 1
+    record = report["records"][0]
+    assert record["physical_blocks"] == [0, 2, 3]
+    torch.testing.assert_close(policy._tensor_from_payload(record["attention_output"]),
+                               torch.tensor([[1., 2.]]))
+    assert report == policy.validation_report("request")
+
+
+def test_validation_off_does_not_allocate_snapshots(monkeypatch):
+    policy = SolidAttentionPolicy()
+    monkeypatch.setattr(policy, "_validation_snapshot",
+                        lambda _: pytest.fail("off mode allocated a snapshot"))
+    selected = torch.tensor([0, 2])
+    assert policy._apply_validation_selection(
+        "request", 0, selected, 3, 4, 1, 3) is selected
+
+
+def test_validation_fingerprint_ignores_unused_live_slots():
+    policy = SolidAttentionPolicy()
+    metadata = dict(_validation_metadata(), prefix_blocks=1)
+    policy.configure_validation("record", "record", metadata)
+    policy._apply_validation_selection(
+        "record", 0, torch.tensor([0]), 1, 2, 1, 1)
+    key = torch.zeros(2, 1, 1, 16, 8)
+    value = torch.zeros(2, 1, 8, 16)
+    table = torch.arange(2).view(1, -1)
+    output = torch.ones(1, 8)
+    policy.record_validation_attention("record", 0, key, value, table,
+                                       output, sequence_length=17)
+    trace = policy.validation_report("record")
+    policy.configure_validation("replay", "replay", metadata,
+                                trace["records"], trace["metadata"])
+    policy._apply_validation_selection(
+        "replay", 0, torch.tensor([0]), 1, 2, 1, 1)
+    key[1, ..., 1:, :] = 123
+    value[1, ..., 1:] = 456
+    policy.record_validation_attention("replay", 0, key, value, table,
+                                       output, sequence_length=17)
+    assert policy.validation_report("replay")["kv_fingerprint_mismatches"] == 0
+
+
+def test_replay_does_not_score_or_require_page_representatives(monkeypatch):
+    policy = SolidAttentionPolicy()
+    metadata = _validation_metadata()
+    record = {"decode_step": 0, "layer_index": 0, "prefix_blocks": 3,
+              "selected_prefix_blocks": [0, 2], "attention_blocks": [0, 2, 3]}
+    policy.configure_validation("request", "replay", metadata, [record], metadata)
+    monkeypatch.setattr(policy, "_select_prefix_with_logical_indices",
+                        lambda *args: pytest.fail("replay recomputed selection"))
+    actual = policy.select_actual_prefix_blocks("request", 0, torch.ones(1, 2),
+                                                3, 1)
+    assert actual == (0, 2)
+
+
+def test_validation_logits_deferred_and_compared():
+    metadata = _validation_metadata()
+    policy = SolidAttentionPolicy()
+    table = torch.arange(4).view(1, -1)
+    cache = torch.zeros(4, 1, 4)
+    output = torch.ones(1, 2)
+    logits = torch.tensor([[1., 3., 2.]])
+    policy.configure_validation("record", "record", metadata)
+    policy._apply_validation_selection("record", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    policy.record_validation_attention("record", 0, cache, cache, table, output)
+    policy.record_validation_logits("record", logits)
+    trace = policy.validation_report("record")
+    assert trace["logit_checks"] == 1
+    policy.configure_validation("replay", "replay", metadata, trace["records"], metadata)
+    policy._apply_validation_selection("replay", 0, torch.tensor([0]), 3, 4, 1, 3)
+    policy.record_validation_attention("replay", 0, cache, cache, table, output)
+    policy.record_validation_logits("replay", torch.tensor([[1., 2., 4.]]))
+    report = policy.validation_report("replay")
+    assert report["logit_mismatches"] == 1
+    assert report["logit_rel_error"] > 0
+    assert not report["greedy_token_match"]
+
+
+def test_validation_mapping_error_reports_physical_block():
+    metadata = _validation_metadata()
+    policy = SolidAttentionPolicy()
+    cache = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    output = torch.ones(1, 2)
+    policy.configure_validation("record", "record", metadata)
+    policy._apply_validation_selection("record", 0, torch.tensor([0, 2]), 3, 4, 1, 3)
+    policy.record_validation_attention("record", 0, cache, cache,
+                                       torch.arange(4).view(1, -1), output)
+    trace = policy.validation_report("record")
+    policy.configure_validation("replay", "replay", metadata, trace["records"], metadata)
+    policy._apply_validation_selection("replay", 0, torch.tensor([0]), 3, 4, 1, 3)
+    policy.record_validation_attention("replay", 0, cache, cache,
+                                       torch.tensor([[1, 0, 2, 3]]), output)
+    report = policy.validation_report("replay")
+    assert report["first_mismatch"] == {
+        "decode_step": 0, "layer_index": 0,
+        "page_identity": metadata["page_identity"],
+        "logical_block": 0, "physical_block": 1}
