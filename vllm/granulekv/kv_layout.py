@@ -45,6 +45,10 @@ class GranuleKVLayout:
     host_kv_stride_elems: int = 0
     host_block_stride_elems: int = 0
 
+    @property
+    def descriptor_bytes(self) -> int:
+        return 2 * self.fragment_bytes
+
     @classmethod
     def from_allocation(
         cls,
@@ -73,19 +77,22 @@ class GranuleKVLayout:
 
         allocation_strides = contiguous_strides(shape)
         tensor_shape = tuple(shape[index] for index in order)
-        tensor_strides = tuple(allocation_strides[index] for index in order)
         if len(tensor_shape) != 3 or tensor_shape[0] != 2:
             raise ValueError(
                 f"GranuleKV requires V0 [2,N,E] KV layout, got {tensor_shape}")
-        if tensor_strides[2] != 1:
+        if allocation_strides[order[2]] != 1:
             raise ValueError("GranuleKV fragment must be contiguous")
+        # Preserve each K/V fragment's internal layout, but pair fragments
+        # physically: [K_0 | V_0][K_1 | V_1] ... .
+        block_elems = tensor_shape[2]
+        tensor_strides = (block_elems, 2 * block_elems, 1)
 
         element_size = int(torch.empty((), dtype=dtype).element_size())
         storage_elements = 1 + sum(
             (size - 1) * stride
             for size, stride in zip(tensor_shape, tensor_strides))
         region_bytes = storage_elements * element_size
-        fragment_bytes = tensor_strides[1] * element_size
+        fragment_bytes = block_elems * element_size
         if fragment_bytes % 4096 != 0:
             raise ValueError("GranuleKV fragment must be 4KB aligned")
         host_region_bytes = 0
@@ -95,7 +102,7 @@ class GranuleKVLayout:
             if num_host_blocks <= 0 or num_host_regions <= 0:
                 raise ValueError("host blocks and regions must be positive together")
             host_block_stride_elems = int(tensor_strides[1])
-            host_kv_stride_elems = int(num_host_blocks * host_block_stride_elems)
+            host_kv_stride_elems = block_elems
             host_shape = list(tensor_shape)
             host_shape[1] = int(num_host_blocks)
             host_strides = (host_kv_stride_elems, host_block_stride_elems,
@@ -151,6 +158,7 @@ class GranuleKVLayout:
             "region_bytes": self.region_bytes,
             "element_size": self.element_size,
             "fragment_bytes": self.fragment_bytes,
+            "descriptor_bytes": self.descriptor_bytes,
             "kv_stride_elems": self.tensor_strides[0],
             "block_stride_elems": self.tensor_strides[1],
             "logical_block_bytes": self.num_layers * 2 * self.fragment_bytes,
@@ -169,6 +177,8 @@ class GranuleKVLayout:
                 or tuple(manifest["tensor_strides"]) != self.tensor_strides
                 or manifest["dtype"] != self.dtype_name):
             raise RuntimeError("GranuleKV allocation manifest layout mismatch")
+        if manifest.get("descriptor_bytes") != self.descriptor_bytes:
+            raise RuntimeError("GranuleKV descriptor size mismatch")
         expected_regions = self.num_gpu_regions + self.num_host_regions
         if len(manifest["regions"]) != expected_regions:
             raise RuntimeError("GranuleKV allocation region count mismatch")

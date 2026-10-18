@@ -341,6 +341,22 @@ class PagedAttention:
         dst_kv_cache: torch.Tensor,
         src_to_dst: torch.Tensor,
     ) -> None:
+        # A paired cache is contiguous in [block, K/V, elements] order.
+        # Copy the complete pair once, rather than crossing into the next
+        # block when swap_blocks interprets a fragment's stride as its size.
+        src_paired = (src_kv_cache.stride(0) == src_kv_cache.shape[2]
+                      and src_kv_cache.stride(1) == 2 * src_kv_cache.shape[2])
+        dst_paired = (dst_kv_cache.stride(0) == dst_kv_cache.shape[2]
+                      and dst_kv_cache.stride(1) == 2 * dst_kv_cache.shape[2])
+        if src_paired != dst_paired:
+            raise ValueError("swap_blocks requires matching physical KV layouts")
+        if src_paired:
+            src_blocks = src_kv_cache.transpose(0, 1).view(
+                src_kv_cache.shape[1], -1)
+            dst_blocks = dst_kv_cache.transpose(0, 1).view(
+                dst_kv_cache.shape[1], -1)
+            ops.swap_blocks(src_blocks, dst_blocks, src_to_dst)
+            return
         src_key_cache = src_kv_cache[0]
         dst_key_cache = dst_kv_cache[0]
         ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)

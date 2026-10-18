@@ -187,8 +187,8 @@ class CacheEngine:
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device.
 
-        【GranuleKV 直通调用链】新后端开启时，GPU 分配改用 64KB 对齐 owner，
-        但返回给 attention 的 tensor shape/stride 与原生分配完全一致。
+        GranuleKV uses aligned regions with block-level K/V pairing; logical
+        shape and each fragment's internal ordering stay backend-compatible.
         """
         kv_cache_generic_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)

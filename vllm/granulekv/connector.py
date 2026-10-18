@@ -232,10 +232,13 @@ class GranuleKVConnector:
         logger.info(
             "[GRANULEKV] imported KV cache layers=%d gpu_regions=%d "
             "gpu_blocks=%d storage_blocks=%d fragment_bytes=%d "
+            "descriptor_bytes=%d block_stride_elems=%d "
             "pool_capacity=%d max_blocks_per_pool=%d max_in_flight=%d",
             self.layout.num_layers, self.layout.num_gpu_regions,
             self.layout.num_gpu_blocks, self.layout.num_storage_blocks,
-            self.layout.fragment_bytes, self.descriptor_pool_capacity,
+            self.layout.fragment_bytes, self.layout.descriptor_bytes,
+            self.layout.tensor_strides[1],
+            self.descriptor_pool_capacity,
             self.max_blocks_per_pool, self.max_in_flight)
         return tensors
 

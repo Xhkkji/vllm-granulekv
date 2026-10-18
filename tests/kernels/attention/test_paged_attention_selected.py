@@ -179,3 +179,54 @@ def test_selected_all_blocks_matches_dense_paged_attention(
                                dense_output,
                                rtol=2e-2,
                                atol=2e-2)
+
+
+@pytest.mark.parametrize("sequence_length", [257, 32769])
+def test_paired_layout_selected_attention_matches_dense(sequence_length):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    block_size = 16
+    num_blocks = (sequence_length + block_size - 1) // block_size
+    num_heads, num_kv_heads, head_size = 28, 4, 128
+    x = 16 // 2
+    elements = block_size * num_kv_heads * head_size
+    storage = torch.randn(2 * num_blocks * elements, device="cuda",
+                          dtype=torch.float16)
+    backing = storage.as_strided(
+        (2, num_blocks, elements), (elements, 2 * elements, 1))
+    key_cache = backing[0].view(num_blocks, num_kv_heads,
+                                head_size // x, block_size, x)
+    value_cache = backing[1].view(num_blocks, num_kv_heads, head_size,
+                                  block_size)
+    block_table = torch.arange(num_blocks, device="cuda",
+                               dtype=torch.int32).flip(0).view(1, -1)
+    query = torch.randn(1, num_heads, head_size, device="cuda",
+                        dtype=torch.float16)
+    seq_lens = torch.tensor([sequence_length], device="cuda", dtype=torch.int32)
+    selected = torch.arange(num_blocks, device="cuda", dtype=torch.int32)
+    scale = 1.0 / math.sqrt(head_size)
+    k_scale = v_scale = torch.tensor(1.0, device="cuda")
+
+    selected_output = PagedAttention.forward_decode_selected(
+        query, key_cache, value_cache, block_table, seq_lens, selected,
+        num_blocks, sequence_length, "auto", num_kv_heads, scale, None,
+        k_scale, v_scale)
+    dense_output = PagedAttention.forward_decode(
+        query, key_cache, value_cache, block_table, seq_lens, sequence_length,
+        "auto", num_kv_heads, scale, None, k_scale, v_scale)
+    torch.testing.assert_close(selected_output, dense_output,
+                               rtol=2e-2, atol=2e-2)
+    contiguous_dense = PagedAttention.forward_decode(
+        query, key_cache.contiguous(), value_cache.contiguous(), block_table,
+        seq_lens, sequence_length, "auto", num_kv_heads, scale, None,
+        k_scale, v_scale)
+    torch.testing.assert_close(dense_output, contiguous_dense, rtol=0, atol=0)
+    subset = list(range(0, num_blocks, 3))
+    sparse = PagedAttention.forward_decode_selected(
+        query, key_cache, value_cache, block_table, seq_lens,
+        torch.tensor(subset, device="cuda", dtype=torch.int32), len(subset),
+        sum(min(block_size, sequence_length - i * block_size) for i in subset),
+        "auto", num_kv_heads, scale, None, k_scale, v_scale)
+    reference = _reference_attention(query, key_cache, value_cache, block_table,
+                                     sequence_length, subset, scale)
+    torch.testing.assert_close(sparse, reference, rtol=2e-2, atol=2e-2)

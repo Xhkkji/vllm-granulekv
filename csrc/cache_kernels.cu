@@ -73,7 +73,9 @@ template <typename scalar_t>
 __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
                                    int64_t* value_cache_ptrs,
                                    const int64_t* __restrict__ block_mapping,
-                                   const int numel_per_block) {
+                                   const int numel_per_block,
+                                   const int64_t key_block_stride,
+                                   const int64_t value_block_stride) {
   const int layer_idx = blockIdx.x;
   const int pair_idx = blockIdx.y;
 
@@ -83,16 +85,14 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
   int64_t src_block_number = block_mapping[2 * pair_idx];
   int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
 
-  const int64_t src_block_offset = src_block_number * numel_per_block;
-  const int64_t dst_block_offset = dst_block_number * numel_per_block;
   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
-    int64_t src_offset = src_block_offset + i;
-    int64_t dst_offset = dst_block_offset + i;
+    int64_t src_offset = src_block_number * key_block_stride + i;
+    int64_t dst_offset = dst_block_number * key_block_stride + i;
     key_cache[dst_offset] = key_cache[src_offset];
   }
   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
-    int64_t src_offset = src_block_offset + i;
-    int64_t dst_offset = dst_block_offset + i;
+    int64_t src_offset = src_block_number * value_block_stride + i;
+    int64_t dst_offset = dst_block_number * value_block_stride + i;
     value_cache[dst_offset] = value_cache[src_offset];
   }
 }
@@ -136,6 +136,10 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
   int64_t key_cache_ptrs[num_layers];
   int64_t value_cache_ptrs[num_layers];
   for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+    TORCH_CHECK(key_caches[layer_idx].stride(0) == key_caches[0].stride(0) &&
+                    value_caches[layer_idx].stride(0) ==
+                        value_caches[0].stride(0),
+                "copy_blocks requires uniform cache block strides");
     key_cache_ptrs[layer_idx] =
         reinterpret_cast<int64_t>(key_caches[layer_idx].data_ptr());
     value_cache_ptrs[layer_idx] =
@@ -165,7 +169,8 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
         vllm::copy_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
             key_cache_ptrs_tensor.data_ptr<int64_t>(),
             value_cache_ptrs_tensor.data_ptr<int64_t>(),
-            block_mapping.data_ptr<int64_t>(), numel_per_block);
+            block_mapping.data_ptr<int64_t>(), numel_per_block,
+            key_caches[0].stride(0), value_caches[0].stride(0));
       }));
 }
 
@@ -218,6 +223,7 @@ __global__ void reshape_and_cache_kernel(
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int key_stride, const int value_stride, const int num_heads,
     const int head_size, const int block_size, const int x,
+    const int64_t key_block_stride, const int64_t value_block_stride,
     const float* k_scale, const float* v_scale) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -240,11 +246,11 @@ __global__ void reshape_and_cache_kernel(
     const int x_offset = head_offset % x;
 
     const int64_t tgt_key_idx =
-        block_idx * num_heads * (head_size / x) * block_size * x +
+        block_idx * key_block_stride +
         head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
         block_offset * x + x_offset;
     const int64_t tgt_value_idx =
-        block_idx * num_heads * head_size * block_size +
+        block_idx * value_block_stride +
         head_idx * head_size * block_size + head_offset * block_size +
         block_offset;
     scalar_t tgt_key = key[src_key_idx];
@@ -363,6 +369,7 @@ __global__ void concat_and_cache_mla_kernel(
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
           slot_mapping.data_ptr<int64_t>(), key_stride, value_stride, \
           num_heads, head_size, block_size, x,                        \
+          key_cache.stride(0), value_cache.stride(0),                 \
           reinterpret_cast<const float*>(k_scale.data_ptr()),         \
           reinterpret_cast<const float*>(v_scale.data_ptr()));
 

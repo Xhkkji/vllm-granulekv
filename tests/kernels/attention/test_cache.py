@@ -430,6 +430,77 @@ def test_swap_blocks(
                                    dist_value_caches[0][dst].cpu())
 
 
+@pytest.mark.parametrize("paired", [False, True])
+@torch.inference_mode()
+def test_paired_granulekv_cache_writer_copy_swap(paired):
+    """Cache ops honor per-fragment views with paired physical block stride."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from vllm.attention.ops.paged_attn import PagedAttention
+
+    num_blocks, block_size = 7, 16
+    num_heads, head_size = 4, 128
+    pack = 16 // torch.tensor([], dtype=torch.float16).element_size()
+    elements = block_size * num_heads * head_size
+
+    strides = ((elements, 2 * elements, 1) if paired else
+               (num_blocks * elements, elements, 1))
+
+    def cache_views():
+        storage = torch.full((2 * num_blocks * elements,), -7,
+                             dtype=torch.float16, device="cuda")
+        backing = storage.as_strided((2, num_blocks, elements), strides)
+        key = backing[0].view(num_blocks, num_heads, head_size // pack,
+                              block_size, pack)
+        value = backing[1].view(num_blocks, num_heads, head_size, block_size)
+        return backing, key, value
+
+    source, key_cache, value_cache = cache_views()
+    tokens = 19
+    key = torch.randn(tokens, num_heads, head_size, device="cuda",
+                      dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.tensor([0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49,
+                          63, 64, 65, 79, 80, 81, 62, 78],
+                         device="cuda", dtype=torch.int64)
+    assert int(slots.max()) < num_blocks * block_size
+    expected_key = key_cache.clone()
+    expected_value = value_cache.clone()
+    for token, slot in enumerate(slots.cpu().tolist()):
+        block, offset = divmod(slot, block_size)
+        expected_key[block, :, :, offset, :] = key[token].view(
+            num_heads, head_size // pack, pack)
+        expected_value[block, :, :, offset] = value[token]
+    ops.reshape_and_cache(
+        key, value, key_cache, value_cache, slots, "auto",
+        torch.tensor(1.0, device="cuda"), torch.tensor(1.0, device="cuda"))
+    torch.testing.assert_close(key_cache, expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value_cache, expected_value, rtol=0, atol=0)
+
+    expected = source.clone()
+    expected[:, 3].copy_(expected[:, 1])
+    mapping = torch.tensor([[1, 3]], dtype=torch.int64, device="cpu")
+    ops.copy_blocks([key_cache], [value_cache], mapping.to("cuda"))
+    torch.testing.assert_close(source, expected, rtol=0, atol=0)
+
+    host_storage = torch.full((2 * num_blocks * elements,), -9,
+                              dtype=torch.float16)
+    host = host_storage.as_strided((2, num_blocks, elements), strides)
+    expected_host = host.clone()
+    expected_host[:, 3] = source[:, 1].cpu()
+    PagedAttention.swap_blocks(source, host, mapping)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(host, expected_host, rtol=0, atol=0)
+    target, _, _ = cache_views()
+    expected_target = target.clone()
+    expected_target[:, 1] = host[:, 3].to("cuda")
+    PagedAttention.swap_blocks(host, target, mapping.flip(1))
+    torch.testing.assert_close(target, expected_target, rtol=0, atol=0)
+    expected_target[:, 3] = source[:, 1]
+    PagedAttention.swap_blocks(source, target, mapping)
+    torch.testing.assert_close(target, expected_target, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
