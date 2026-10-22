@@ -509,14 +509,18 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                                         model_execute_time)
 
         if output is not None and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
-            feedback = tuple(
-                item for request_id in request_ids
-                for item in [build_sparse_restore_plan_feedback(
-                    str(request_id), envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)]
-                if item is not None)
+            feedback = []
+            update_prediction = getattr(self, "update_sparse_restore_prediction", None)
+            for request_id in request_ids:
+                item = build_sparse_restore_plan_feedback(
+                    str(request_id), envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)
+                if item is not None:
+                    feedback.append(item)
+                    if update_prediction is not None:
+                        update_prediction(str(request_id), item)
             if feedback:
                 for item in output:
-                    item.sparse_kv_plan_feedback = feedback
+                    item.sparse_kv_plan_feedback = tuple(feedback)
 
         # output is List[SamplerOutput]
         return output

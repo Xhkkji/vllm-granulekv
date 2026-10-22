@@ -36,7 +36,8 @@ def _layer_index_from_name(layer_name: str) -> Optional[int]:
 
 
 def _sparse_prefill_metadata(attn_metadata: Any) -> Any:
-    if not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+    if not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+            or envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE):
         if not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE:
             return attn_metadata
         policy = get_sparse_kv_policy()
@@ -63,8 +64,7 @@ def _observe_decode_query(layer_name: str, attn_metadata: Any,
         return
     if (attn_metadata.num_prefill_tokens != 0
             or attn_metadata.num_decode_tokens != 1):
-        if not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
-                and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+        if not (envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
                 and attn_metadata.num_prefills == 1
                 and attn_metadata.num_decode_tokens == 0):
             return
@@ -92,8 +92,7 @@ def _correct_decode_sparse_blocks(layer_name: str, attn_metadata: Any,
         return
     if (attn_metadata.num_prefill_tokens != 0
             or attn_metadata.num_decode_tokens != 1):
-        if not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
-                and attn_metadata.num_prefills == 1
+        if not (attn_metadata.num_prefills == 1
                 and attn_metadata.num_decode_tokens == 0):
             return
     layer_index = _layer_index_from_name(layer_name)

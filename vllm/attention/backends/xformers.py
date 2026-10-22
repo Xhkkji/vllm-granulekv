@@ -1204,10 +1204,9 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                         total_blocks = ((prefill_meta.seq_lens[0]
                                          + int(value_cache.shape[-1]) - 1)
                                         // int(value_cache.shape[-1]))
-                        immutable_prefix_blocks = (
-                            total_blocks - selection.count + actual.prefix_count)
-                        selected_blocks = (*actual.prefix_blocks,
-                                           *range(immutable_prefix_blocks, total_blocks))
+                        selected_blocks = tuple(sorted(set(actual.history_blocks).union(
+                            range(context_length // int(value_cache.shape[-1]),
+                                  total_blocks))))
                     out = self._run_prefix_attention_fallback(
                         layer=layer,
                         query=query,
@@ -1472,6 +1471,21 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     layer._k_scale,
                     layer._v_scale,
                 )
+
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                or envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                or envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):
+            policy = get_sparse_kv_policy()
+            seal = getattr(policy, "update_history_representatives", None)
+            request_ids = get_active_layer_request_ids()
+            if callable(seal) and len(request_ids) == 1:
+                metadata = attn_metadata.prefill_metadata or attn_metadata.decode_metadata
+                if metadata is not None and metadata.block_tables.numel():
+                    length = (metadata.seq_lens[0] if num_prefill_query_tokens else
+                              sequence_length)
+                    seal(request_ids[0], self._layer_index_from_name(layer.layer_name),
+                         key_cache, metadata.block_tables[0], length,
+                         int(value_cache.shape[-1]))
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

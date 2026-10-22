@@ -279,6 +279,20 @@ class PrefetchResidencyDirectory:
             if plan.seq_group_id in finished:
                 del self._correction_plans[plan_id]
 
+    def update_prediction(self, request_id: str, num_prefix_blocks: int,
+                          blocks_by_layer: Sequence[Sequence[int]]) -> None:
+        """Install next-forward feedback in the existing per-layer plan."""
+        for plan in self._correction_plans.values():
+            if plan.seq_group_id != request_id:
+                continue
+            if plan.num_prefix_blocks != num_prefix_blocks:
+                raise RuntimeError("prediction feedback changed immutable prefix")
+            for layer in plan.predicted_by_layer:
+                blocks = frozenset(blocks_by_layer[layer])
+                if any(block < 0 or block >= num_prefix_blocks for block in blocks):
+                    raise RuntimeError("prediction feedback is outside prefix")
+                plan.predicted_by_layer[layer] = blocks
+
     def prediction_state(
         self,
         request_ids: Sequence[str],

@@ -108,6 +108,51 @@ def test_abort_before_first_forward_has_no_cached_metadata(worker):
     assert worker._get_cached_seq_group_metadata([], ["not-started"]) == []
 
 
+@pytest.mark.parametrize("consume", [False, True])
+def test_prefetch_finish_retains_dma_and_counts_consumption_once(worker, consume):
+    worker._discarded_host_transfers = set()
+    worker._host_staging_owner = (0, "r")
+    event = Fence()
+    key = (0, "r", 0, 0)
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda *args: event)
+    worker.copy_host_blocks_to_gpu_async(
+        0, "r", 0, torch.tensor([[0, 3]]), (0,), reason="prefetch")
+    if consume:
+        worker._consume_host_copies(0, "r", 0, (0,))
+        worker._consume_host_copies(0, "r", 0, (0,))
+    worker._forget_host_staging(0, ("r",))
+    worker._forget_host_staging(0, ("r",))
+    assert key in worker._pending_h2d_transfers
+    assert not worker._gpu_resident_blocks
+    assert not worker._gpu_destination_owners
+    assert worker._host_stats["host_gpu_prefetch_hits"] == int(consume)
+    assert worker._pending_h2d_transfers[key].prefetched == (not consume)
+    event.ready = True
+    worker._drain_host_staging_owner(0, "r", 1)
+    assert not worker._pending_h2d_transfers
+    assert worker._host_staging_owner is None
+    assert not worker._backing_retired
+    assert worker._host_stats["host_gpu_prefetch_blocks"] == 1
+    assert worker._host_stats["host_gpu_prefetch_hits"] == int(consume)
+
+
+def test_discarded_host_read_does_not_release_inflight_prefetch_source(worker):
+    worker._host_staging_owner = (0, "r")
+    worker._discarded_host_transfers = {(0, "host-read")}
+    worker._host_async_kv_transfers[0, "host-read"] = (
+        "host-read", "r", (1,), (0, 1))
+    worker._pending_h2d_transfers[0, "r", 0, 0] = module._PendingHostCopy(
+        3, Fence(), True)
+    worker._backing_retired.add((0, "r"))
+    worker.cache_engine[0].poll_async_kv_transfer = lambda request: (
+        AsyncKVTransferEvent(request, AsyncKVTransferState.READY))
+    worker._poll_host_transfers(0)
+    assert worker._host_staging_owner == (0, "r")
+    assert (0, "r") in worker._backing_retired
+    assert not worker._host_ready_blocks
+
+
 def test_back_up_only_gpu_only_and_dirty_tail(worker):
     worker._backing_forward[0, "r"] = ((3, 4, 5), 33, 34, False)
     for block, destination in enumerate((3, 4, 5)):
@@ -134,16 +179,19 @@ def test_pending_d2h_is_stream_dependency_not_cpu_wait(worker):
 
 
 @pytest.mark.parametrize("computed,expected", [(32, ()), (33, (2,))])
+@pytest.mark.parametrize("is_prompt", [False, True])
 def test_sparse_prefill_restores_only_partial_tail_before_query(
-        worker, monkeypatch, computed, expected):
+        worker, monkeypatch, computed, expected, is_prompt):
     monkeypatch.setattr(module.envs,
                         "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE", True)
     worker._prefetch_runtime = SimpleNamespace(
         prediction_state=lambda *args: SimpleNamespace(num_prefix_blocks=2))
     worker._backing_forward[0, "r"] = (tuple(range(8)), computed,
-                                       computed + 17, True)
+                                       computed + (17 if is_prompt else 1), is_prompt)
     restored = []
-    worker._restore_backing_blocks = lambda ve, req, layer, table, blocks: (
+    worker._restore_backing_blocks = lambda ve, req, layer, table, blocks, **kw: (
         restored.append(tuple(blocks)))
     worker._restore_live_backing(0, ("r",), 0)
     assert restored == [expected]
@@ -152,15 +200,148 @@ def test_sparse_prefill_restores_only_partial_tail_before_query(
 def test_backing_restore_reuses_owner_and_does_not_repeat_pending_copy(worker):
     copied = []
     worker.wait_for_host_blocks = lambda *args: True
-    worker.copy_host_blocks_to_gpu_async = (
-        lambda ve, req, layer, mapping, blocks: copied.append(mapping.tolist()))
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: copied.append(mapping.tolist()) or Fence())
     table = (3, 4, 5)
     worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
     worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
     assert copied == [[[0, 3], [2, 5]]]
+    worker._pending_h2d_transfers.pop((0, "r", 0, 2))
     worker._mark_gpu_blocks_ready(0, "r", 8, (2,), ((2, 5),))
     worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
     assert copied[-1] == [[2, 5]]
+
+
+def test_correction_restores_only_selected_history_not_whole_suffix(worker, monkeypatch):
+    from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
+        SparseKVActualSelection)
+    from vllm.attention.ops.sparse_kv import SparseKVDeviceSelection
+
+    for name in ("VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE",
+                 "VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE",
+                 "VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE"):
+        monkeypatch.setattr(module.envs, name, True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE", False)
+    monkeypatch.setattr(module, "get_active_layer_sequence_lengths", lambda: {"r": 100})
+    state = SimpleNamespace(seq_group_id="r", num_prefix_blocks=2,
+                            resident_prefix_blocks=(0, 1),
+                            predicted_prefix_blocks=(0, 1),
+                            correction_mapping_by_logical=((-1, 8), (-1, 9)))
+    worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args: state)
+    table = tuple(range(8, 15))
+    worker._backing_forward[0, "r"] = (table, 81, 100, True)
+    selected = SparseKVActualSelection(
+        history_blocks=(0, 3, 5),
+        attention=SparseKVDeviceSelection(torch.tensor([0, 3, 5, 6]), 4))
+    selections, restores = [], []
+    monkeypatch.setattr(module, "select_actual_sparse_blocks_device",
+                        lambda *args: selections.append(args) or selected)
+    worker.gpu_blocks_ready = lambda *args: (0,)
+    worker._restore_backing_blocks = lambda *args: restores.append(args)
+    worker._prefetch_next_layer = lambda *args: None
+    result = worker._correct_hierarchical_layer(0, ("r",), 0, torch.ones(19, 2, 2))
+    assert len(selections) == 1
+    assert selections[0][3:7] == (2, 81, 100, 16)
+    assert restores == [(0, "r", 0, table, (3, 5))]
+    assert result.block_indices == (0, 3, 5, 6)
+    assert result.device_selection is selected.attention
+
+
+def test_independent_layers_keep_same_destination_without_reloading(worker):
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
+    copied = []
+    worker.wait_for_host_blocks = lambda *args: True
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: copied.append((layer, mapping.tolist())) or Fence())
+    for layer in (0, 8, 16, 24):
+        worker._restore_backing_blocks(0, "r", layer, (3, 4, 5), (0, 2))
+    assert len(copied) == 4
+    for layer in (0, 8, 16, 24):
+        worker._restore_backing_blocks(0, "r", layer, (3, 4, 5), (0, 2))
+        assert worker.gpu_blocks_ready(0, "r", layer, (0, 2)) == (0, 2)
+    assert len(copied) == 4
+
+
+def test_h2d_submit_does_not_wait_and_consumer_waits_only_selected(worker, monkeypatch):
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
+    worker._backing_forward[0, "r"] = ((3, 4, 5), 48, 49, False)
+    ready = Fence()
+    submitted, waits = [], []
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: submitted.append((layer, mapping.tolist(), fences)) or ready)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(
+        wait_event=waits.append))
+    release = Fence()
+    worker._gpu_region_release_events[0, 1, 3] = ("r", release)
+    worker.copy_host_blocks_to_gpu_async(
+        0, "r", 1, torch.tensor([[0, 3], [2, 5]]), (0, 2), reason="prefetch")
+    assert waits == []
+    assert submitted == [(1, [[0, 3], [2, 5]], [release])]
+    assert worker.gpu_blocks_ready(0, "r", 1, (0, 2)) == ()
+    worker._consume_host_copies(0, "r", 1, (2,))
+    assert waits == [ready]
+    assert worker.gpu_blocks_ready(0, "r", 1, (0, 2)) == (2,)
+    worker._consume_host_copies(0, "r", 1, (2,))
+    assert waits == [ready]
+    assert worker._host_stats["host_gpu_prefetch_hits"] == 1
+
+
+def test_prefetch_only_ready_missing_complete_prefix_and_pending_dedup(worker):
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
+    worker._backing_forward[0, "r"] = (tuple(range(10, 16)), 65, 66, False)
+    state = SimpleNamespace(seq_group_id="r", predicted_prefix_blocks=(0, 1, 2, 3, 4))
+    worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args: state)
+    worker._poll_host_transfers = lambda *args: None
+    worker._host_ready_blocks.update((0, "r", 1, block) for block in (0, 1, 2, 4))
+    worker._mark_gpu_blocks_ready(0, "r", 1, (0,), ((0, 10),))
+    worker._gpu_pending_transfers[0, "ssd"] = ("r", (1, 2), ((1, 11),), (1,))
+    submitted = []
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: submitted.append(mapping.tolist()) or Fence())
+    worker._prefetch_next_layer(0, ("r",), 1)
+    worker._prefetch_next_layer(0, ("r",), 1)
+    assert submitted == [[[2, 12]]]
+    worker._restore_backing_blocks(0, "r", 1, tuple(range(10, 16)), (0, 2))
+    assert submitted == [[[2, 12]]]
+
+
+def test_h2d_rejects_current_chunk_and_wrong_destination(worker):
+    worker._backing_forward[0, "r"] = ((3, 4, 5), 32, 48, True)
+    for mapping, logical in (([[2, 5]], (2,)), ([[0, 5]], (0,))):
+        with pytest.raises(RuntimeError, match="outside historical"):
+            worker.copy_host_blocks_to_gpu_async(0, "r", 0, torch.tensor(mapping), logical)
+
+
+def test_pending_copy_with_wrong_physical_owner_is_rejected(worker):
+    worker._backing_forward[0, "r"] = ((3,), 16, 17, False)
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = lambda *args: Fence()
+    worker.copy_host_blocks_to_gpu_async(0, "r", 0, torch.tensor([[0, 3]]), (0,))
+    worker._gpu_destination_owners[0, 0, 3] = (0, "other", 0, 0)
+    with pytest.raises(RuntimeError, match="physical owner"):
+        worker._consume_host_copies(0, "r", 0, (0,))
+
+
+def test_host_write_yields_to_pending_read(worker):
+    worker._poll_host_transfers = lambda *args: None
+    worker._host_ready_blocks.add((0, "r", 0, 0))
+    worker._gpu_pending_transfers[0, "read"] = ("r", (1, 2), ((1, 1),), (1,))
+    submitted = []
+    engine = worker.cache_engine[0]
+    engine.submit_async_kv_transfer = lambda *a, **kw: (
+        submitted.append(a) or AsyncKVTransferEvent("write", AsyncKVTransferState.PENDING))
+    request = AsyncKVTransferRequest(
+        request_id="write", seq_group_id="r", reservation_id="res",
+        operation=AsyncKVTransferOperation.WRITE,
+        priority=AsyncKVTransferPriority.DEFERRED_WRITE,
+        block_mapping=((0, 4),), logical_blocks=(LogicalBlockKey(0, 0),),
+        layer_range=(0, 1), destination="host")
+    mapping = torch.tensor(request.block_mapping)
+    worker._submit_gpu_transfer(0, engine, request, mapping)
+    assert not submitted
+    assert (0, "write") in worker._deferred_gpu_transfers
+    worker._gpu_pending_transfers.clear()
+    worker._poll_gpu_transfer(0, engine, "write")
+    assert len(submitted) == 1
 
 
 def test_sparse_backup_includes_unused_gpu_only_prediction(worker):

@@ -93,6 +93,32 @@ def test_prefix_fallback_plan_builds_gpu_resident_query_positions():
     assert plan.context_block_offsets.tolist() == [0, 1, 2, 0, 1]
 
 
+@pytest.mark.parametrize("context,query_tokens,selected", [
+    (19, 1, (0, 2, 4)), (19, 9, (0, 2, 4, 5, 6)), (20, 9, (0, 2, 4, 5, 6, 7)),
+])
+def test_sparse_history_plan_excludes_gaps_and_current_chunk(context, query_tokens, selected):
+    impl = _make_impl()
+    table = [7, 3, 6, 1, 5, 0, 2, 4]
+    meta = _make_prefill_meta(context_lens=[context],
+                              query_start_loc=[0, query_tokens], block_tables=[table])
+    meta.seq_lens = [context + query_tokens]
+    meta.num_prefill_tokens = query_tokens
+    plan = impl._get_prefix_fallback_plan(
+        prefill_meta=meta, device=torch.device("cpu"), block_size=4,
+        selected_blocks=selected, selected_indices=torch.tensor(selected))
+    positions = [position for block in selected
+                 for position in range(block * 4, min(context, (block + 1) * 4))]
+    assert plan.context_block_ids.tolist() == [table[position // 4] for position in positions]
+    assert plan.context_block_offsets.tolist() == [position % 4 for position in positions]
+    assert plan.total_context_tokens == len(positions)
+    assert plan.total_kv_tokens == len(positions) + query_tokens
+    assert plan.query_full_positions.tolist() == list(range(len(positions), len(positions) + query_tokens))
+    mask = plan.attn_bias.materialize((query_tokens, plan.total_kv_tokens))
+    expected = torch.arange(plan.total_kv_tokens)[None, :] <= (
+        len(positions) + torch.arange(query_tokens)[:, None])
+    assert torch.equal(torch.isfinite(mask), expected)
+
+
 def test_query_workspace_backend_prefers_direct_scatter(
     monkeypatch: pytest.MonkeyPatch,
 ):

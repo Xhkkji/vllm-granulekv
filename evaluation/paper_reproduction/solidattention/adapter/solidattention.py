@@ -37,18 +37,6 @@ class SolidAttentionSelector:
         return self._delegate.select(num_layers, num_blocks)
 
 
-@dataclass
-class _AttentionSelectionState:
-    buffer: torch.Tensor
-    fixed_blocks: torch.Tensor
-    candidate_blocks: torch.Tensor
-    prefix_count: int
-    num_blocks: int
-    count: int
-    mapping_token: int
-    ready: bool
-
-
 @dataclass(frozen=True)
 class _PredictionRepresentativeState:
     logical_block_indices: Tuple[int, ...]
@@ -79,13 +67,14 @@ class _ValidationState:
     all_block_attention_cosine: float = 1.0
     first_mismatch_step: Optional[int] = None
     first_mismatch_layer: Optional[int] = None
+    host_copies: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SolidAttentionPolicy:
     """Minimal SolidAttention-style policy for the shared sparse bridge.
 
     The policy keeps fixed initial/local blocks and selects the remaining
-    immutable prefix blocks with a GPU query/page score.  It owns only policy
+    complete historical blocks with a GPU query/page score.  It owns only policy
     metadata; physical mappings, I/O requests and allocator state stay in the
     existing vLLM/GranuleKV integration.
     """
@@ -116,8 +105,6 @@ class SolidAttentionPolicy:
         self._prediction_representatives: Dict[
             str, Dict[int, _PredictionRepresentativeState]] = defaultdict(dict)
         self._seen: set[tuple[str, int]] = set()
-        self._attention_selection_buffers: Dict[
-            str, Dict[int, _AttentionSelectionState]] = defaultdict(dict)
         self._dynamic_selection_buffers: Dict[
             str, Dict[int, torch.Tensor]] = defaultdict(dict)
         self._selection_control_buffers: Dict[str, torch.Tensor] = {}
@@ -180,15 +167,23 @@ class SolidAttentionPolicy:
                         current_metadata["prefix_blocks"]):
                     raise ValueError(
                         "replay record prefix_blocks differs from metadata")
-                selected = tuple(int(index) for index in
-                                 record["selected_prefix_blocks"])
+                unified = record.get("selection_semantics") == "complete_history_v1"
+                selected = tuple(int(index) for index in record[
+                    "attention_blocks" if unified else "selected_prefix_blocks"])
+                limit = (int(record["sequence_blocks"]) if unified else
+                         int(current_metadata["prefix_blocks"]))
                 if (selected != tuple(sorted(set(selected)))
-                        or any(index < 0 or index >= int(
-                            current_metadata["prefix_blocks"])
-                               for index in selected)):
+                        or any(index < 0 or index >= limit for index in selected)):
                     raise ValueError(
-                        "replay selected prefix blocks must be sorted, unique, "
-                        "and inside the immutable prefix")
+                        "replay selected blocks must be sorted, unique, "
+                        "and inside their recorded selection boundary")
+                if unified:
+                    size, history = int(record["block_size"]), int(record["history_tokens"])
+                    historical = tuple(index for index in selected if index * size < history)
+                    current = set(range(history // size, limit))
+                    if (tuple(record["selected_history_blocks"]) != historical
+                            or not current.issubset(selected)):
+                        raise ValueError("replay history/current selection is inconsistent")
                 page_identity = record.get("page_identity")
                 if (page_identity is not None
                         and page_identity != current_metadata["page_identity"]):
@@ -220,8 +215,20 @@ class SolidAttentionPolicy:
         replay_unconsumed = len(set(state.replay) - set(state.records_by_key))
         first_record = state.records_by_key.get(
             (state.first_mismatch_step, state.first_mismatch_layer), {})
+        copied = set()
+        duplicate_copies = 0
+        for transfer in state.host_copies:
+            for logical, _ in transfer["mapping"]:
+                version = min(transfer["block_size"], transfer["history_tokens"]
+                              - logical * transfer["block_size"])
+                identity = (transfer["layer_index"], logical, version)
+                duplicate_copies += identity in copied
+                copied.add(identity)
         return {
             "mode": state.mode,
+            "host_copy_duplicate_blocks": duplicate_copies,
+            "host_copy_mapping_blocks": sum(len(item["mapping"]) for item in state.host_copies),
+            "host_copies": state.host_copies,
             "metadata": dict(state.metadata),
             "records": list(state.records),
             "attention_checks": sum("attention_output" in record
@@ -318,6 +325,7 @@ class SolidAttentionPolicy:
         num_blocks: int,
         block_budget: int,
         representative_count: int,
+        *, history_tokens: Optional[int] = None, block_size: Optional[int] = None,
     ) -> torch.Tensor:
         state = self._validation_state(request_id)
         if state is None or state.mode == "off":
@@ -325,8 +333,10 @@ class SolidAttentionPolicy:
         key = self._next_validation_key(state, layer_index)
         step, _ = key
         chosen = selected_prefix
+        selection_boundary = (num_prefix_blocks if history_tokens is None else
+                              history_tokens // block_size)
         if state.mode == "all_blocks":
-            chosen = torch.arange(num_prefix_blocks, device=selected_prefix.device)
+            chosen = torch.arange(selection_boundary, device=selected_prefix.device)
         elif state.mode == "replay":
             record = state.replay.get((step, layer_index))
             if record is None:
@@ -338,7 +348,16 @@ class SolidAttentionPolicy:
                 raise RuntimeError(
                     "sparse replay prefix mismatch: "
                     f"expected={expected_prefix} actual={num_prefix_blocks}")
-            chosen = torch.tensor(record["selected_prefix_blocks"],
+            field = "selected_prefix_blocks"
+            if history_tokens is not None:
+                if (record.get("selection_semantics") != "complete_history_v1"
+                        or record.get("history_tokens") != history_tokens
+                        or record.get("block_size") != block_size
+                        or record.get("sequence_blocks") != num_blocks):
+                    raise RuntimeError("replay trace lacks matching complete-history semantics")
+                field = "selected_history_blocks"
+            chosen = torch.tensor([index for index in record[field]
+                                   if index < selection_boundary],
                                   dtype=torch.long, device=selected_prefix.device)
         record = {
             "decode_step": step,
@@ -350,7 +369,12 @@ class SolidAttentionPolicy:
             "page_identity": state.metadata.get("page_identity"),
             "representative_count": representative_count,
         }
-        record["_snapshots"] = {"selection": self._validation_snapshot(chosen)}
+        if history_tokens is not None:
+            record.update(selection_semantics="complete_history_v1",
+                          history_tokens=history_tokens, block_size=block_size,
+                          sequence_blocks=num_blocks)
+        record["_snapshots"] = ({} if history_tokens is not None else
+                                {"selection": self._validation_snapshot(chosen)})
         record["_ready"] = self._validation_event(chosen)
         if state.metadata.get("capture_trace", False):
             state.records.append(record)
@@ -412,6 +436,31 @@ class SolidAttentionPolicy:
             digest.update(host.view(torch.uint8).numpy().tobytes())
         return digest.hexdigest()
 
+    def record_validation_host_copy(self, request_id: str, layer_index: int,
+                                    history_tokens: int, block_size: int,
+                                    reason: str, mapping: Sequence[Sequence[int]]) -> None:
+        state = self._validation_states.get(request_id)
+        if state is None or state.mode == "off":
+            return
+        key = state.current_layer_keys.get(layer_index)
+        record = state.records_by_key.get(key, {})
+        if reason == "actual":
+            if record.get("history_tokens") != history_tokens:
+                raise RuntimeError("host copy has no current actual selection")
+            allowed = set(record["selected_history_blocks"])
+        elif reason == "partial_tail":
+            allowed = ({history_tokens // block_size} if history_tokens % block_size else set())
+        elif reason == "prefetch":
+            allowed = range(min(int(state.metadata["prefix_blocks"]), history_tokens // block_size))
+        else:
+            raise ValueError("unknown host copy reason")
+        if any(source not in allowed for source, _ in mapping):
+            raise RuntimeError("host copy is outside its selected read set")
+        state.host_copies.append(dict(
+            request_id=request_id, page_identity=state.metadata.get("page_identity"),
+            layer_index=layer_index, history_tokens=history_tokens, block_size=block_size,
+            reason=reason, mapping=[list(pair) for pair in mapping]))
+
     def record_validation_attention(
         self,
         request_id: str,
@@ -435,9 +484,12 @@ class SolidAttentionPolicy:
         record = state.records_by_key[key]
         record["sequence_length"] = sequence_length
         selected = record["_selection_device"]
-        suffix = torch.arange(record["prefix_blocks"], record["_num_blocks"],
-                              device=selected.device, dtype=selected.dtype)
-        logical = torch.cat((selected, suffix)).long()
+        if record.get("selection_semantics") == "complete_history_v1":
+            logical = selected.long()
+        else:
+            suffix = torch.arange(record["prefix_blocks"], record["_num_blocks"],
+                                  device=selected.device, dtype=selected.dtype)
+            logical = torch.cat((selected, suffix)).long()
         physical = block_table[0].index_select(0, logical).long()
         snapshots = record["_snapshots"]
         snapshots["physical"] = self._validation_snapshot(physical)
@@ -464,9 +516,16 @@ class SolidAttentionPolicy:
         num_blocks = record.pop("_num_blocks")
         step, layer_index = record["decode_step"], record["layer_index"]
         key = (step, layer_index)
-        prefix = snapshots["selection"].tolist()
-        record["selected_prefix_blocks"] = prefix
-        record["attention_blocks"] = prefix + list(range(record["prefix_blocks"], num_blocks))
+        selected = snapshots["selection"].tolist()
+        if record.get("selection_semantics") == "complete_history_v1":
+            record["attention_blocks"] = selected
+            record["selected_history_blocks"] = [index for index in selected
+                if index * record["block_size"] < record["history_tokens"]]
+            record["selected_prefix_blocks"] = [index for index in selected
+                                                if index < record["prefix_blocks"]]
+        else:
+            record["selected_prefix_blocks"] = selected
+            record["attention_blocks"] = selected + list(range(record["prefix_blocks"], num_blocks))
         if "output" not in snapshots:
             return
         record["physical_blocks"] = snapshots["physical"].tolist()
@@ -628,7 +687,7 @@ class SolidAttentionPolicy:
                                    control_copy: bool = False) -> tuple[int, ...]:
         """Copy selection metadata explicitly at its CPU control dependency."""
         if not selected.is_cuda:
-            return tuple(int(index) for index in selected)
+            return tuple(int(index) for index in selected if index >= 0)
         if not (control_copy or
                 envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
             record_sparse_kv_selection_tolist_call()
@@ -754,24 +813,26 @@ class SolidAttentionPolicy:
 
     def _select_actual_prefix_fixed(self, request_id: str, layer_index: int,
                                    query: torch.Tensor, prefix_count: int,
-                                   block_budget: int) -> torch.Tensor:
+                                   block_budget: int,
+                                   metadata=None) -> torch.Tensor:
         """Fixed-shape union; compact count is read at the existing control wait."""
         page = self._page_index_keys.get(request_id, request_id)
-        source = self._prediction_representatives.get(page, {}).get(layer_index)
-        if source is None:
-            source = self._representatives.get(page, {}).get(layer_index)
-        elif source.representatives.device != query.device:
-            # Keep the existing page-scoped device metadata across requests;
-            # only the cheap logical-index view is request/prefix scoped.
-            source = _PredictionRepresentativeState(
-                source.logical_block_indices, source.representatives.to(query.device))
-            self._prediction_representatives[page][layer_index] = source
-        signature = (page, id(source), prefix_count, query.device)
+        source = None
+        if metadata is None:
+            metadata = self._get_prediction_representatives(
+                request_id, layer_index, prefix_count, device=query.device)
+            source = self._prediction_representatives.get(page, {}).get(layer_index)
+            if source is None:
+                source = self._representatives.get(page, {}).get(layer_index)
+        signature = (page, id(source) if source is not None else
+                     id(metadata[1]) if metadata is not None else None,
+                     prefix_count, query.device)
         key = (request_id, layer_index)
         cached = self._actual_metadata.get(key)
         if cached is None or cached[0] != signature:
-            metadata = self._get_prediction_representatives(
-                request_id, layer_index, prefix_count)
+            if metadata is None:
+                metadata = self._get_prediction_representatives(
+                    request_id, layer_index, prefix_count)
             if metadata is None:
                 raise RuntimeError("SolidAttention actual selection lacks prefix metadata")
             logical, representatives = metadata
@@ -888,6 +949,8 @@ class SolidAttentionPolicy:
         request_id: str,
         layer_index: int,
         num_prefix_blocks: int,
+        *,
+        device: Optional[torch.device] = None,
     ) -> Optional[tuple[Tuple[int, ...], torch.Tensor]]:
         page_index_key = self._page_index_keys.get(request_id, request_id)
         state = self._prediction_representatives.get(page_index_key,
@@ -900,20 +963,25 @@ class SolidAttentionPolicy:
             cached_count, representatives = cached
             logical_block_indices = tuple(range(cached_count))
         else:
+            if device is not None and state.representatives.device != device:
+                state = _PredictionRepresentativeState(
+                    state.logical_block_indices, state.representatives.to(device))
+                self._prediction_representatives[page_index_key][layer_index] = state
             logical_block_indices = state.logical_block_indices
             representatives = state.representatives
+        if device is not None and representatives.device != device:
+            representatives = representatives.to(device)
+            self._representatives[page_index_key][layer_index] = (
+                cached_count, representatives)
         positions = tuple(
             position for position, index in enumerate(logical_block_indices)
             if index < num_prefix_blocks)
         if not positions:
             return None
         if len(positions) != len(logical_block_indices):
-            position_tensor = torch.tensor(positions,
-                                           dtype=torch.long,
-                                           device=representatives.device)
-            representatives = representatives.index_select(0, position_tensor)
-            logical_block_indices = tuple(logical_block_indices[position]
-                                          for position in positions)
+            # Registered logical indices are sorted, so this is a prefix view.
+            representatives = representatives[:len(positions)]
+            logical_block_indices = logical_block_indices[:len(positions)]
         return logical_block_indices, representatives
 
     def _cached_representatives(self, request_id: str, layer_index: int,
@@ -930,27 +998,31 @@ class SolidAttentionPolicy:
             new_representatives = build_page_representatives_from_paged_key_cache(
                 key_cache, new_ids, output_device=device)
             representatives = (new_representatives
-                               if representatives is None else
+                               if representatives is None or representatives.numel() == 0 else
                                torch.cat((representatives, new_representatives)))
             cached_count = prefix_count
             self._representatives[request_id][layer_index] = (
                 cached_count, representatives)
         if representatives is None:
-            return torch.empty((0, 2, 0, 0), device=device)
+            representatives = torch.empty((0, 2, 0, 0), device=device)
+            self._representatives[request_id][layer_index] = (0, representatives)
         if representatives.device != device:
             representatives = representatives.to(device=device)
             self._representatives[request_id][layer_index] = (
                 cached_count, representatives)
         return representatives[:prefix_count]
 
-    @staticmethod
-    def _mapping_token(physical_block_ids: torch.Tensor) -> int:
-        # The resident decode mapping is append-only.  vLLM may reallocate
-        # the block-table storage while growing it, even though existing
-        # logical-to-physical entries are unchanged.  Use the logical view
-        # length as the stable growth token; selected-list mode is disabled
-        # for dynamic restore/remapping paths.
-        return int(physical_block_ids.numel())
+    def update_history_representatives(
+        self, request_id: str, layer_index: int, key_cache: torch.Tensor,
+        physical_blocks: torch.Tensor, sequence_length: int, block_size: int,
+    ) -> None:
+        """Seal new request-local pages while their GPU contents are valid."""
+        complete = sequence_length // block_size
+        previous = self._representatives[request_id].get(layer_index)
+        self._cached_representatives(request_id, layer_index, key_cache,
+                                     physical_blocks, complete, key_cache.device)
+        if self._representatives[request_id].get(layer_index) is not previous:
+            self._actual_metadata.pop((request_id, layer_index), None)
 
     def _prepare_device_selection(
         self,
@@ -1134,77 +1206,10 @@ class SolidAttentionPolicy:
         block_size: int,
         block_budget: int,
     ) -> SparseKVDeviceSelection:
-        """Return a reusable GPU logical-block buffer for selected attention."""
-        key = (request_id, layer_index)
-        mapping_token = self._mapping_token(physical_block_ids)
-        state = self._attention_selection_buffers[request_id].get(layer_index)
-        if state is not None and state.mapping_token != mapping_token:
-            # A longer logical view means that a new live block became
-            # immutable.  Keep the request's warmup state and append only the
-            # new representative; the selection itself is refreshed below.
-            state = None
-
-        query, num_blocks, prefix_count, representatives = (
-            self._prepare_device_selection(
-                request_id, layer_index, query, key_cache, physical_block_ids,
-                sequence_length, block_size, block_budget))
-        validation = self._validation_state(request_id)
-        reuse = (envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE
-                 and (validation is None or validation.mode == "off"))
-        if (reuse and state is not None and state.ready
-                and state.prefix_count == prefix_count
-                and state.num_blocks == num_blocks
-                and state.buffer.device == query.device):
-            record_sparse_kv_selection(refresh=False)
-            return SparseKVDeviceSelection(state.buffer, state.count)
-
-        if (state is not None and state.prefix_count == prefix_count
-                and state.fixed_blocks.device == query.device):
-            fixed_and_candidates = (state.fixed_blocks, state.candidate_blocks)
-        else:
-            fixed_and_candidates = self._fixed_and_candidates(
-                prefix_count, query.device)
-
-        if key not in self._seen:
-            self._seen.add(key)
-            selected_prefix = torch.arange(prefix_count,
-                                           dtype=torch.long,
-                                           device=query.device)
-            selected_prefix = self._apply_validation_selection(
-                request_id, layer_index, selected_prefix, prefix_count,
-                num_blocks, block_budget, int(representatives.shape[0]))
-            suffix = torch.arange(prefix_count,
-                                  num_blocks,
-                                  dtype=torch.long,
-                                  device=query.device)
-            selected = torch.cat((selected_prefix, suffix))
-            ready = False
-        else:
-            selected_prefix = self._select_prefix(query, representatives,
-                                                   prefix_count, block_budget,
-                                                   fixed_and_candidates)
-            selected_prefix = self._apply_validation_selection(
-                request_id, layer_index, selected_prefix, prefix_count,
-                num_blocks, block_budget, int(representatives.shape[0]))
-            suffix = torch.arange(prefix_count, num_blocks, dtype=torch.long,
-                                  device=query.device)
-            selected = torch.cat((selected_prefix, suffix))
-            ready = True
-        record_sparse_kv_selection(refresh=True)
-        count = selected.shape[0]
-        if state is None or state.buffer.numel() < count or state.buffer.device != selected.device:
-            capacity = count if state is None else max(count, state.buffer.numel() * 2)
-            buffer = torch.empty(capacity,
-                                 dtype=torch.int32,
-                                 device=selected.device)
-        else:
-            buffer = state.buffer
-        buffer[:count].copy_(selected)
-        self._attention_selection_buffers[request_id][layer_index] = (
-            _AttentionSelectionState(buffer, fixed_and_candidates[0],
-                                     fixed_and_candidates[1], prefix_count,
-                                     num_blocks, count, mapping_token, ready))
-        return SparseKVDeviceSelection(buffer, count)
+        """Resident decode uses the same historical selector as restore."""
+        return self.select_prefill_blocks_device(
+            request_id, layer_index, query, key_cache, physical_block_ids,
+            sequence_length, sequence_length - 1, block_size, block_budget).attention
 
     def select_blocks(self, request_id: str, layer_index: int,
                       query: torch.Tensor,
@@ -1339,35 +1344,63 @@ class SolidAttentionPolicy:
         layer_index: int,
         query: torch.Tensor,
         num_prefix_blocks: int,
-        num_blocks: int,
+        history_tokens: int,
+        sequence_length: int,
+        block_size: int,
         block_budget: int,
     ) -> SparseKVActualSelection:
-        """Build one current-query selection for correction and attention."""
-        if num_blocks < num_prefix_blocks:
-            raise ValueError("num_blocks must cover the immutable prefix")
-        selected_prefix = self._select_actual_prefix_tensor(
-            request_id, layer_index, query, num_prefix_blocks, block_budget,
-            output_device=query.device)
-        prefix_blocks = self._selection_indices_to_host(selected_prefix,
-                                                       control_copy=True)
-        selected_prefix = selected_prefix[:len(prefix_blocks)]
-        cached_metadata = self._actual_metadata.get((request_id, layer_index))
-        representative_count = cached_metadata[-1] if cached_metadata else 0
-        if cached_metadata is None and self._validation_state(request_id) is not None:
-            metadata = self._get_prediction_representatives(
-                request_id, layer_index, num_prefix_blocks)
-            representative_count = 0 if metadata is None else len(metadata[0])
-        selected_prefix = self._apply_validation_selection(
-            request_id, layer_index, selected_prefix, num_prefix_blocks,
-            num_blocks, block_budget, representative_count)
-        if not selected_prefix.is_cuda:
-            raise RuntimeError(
-                "dynamic selected-list attention requires CUDA metadata")
-        suffix = torch.arange(num_prefix_blocks,
-                              num_blocks,
-                              dtype=torch.long,
-                              device=selected_prefix.device)
-        selected = torch.cat((selected_prefix, suffix))
+        """Select complete history once; append only partial/current pages."""
+        if block_size <= 0 or block_budget <= 0:
+            raise ValueError("block size and budget must be positive")
+        if (not 0 <= history_tokens < sequence_length
+                or not 0 <= num_prefix_blocks <=
+                (history_tokens + block_size - 1) // block_size):
+            raise ValueError("invalid immutable/history/current KV boundaries")
+        complete = history_tokens // block_size
+        num_blocks = (sequence_length + block_size - 1) // block_size
+        cached = self._representatives[request_id].get(layer_index)
+        if cached is None:
+            source = self._get_prediction_representatives(
+                request_id, layer_index, num_prefix_blocks, device=query.device)
+            if source is None or source[0] != tuple(range(num_prefix_blocks)):
+                raise RuntimeError("history selection lacks complete prefix metadata")
+            count = min(complete, num_prefix_blocks)
+            cached = (count, source[1][:count])
+            self._representatives[request_id][layer_index] = cached
+        cached_count, representatives = cached
+        if cached_count < complete:
+            raise RuntimeError("history representative was not sealed before GPU reuse")
+        if representatives.device != query.device:
+            representatives = representatives.to(query.device)
+            self._representatives[request_id][layer_index] = (cached_count, representatives)
+        metadata = (tuple(range(complete)), representatives)
+        selected_history = self._select_actual_prefix_fixed(
+            request_id, layer_index, query, complete, block_budget, metadata)
+        validation = self._validation_state(request_id)
+        if validation is not None:
+            selected_history = self._apply_validation_selection(
+                request_id, layer_index, selected_history, num_prefix_blocks,
+                num_blocks, block_budget, complete,
+                history_tokens=history_tokens, block_size=block_size)
+        history_blocks = self._selection_indices_to_host(
+            selected_history, control_copy=True)
+        selected_history = selected_history[:len(history_blocks)]
+        if (validation is None and complete == num_prefix_blocks
+                and (query.ndim != 3 or query.shape[0] == 1)):
+            self._actual_predictions[request_id, layer_index] = (
+                num_prefix_blocks, block_budget, history_blocks,
+                self._normalize_query(query))
+        current = torch.arange(complete, num_blocks, dtype=torch.long,
+                               device=query.device)
+        selected = torch.cat((selected_history, current))
+        history_blocks += tuple(range(complete,
+                                      (history_tokens + block_size - 1) // block_size))
+        if validation is not None:
+            record = validation.records_by_key[validation.current_layer_keys[layer_index]]
+            record["selected_history_blocks"] = list(history_blocks)
+            record["_selection_device"] = selected.detach()
+            record["_snapshots"]["selection"] = self._validation_snapshot(selected)
+            record["_ready"] = self._validation_event(selected)
         count = int(selected.shape[0])
         buffer = self._dynamic_selection_buffers[request_id].get(layer_index)
         if (buffer is None or buffer.device != selected.device
@@ -1379,22 +1412,10 @@ class SolidAttentionPolicy:
                                  device=selected.device)
             self._dynamic_selection_buffers[request_id][layer_index] = buffer
         buffer[:count].copy_(selected)
-        # Validation may replace the selection; its extra work is not timed.
-        validation = self._validation_state(request_id)
-        if validation is not None:
-            prefix_blocks = self._selection_indices_to_host(selected_prefix,
-                                                           control_copy=True)
-        if (validation is None
-                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
-                and (query.ndim != 3 or query.shape[0] == 1)):
-            self._actual_predictions[request_id, layer_index] = (
-                num_prefix_blocks, block_budget, prefix_blocks,
-                self._normalize_query(query))
+        record_sparse_kv_selection(refresh=True)
         return SparseKVActualSelection(
-            prefix_blocks=prefix_blocks,
-            attention=SparseKVDeviceSelection(
-                buffer, count, prefix_count=int(selected_prefix.shape[0])),
-            prefix_count=int(selected_prefix.shape[0]),
+            history_blocks=history_blocks,
+            attention=SparseKVDeviceSelection(buffer, count),
         )
 
     def select_prefill_blocks_device(
@@ -1407,13 +1428,14 @@ class SolidAttentionPolicy:
         validation = self._validation_state(request_id)
         prefix_count = (int(validation.metadata["prefix_blocks"])
                         if validation is not None else context_length // block_size)
-        if not 0 < prefix_count <= context_length // block_size:
-            raise ValueError("sparse prefill prefix must be complete cached blocks")
+        if not 0 <= prefix_count <= (context_length + block_size - 1) // block_size:
+            raise ValueError("sparse prefill prefix exceeds cached history")
         self._cached_representatives(request_id, layer_index, key_cache,
-                                     physical_blocks, prefix_count, query.device)
+                                     physical_blocks, context_length // block_size,
+                                     query.device)
         return self.select_actual_blocks_device(
             request_id, layer_index, query, prefix_count,
-            (sequence_length + block_size - 1) // block_size, block_budget)
+            context_length, sequence_length, block_size, block_budget)
 
     def predict_restore_blocks(self, request_id: str, layer_index: int,
                                num_prefix_blocks: int,
@@ -1429,9 +1451,15 @@ class SolidAttentionPolicy:
                 and guard_blocks == 0 and cached[3] is history):
             return cached[2]
         metadata = self._get_prediction_representatives(
-            request_id, layer_index, num_prefix_blocks)
+            request_id, layer_index, num_prefix_blocks, device=history.device)
         if metadata is None:
             return None
+        if (history.is_cuda
+                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
+            selected = self._select_actual_prefix_fixed(
+                request_id, layer_index, history, num_prefix_blocks,
+                block_budget + guard_blocks, metadata)
+            return self._selection_indices_to_host(selected, control_copy=True)
         logical, representatives = metadata
         selected = self._select_prefix_with_logical_indices(
             history, representatives, logical, num_prefix_blocks,
@@ -1455,6 +1483,5 @@ class SolidAttentionPolicy:
         # retained until a later prefix registration replaces it.
         if page_index_key is None or page_index_key == request_id:
             self._prediction_representatives.pop(request_id, None)
-        self._attention_selection_buffers.pop(request_id, None)
         self._dynamic_selection_buffers.pop(request_id, None)
         self._seen = {key for key in self._seen if key[0] != request_id}

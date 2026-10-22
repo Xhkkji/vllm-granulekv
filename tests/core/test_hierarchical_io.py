@@ -287,6 +287,11 @@ def test_layer_working_set_regions_cover_current_and_max_lead_windows():
     }
     assert get_layer_working_set_regions(values) == 6
     assert RollingPrefetchConfig.from_env(values).working_set_enabled
+    values["VLLM_GRANULEKV_HOST_BACKING_ENABLE"] = "1"
+    assert get_layer_working_set_regions(values) == 28
+    values["VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS"] = "4"
+    values["VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS"] = "1"
+    assert get_layer_working_set_regions(values) == 28
 
 
 def test_layer_barrier_reports_consumption_after_wait():
@@ -542,6 +547,26 @@ def test_sparse_residency_miss_is_reported_separately_from_prediction():
         "residency_miss": 1,
         "residency_miss_blocks": 2,
     }
+
+
+def test_prediction_feedback_updates_existing_plan_without_publishing_residency():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _correction_prefetch_request(0, first=True)
+    runtime.submit_or_stage(
+        0, request, request.block_mapping,
+        lambda current, _mapping: AsyncKVTransferEvent(
+            current.request_id, AsyncKVTransferState.PENDING))
+    before = runtime.prediction_state(("seq-correction",), 0)
+    runtime.residency.update_prediction("seq-correction", 4, ((1, 2), (0,)))
+    after = runtime.prediction_state(("seq-correction",), 0)
+    assert after.predicted_prefix_blocks == (1, 2)
+    assert after.resident_prefix_blocks == before.resident_prefix_blocks
+    with pytest.raises(RuntimeError, match="immutable prefix"):
+        runtime.residency.update_prediction("seq-correction", 5, ((1,), (0,)))
+    with pytest.raises(RuntimeError, match="outside prefix"):
+        runtime.residency.update_prediction("seq-correction", 4, ((4,), (0,)))
+    runtime.forget_seq_groups(("seq-correction",))
+    assert runtime.prediction_state(("seq-correction",), 0) is None
 
 
 def test_single_layer_correction_updates_only_current_layer():

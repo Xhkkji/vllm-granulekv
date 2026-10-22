@@ -202,6 +202,14 @@ def _run_cached_case(llm: Any, case: dict[str, Any], sampling: Any,
             "prefill_selected_prefix_layer_blocks": sum(
                 len(row["selected_prefix_blocks"]) for row in prefill),
             "prefill_full_prefix_layer_blocks": len(prefill) * (prefix // args.page_size),
+            "prefill_selected_history_layer_blocks": sum(
+                len(row["selected_history_blocks"]) for row in prefill),
+            "prefill_complete_history_candidates": sum(
+                row["representative_count"] for row in prefill),
+            "prefill_selected_generated_history_blocks": sum(
+                sum(block >= prefix // args.page_size
+                    for block in row["selected_history_blocks"])
+                for row in prefill),
             "sparse_stats": llm.collective_rpc("get_sparse_kv_stats")[0],
         })
     return result, coverage

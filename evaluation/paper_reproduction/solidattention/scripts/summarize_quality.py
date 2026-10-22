@@ -85,6 +85,8 @@ def main() -> None:
             quality_pass = False
         prefix_full = sum(item.get("prefill_full_prefix_layer_blocks", 0)
                           for item in sparse_results.values())
+        history_full = sum(item.get("prefill_complete_history_candidates", 0)
+                           for item in sparse_results.values())
         full_blocks = sum(item.get("sparse_stats", {}).get("full_blocks", 0)
                           for item in sparse_results.values())
         selected_blocks = sum(item.get("sparse_stats", {}).get("selected_blocks", 0)
@@ -101,6 +103,13 @@ def main() -> None:
                 sum(item["prefill_selected_prefix_layer_blocks"]
                     for item in sparse_results.values()) / prefix_full
                 if prefix_full else None),
+            "prefill_complete_history_candidates": history_full,
+            "prefill_selected_history_layer_blocks": sum(
+                item.get("prefill_selected_history_layer_blocks", 0)
+                for item in sparse_results.values()),
+            "prefill_selected_generated_history_blocks": sum(
+                item.get("prefill_selected_generated_history_blocks", 0)
+                for item in sparse_results.values()),
             "selected_block_ratio": (selected_blocks / full_blocks if full_blocks
                                      else stats.get("selected_ratio")),
             "dense_score": dense_score,

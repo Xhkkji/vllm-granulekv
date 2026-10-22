@@ -302,7 +302,6 @@ class SparseKVDeviceSelection:
 
     logical_block_indices: torch.Tensor
     count: int
-    prefix_count: int | None = None
 
 
 def validate_sparse_kv_device_selection(
@@ -323,10 +322,6 @@ def validate_sparse_kv_device_selection(
         raise TypeError("selected logical block count must be a Python int")
     if selection.count <= 0 or selection.count > indices.numel():
         raise ValueError("selected logical block count is outside the buffer")
-    if selection.prefix_count is not None and (
-            selection.prefix_count <= 0 or
-            selection.prefix_count > selection.count):
-        raise ValueError("selected prefix count is outside the selection")
     _SPARSE_STATS["attention_selection_calls"] += 1
     _SPARSE_STATS["attention_selected_blocks"] += selection.count
     return selection

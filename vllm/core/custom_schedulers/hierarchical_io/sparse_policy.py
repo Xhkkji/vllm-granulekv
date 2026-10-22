@@ -33,11 +33,10 @@ class SparseKVPlanFeedback(msgspec.Struct,
 
 @dataclass(frozen=True)
 class SparseKVActualSelection:
-    """Current-query host prefix plus device attention metadata."""
+    """One historical read set shared by restore and attention."""
 
-    prefix_blocks: Tuple[int, ...]
+    history_blocks: Tuple[int, ...]
     attention: Any
-    prefix_count: int = 0
 
 
 class SparseKVPolicy(Protocol):
@@ -180,7 +179,9 @@ def select_actual_sparse_blocks_device(
     layer_index: int,
     query: torch.Tensor,
     num_prefix_blocks: int,
-    num_blocks: int,
+    history_tokens: int,
+    sequence_length: int,
+    block_size: int,
     block_budget: int,
 ) -> SparseKVActualSelection:
     """Select once for both host-side correction and device attention."""
@@ -192,16 +193,15 @@ def select_actual_sparse_blocks_device(
             "dynamic selected-list attention requires "
             "select_actual_blocks_device()")
     selection = selector(request_id, layer_index, query, num_prefix_blocks,
-                         num_blocks, block_budget)
+                         history_tokens, sequence_length, block_size, block_budget)
     if not isinstance(selection, SparseKVActualSelection):
         raise TypeError(
             "device actual selector must return SparseKVActualSelection")
-    prefix = selection.prefix_blocks
-    normalized = tuple(sorted(set(int(index) for index in prefix)))
-    if (not normalized or normalized != prefix
-            or normalized[0] < 0
-            or normalized[-1] >= num_prefix_blocks):
-        raise RuntimeError("actual sparse selection is outside prefix")
+    history = selection.history_blocks
+    normalized = tuple(sorted(set(int(index) for index in history)))
+    if (normalized != history or any(index < 0 or index * block_size >=
+                                     history_tokens for index in history)):
+        raise RuntimeError("actual sparse selection is outside history")
     return selection
 
 def discard_sparse_restore_context(request_ids: Sequence[str]) -> None:

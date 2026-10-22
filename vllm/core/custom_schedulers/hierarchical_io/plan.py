@@ -409,8 +409,8 @@ def get_layer_working_set_regions(
         environ: Optional[Mapping[str, str]] = None) -> int:
     """计算 layer working-set 的真实 GPU region 数，关闭时返回 0。
 
-    当前 window 消费期间还要允许 ``max_lead_units`` 个未来 window 读入，
-    因此 region 数固定为 ``window_layers * (max_lead_units + 1)``。
+    Host backing keeps final attention KV in independent layer regions.
+    The legacy streaming path retains its window-sized working set.
     """
     values = os.environ if environ is None else environ
     if not bool(int(_env(values, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE",
@@ -449,6 +449,8 @@ def get_layer_working_set_regions(
     regions = window_layers * (max_lead + 1)
     if regions > num_layers:
         raise ValueError("layer working set cannot exceed model layer count")
+    if bool(int(values.get("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "0"))):
+        return num_layers
     return regions
 
 

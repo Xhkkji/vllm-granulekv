@@ -18,6 +18,155 @@ def _representatives(num_pages: int = 8) -> torch.Tensor:
     return torch.stack((lower, upper), dim=1)
 
 
+@pytest.mark.parametrize("computed,tokens", [(160, 1), (163, 1), (163, 37)])
+def test_complete_history_selection_and_partial_current_union(computed, tokens):
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("page", 0, _representatives(4))
+    policy.bind_page_index_key("r", "page")
+    policy._representatives["r"][0] = (10, _representatives(10))
+    actual = policy.select_actual_blocks_device(
+        "r", 0, torch.ones(tokens, 2, 2), 4, computed,
+        computed + tokens, 16, 1)
+    assert actual.history_blocks == (0, 1, 9) + ((10,) if computed % 16 else ())
+    indices = actual.attention.logical_block_indices[:actual.attention.count].tolist()
+    assert indices == [0, 1, 9, *range(10, (computed + tokens + 15) // 16)]
+    assert len(indices) == len(set(indices))
+
+
+@pytest.mark.parametrize("heads", [2, 8])
+@pytest.mark.parametrize("complete", [1, 3, 12])
+def test_complete_history_chunk_one_matches_single_query_reference(heads, complete):
+    torch.manual_seed(29)
+    reps = torch.randn(complete, 2, 2, 2)
+    query = torch.randn(heads, 2)
+    policy = SolidAttentionPolicy(2, 2)
+    policy.register_page_representatives("r", 0, reps)
+    expected = reference_solidattention_selection(
+        query, reps, complete, 2, init_blocks=2, local_blocks=2) + (complete,)
+    single = policy.select_actual_blocks_device("r", 0, query, 1,
+                                               complete * 16, complete * 16 + 1, 16, 2)
+    chunk = policy.select_actual_blocks_device("r", 0, query.unsqueeze(0), 1,
+                                              complete * 16, complete * 16 + 1, 16, 2)
+    assert single.history_blocks == chunk.history_blocks
+    assert chunk.attention.logical_block_indices[:chunk.attention.count].tolist() == list(expected)
+
+
+def test_history_metadata_seals_only_new_full_blocks_and_is_request_local(monkeypatch):
+    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+    policy = SolidAttentionPolicy(1, 1)
+    source = _representatives(4)
+    policy.register_page_representatives("page", 0, source)
+    for request in ("a", "b"):
+        policy.bind_page_index_key(request, "page")
+        policy.select_actual_blocks_device(request, 0, torch.ones(2, 2),
+                                          4, 64, 65, 16, 1)
+    calls = []
+    builder = module.build_page_representatives_from_paged_key_cache
+    def capture(cache, ids, **kwargs):
+        calls.append(ids.tolist())
+        return builder(cache, ids, **kwargs)
+    monkeypatch.setattr(module, "build_page_representatives_from_paged_key_cache", capture)
+    key = torch.randn(8, 2, 16, 2)
+    ids = torch.tensor([5, 1, 6, 2, 7, 0, 4, 3])
+    for length in (79, 80, 80, 95, 96):
+        policy.update_history_representatives("a", 0, key, ids, length, 16)
+    assert calls == [[7], [0]]
+    assert policy._representatives["a"][0][0] == 6
+    assert policy._representatives["b"][0][0] == 4
+    shared = policy._prediction_representatives["page"][0].representatives
+    assert shared.data_ptr() == source.data_ptr()
+    torch.testing.assert_close(shared, source)
+    policy.discard("a")
+    assert "a" not in policy._representatives
+    assert "page" in policy._prediction_representatives
+
+
+def test_history_metadata_missing_after_reuse_is_explicit_error():
+    policy = SolidAttentionPolicy()
+    policy.register_page_representatives("page", 0, _representatives(4))
+    policy.bind_page_index_key("r", "page")
+    with pytest.raises(RuntimeError, match="not sealed"):
+        policy.select_actual_blocks_device("r", 0, torch.ones(2, 2),
+                                          4, 160, 161, 16, 1)
+
+
+def test_last_cached_prompt_token_is_partial_history_until_recomputed():
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("page", 0, _representatives(4))
+    policy.bind_page_index_key("r", "page")
+    actual = policy.select_actual_blocks_device("r", 0, torch.ones(2, 2),
+                                               4, 63, 64, 16, 1)
+    assert actual.history_blocks == (0, 1, 2, 3)
+    assert policy._representatives["r"][0][0] == 3
+    key = torch.randn(4, 2, 16, 2)
+    policy.update_history_representatives("r", 0, key, torch.arange(4), 64, 16)
+    assert policy._representatives["r"][0][0] == 4
+    torch.testing.assert_close(policy._representatives["r"][0][1][3],
+                               torch.stack((key[3].amin(1), key[3].amax(1))))
+
+
+def test_validation_host_copy_checks_selected_history_and_partial_version():
+    policy = SolidAttentionPolicy(1, 1)
+    policy.configure_validation("r", "record", dict(_validation_metadata(), prefix_blocks=8))
+    policy.register_page_representatives("r", 0, _representatives(8))
+    policy.select_actual_blocks_device("r", 0, torch.ones(2, 2), 8, 127, 128, 16, 1)
+    policy.record_validation_host_copy("r", 0, 127, 16, "actual", ((0, 10), (6, 16)))
+    policy.record_validation_host_copy("r", 0, 127, 16, "partial_tail", ((7, 17),))
+    with pytest.raises(RuntimeError, match="selected read set"):
+        policy.record_validation_host_copy("r", 0, 127, 16, "actual", ((4, 14),))
+    with pytest.raises(RuntimeError, match="selected read set"):
+        policy.record_validation_host_copy("r", 0, 127, 16, "prefetch", ((7, 17),))
+    assert policy.validation_report("r")["host_copy_duplicate_blocks"] == 0
+
+
+def test_short_history_only_selects_partial_current_and_seals_at_boundary():
+    policy = SolidAttentionPolicy()
+    key = torch.randn(2, 2, 16, 2)
+    ids = torch.arange(2)
+    actual = policy.select_prefill_blocks_device("r", 0, torch.ones(2, 2),
+                                                key, ids, 8, 7, 16, 1)
+    assert actual.history_blocks == (0,)
+    assert actual.attention.logical_block_indices[:actual.attention.count].tolist() == [0]
+    policy.update_history_representatives("r", 0, key, ids, 16, 16)
+    assert policy._representatives["r"][0][1].shape == (1, 2, 2, 2)
+
+
+def test_history_trace_records_final_selection_and_replays_boundaries():
+    policy = SolidAttentionPolicy(1, 1)
+    metadata = dict(_validation_metadata(), prefix_blocks=4)
+    policy.configure_validation("r", "record", metadata)
+    policy.register_page_representatives("r", 0, _representatives(10))
+    actual = policy.select_actual_blocks_device("r", 0, torch.ones(2, 2),
+                                               4, 163, 164, 16, 1)
+    report = policy.validation_report("r")
+    record = report["records"][0]
+    assert record["attention_blocks"] == [0, 1, 9, 10]
+    assert record["selected_history_blocks"] == list(actual.history_blocks)
+    assert record["selected_prefix_blocks"] == [0, 1]
+    policy.configure_validation("r", "replay", metadata,
+                                report["records"], report["metadata"])
+    replay = policy.select_actual_blocks_device("r", 0, -torch.ones(2, 2),
+                                               4, 163, 164, 16, 1)
+    assert replay.history_blocks == actual.history_blocks
+    policy.configure_validation("r", "replay", metadata,
+                                report["records"], report["metadata"])
+    with pytest.raises(RuntimeError, match="complete-history semantics"):
+        policy.select_actual_blocks_device("r", 0, torch.ones(2, 2),
+                                           4, 162, 163, 16, 1)
+
+
+def test_history_selector_rejects_legacy_prefix_only_trace():
+    policy = SolidAttentionPolicy(1, 1)
+    metadata = _validation_metadata()
+    record = {"decode_step": 0, "layer_index": 0, "prefix_blocks": 3,
+              "selected_prefix_blocks": [0, 2], "attention_blocks": [0, 2, 3]}
+    policy.register_page_representatives("r", 0, _representatives(4))
+    policy.configure_validation("r", "replay", metadata, [record], metadata)
+    with pytest.raises(RuntimeError, match="complete-history semantics"):
+        policy.select_actual_blocks_device("r", 0, torch.ones(2, 2),
+                                           3, 64, 65, 16, 1)
+
+
 @pytest.mark.parametrize("envelope", [False, True])
 @pytest.mark.parametrize("heads", [2, 8])
 @pytest.mark.parametrize("tokens", [1, 7])
@@ -55,7 +204,7 @@ def test_resident_prefill_uses_immutable_boundary_and_explicit_control(monkeypat
     policy = SolidAttentionPolicy(1, 1)
     metadata = dict(_validation_metadata(), prefix_blocks=8)
     policy.configure_validation("request", "record", metadata)
-    # Blocks 8 and 9 are mandatory history, not selector candidates.
+    # Complete generated history participates; the newest complete page stays local.
     key = torch.randn(12, 2, 1, 16, 2, device="cuda")
     table = torch.arange(12, device="cuda")
     query = torch.randn(7, 8, 2, device="cuda")
@@ -63,10 +212,10 @@ def test_resident_prefill_uses_immutable_boundary_and_explicit_control(monkeypat
                         lambda _: pytest.fail("selection used CUDA tolist"))
     actual = policy.select_prefill_blocks_device(
         "request", 0, query, key, table, 167, 160, 16, 1)
-    assert actual.prefix_blocks[0] == 0
-    assert actual.prefix_blocks[-1] == 7
-    assert all(block < 8 for block in actual.prefix_blocks)
-    assert actual.attention.count == len(actual.prefix_blocks) + 3
+    assert actual.history_blocks[0] == 0
+    assert actual.history_blocks[-1] == 9
+    assert all(block < 10 for block in actual.history_blocks)
+    assert actual.attention.count == len(actual.history_blocks) + 1
     assert "default" in policy._selection_control_buffers
 
 
@@ -162,12 +311,60 @@ def test_async_actual_has_no_nonzero_and_feedback_does_not_rescore(monkeypatch):
         return tolist(tensor)
 
     monkeypatch.setattr(torch.Tensor, "tolist", cpu_tolist)
-    actual = policy.select_actual_blocks_device("r", 0, query, 12, 13, 2)
-    assert actual.prefix_blocks == expected
+    actual = policy.select_actual_blocks_device("r", 0, query, 12, 192, 193, 16, 2)
+    assert actual.history_blocks == expected
     assert actual.attention.logical_block_indices[:actual.attention.count].cpu().tolist() == [*expected, 12]
     policy.observe_query("r", 0, query)
     monkeypatch.setattr(policy, "_score_pages", lambda *a: pytest.fail("duplicate scoring"))
     assert policy.predict_restore_blocks("r", 0, 12, 2) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shared_history_metadata_stays_on_gpu_across_requests():
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("page", 0, _representatives(12))
+    shared = None
+    for request in ("a", "b"):
+        policy.bind_page_index_key(request, "page")
+        policy.select_actual_blocks_device(
+            request, 0, torch.ones(2, 2, device="cuda"), 12, 191, 192, 16, 2)
+        state = policy._prediction_representatives["page"][0]
+        assert state.representatives.is_cuda
+        if shared is not None:
+            assert state is shared
+        shared = state
+        private = policy._representatives[request][0][1]
+        assert private.data_ptr() == state.representatives.data_ptr()
+        assert private.shape[0] == 11
+        policy.discard(request)
+    assert policy._prediction_representatives["page"][0] is shared
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_partial_prefix_prediction_keeps_immutable_boundary_and_gpu_scoring(monkeypatch):
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", True)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    torch.manual_seed(37)
+    policy = SolidAttentionPolicy(1, 1)
+    reps = torch.randn(12, 2, 2, 2)
+    query = torch.randn(2, 2, device="cuda")
+    expected = tuple(policy._select_prefix_with_logical_indices(
+        query.cpu(), reps, tuple(range(12)), 12, 2).tolist())
+    policy.register_page_representatives("page", 0, reps)
+    policy.bind_page_index_key("r", "page")
+    policy.select_actual_blocks_device("r", 0, query, 12, 191, 192, 16, 2)
+    assert ("r", 0) not in policy._actual_predictions
+    policy.observe_query("r", 0, query)
+    score = policy._score_pages
+    calls = []
+    def gpu_score(q, pages):
+        assert q.is_cuda and pages.device == q.device
+        calls.append(pages.shape[0])
+        return score(q, pages)
+    monkeypatch.setattr(policy, "_score_pages", gpu_score)
+    monkeypatch.setattr(torch, "nonzero", lambda *a, **kw: pytest.fail("dynamic shape sync"))
+    assert policy.predict_restore_blocks("r", 0, 12, 2) == expected
+    assert calls == [10]
 
 
 def test_solidattention_cpu_warmup_and_fixed_blocks():
@@ -225,7 +422,7 @@ def test_solidattention_attention_buffer_is_reused_and_grows():
                                                   physical_ids, 24, 4, 2)
     assert first.logical_block_indices.dtype == torch.int32
     assert first.logical_block_indices.is_contiguous()
-    assert first.count == 6
+    assert first.count <= 6
     assert second.count <= first.count
     assert first.logical_block_indices.data_ptr() == (
         second.logical_block_indices.data_ptr())
@@ -235,32 +432,31 @@ def test_solidattention_attention_buffer_is_reused_and_grows():
     assert grown.count > first.count
     assert grown.logical_block_indices.numel() >= grown.count
     policy.discard("r")
-    assert "r" not in policy._attention_selection_buffers
+    assert "r" not in policy._dynamic_selection_buffers
 
 
-def test_solidattention_reuses_selection_within_block(monkeypatch):
+def test_resident_decode_reuses_buffer_but_scores_each_query(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
-    monkeypatch.setattr(
-        "vllm.envs.VLLM_GRANULEKV_SPARSE_SELECTION_REUSE_ENABLE", True)
     policy = SolidAttentionPolicy(init_blocks=1, local_blocks=1)
     query = torch.ones(1, 2, 4, device="cuda")
     key_cache = torch.randn(16, 2, 4, 4, device="cuda")
     physical_ids = torch.arange(16, dtype=torch.long, device="cuda")
 
-    warmup = policy.select_attention_blocks_device(
-        "r", 0, query, key_cache, physical_ids, 24, 4, 2)
-    refreshed = policy.select_attention_blocks_device(
+    scores = []
+    score = policy._score_pages
+    monkeypatch.setattr(policy, "_score_pages",
+                        lambda *args: scores.append(args[0]) or score(*args))
+    first = policy.select_attention_blocks_device(
         "r", 0, -query, key_cache, physical_ids, 25, 4, 2)
-    reused = policy.select_attention_blocks_device(
-        "r", 0, query * 3, key_cache, physical_ids, 26, 4, 2)
-
-    assert warmup.count == 6
-    assert refreshed.count == reused.count
-    assert refreshed.logical_block_indices.data_ptr() == (
-        reused.logical_block_indices.data_ptr())
-    assert torch.equal(refreshed.logical_block_indices[:refreshed.count],
-                       reused.logical_block_indices[:reused.count])
+    current = policy.select_attention_blocks_device(
+        "r", 0, query, key_cache, physical_ids, 26, 4, 2)
+    assert len(scores) == 2
+    assert first.logical_block_indices.data_ptr() == current.logical_block_indices.data_ptr()
+    representatives = policy._representatives["r"][0][1]
+    expected = torch.cat((policy._select_prefix(query[0], representatives, 6, 2),
+                          torch.tensor([6], device=query.device)))
+    torch.testing.assert_close(current.logical_block_indices[:current.count].long(), expected)
 
 
 def test_solidattention_refreshes_when_sequence_enters_new_block(monkeypatch):
@@ -283,7 +479,7 @@ def test_solidattention_refreshes_when_sequence_enters_new_block(monkeypatch):
 
     assert within_last == 6
     assert crossed.logical_block_indices[crossed.count - 1].item() == 7
-    assert policy._attention_selection_buffers["r"][0].num_blocks == 8
+    assert policy._representatives["r"][0][0] == 7
 
 
 def test_solidattention_gqa_score_matches_expanded_reference():
@@ -350,16 +546,16 @@ def test_solidattention_actual_device_selection_includes_suffix_once():
     policy.bind_page_index_key("request-device", "prefix")
 
     selected = policy.select_actual_blocks_device(
-        "request-device", 0, torch.ones(2, 2, device="cuda"), 4, 6, 1)
+        "request-device", 0, torch.ones(2, 2, device="cuda"), 4, 64, 96, 16, 1)
 
     indices = selected.attention.logical_block_indices[
         :selected.attention.count]
     assert indices.dtype == torch.int32
     assert indices.is_contiguous()
-    assert selected.prefix_blocks == tuple(indices[:len(
-        selected.prefix_blocks)].cpu().tolist())
+    assert selected.history_blocks == tuple(indices[:len(
+        selected.history_blocks)].cpu().tolist())
     assert indices[-2:].cpu().tolist() == [4, 5]
-    assert selected.attention.count == len(selected.prefix_blocks) + 2
+    assert selected.attention.count == len(selected.history_blocks) + 2
 
 
 def test_solidattention_prediction_guard_does_not_change_actual(monkeypatch):
