@@ -396,6 +396,9 @@ class SolidAttentionPolicy:
             raise ValueError(
                 f"unsupported validation tensor dtype: {dtype_name}")
         raw = bytearray(base64.b64decode(str(payload["data_b64"])))
+        if not raw:
+            return torch.empty(tuple(int(value) for value in payload["shape"]),
+                               dtype=dtypes[dtype_name])
         return torch.frombuffer(raw, dtype=dtypes[dtype_name]).clone().reshape(
             tuple(int(value) for value in payload["shape"]))
 
@@ -521,19 +524,24 @@ class SolidAttentionPolicy:
                 raise RuntimeError("replay did not capture reference logits")
             actual_logits = snapshots["logits"].float()
             reference_logits = self._tensor_from_payload(expected["logits"]).float()
-            if actual_logits.shape != reference_logits.shape:
+            if actual_logits.numel() == 0 and reference_logits.numel() == 0:
+                pass
+            elif actual_logits.numel() == 0 or reference_logits.numel() == 0:
+                raise RuntimeError("replay logits emptiness mismatch")
+            elif actual_logits.shape != reference_logits.shape:
                 raise RuntimeError("replay logits shape mismatch")
-            finite = torch.isfinite(reference_logits)
-            error = torch.linalg.vector_norm(
-                actual_logits[finite] - reference_logits[finite])
-            norm = torch.linalg.vector_norm(reference_logits[finite]).clamp_min(1e-12)
-            state.logit_rel_error = max(state.logit_rel_error, float(error / norm))
-            state.greedy_token_match &= torch.equal(
-                actual_logits.argmax(dim=-1), reference_logits.argmax(dim=-1))
-            if not torch.allclose(actual_logits, reference_logits,
-                                  rtol=2e-3, atol=2e-3):
-                state.logit_mismatches += 1
-                self._mark_validation_mismatch(state, step, layer_index)
+            else:
+                finite = torch.isfinite(reference_logits)
+                error = torch.linalg.vector_norm(
+                    actual_logits[finite] - reference_logits[finite])
+                norm = torch.linalg.vector_norm(reference_logits[finite]).clamp_min(1e-12)
+                state.logit_rel_error = max(state.logit_rel_error, float(error / norm))
+                state.greedy_token_match &= torch.equal(
+                    actual_logits.argmax(dim=-1), reference_logits.argmax(dim=-1))
+                if not torch.allclose(actual_logits, reference_logits,
+                                      rtol=2e-3, atol=2e-3):
+                    state.logit_mismatches += 1
+                    self._mark_validation_mismatch(state, step, layer_index)
         if (record["selected_prefix_blocks"] != expected["selected_prefix_blocks"]
                 or record["attention_blocks"] != expected["attention_blocks"]):
             state.replay_selection_mismatches += 1
@@ -616,11 +624,13 @@ class SolidAttentionPolicy:
             raise ValueError("query must have shape [heads, head_dim]")
         return query
 
-    def _selection_indices_to_host(self, selected: torch.Tensor) -> tuple[int, ...]:
+    def _selection_indices_to_host(self, selected: torch.Tensor, *,
+                                   control_copy: bool = False) -> tuple[int, ...]:
         """Copy selection metadata explicitly at its CPU control dependency."""
         if not selected.is_cuda:
             return tuple(int(index) for index in selected)
-        if not envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+        if not (control_copy or
+                envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
             record_sparse_kv_selection_tolist_call()
             return tuple(int(index) for index in selected.tolist())
         count = int(selected.shape[0])
@@ -642,7 +652,7 @@ class SolidAttentionPolicy:
             ready = torch.cuda.Event(blocking=False, interprocess=False)
             ready.record(stream)
         start = time.perf_counter()
-        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+        if control_copy or envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
             while not ready.query():
                 if time.perf_counter() - start > envs.VLLM_GRANULEKV_TIMEOUT_SECONDS:
                     raise TimeoutError("selection control copy timed out")
@@ -659,6 +669,26 @@ class SolidAttentionPolicy:
     def _score_pages(query: torch.Tensor,
                      representatives: torch.Tensor) -> torch.Tensor:
         """Score pages using the representative envelope without host copies."""
+        if query.ndim == 3 and query.shape[0] > 1:
+            tokens, heads, dim = query.shape
+            if representatives.ndim not in (3, 4):
+                raise ValueError("invalid representative shape")
+            kv_heads = representatives.shape[-2]
+            if heads % kv_heads:
+                raise ValueError("representatives do not match query heads")
+            grouped = query.reshape(tokens, kv_heads, heads // kv_heads, dim)
+            if representatives.ndim == 4:
+                if representatives.shape[1] != 2:
+                    raise ValueError("representative envelope must have axis 2")
+                scores = (
+                    torch.einsum("tkhd,pkd->tkhp", grouped.clamp_min(0),
+                                 representatives[:, 1]) +
+                    torch.einsum("tkhd,pkd->tkhp", grouped.clamp_max(0),
+                                 representatives[:, 0]))
+            else:
+                scores = torch.einsum("tkhd,pkd->tkhp", grouped.abs(),
+                                      representatives)
+            return scores.amax(dim=0).reshape(heads, representatives.shape[0])
         query = SolidAttentionPolicy._normalize_query(query)
         if representatives.ndim == 4:
             if representatives.shape[1] != 2:
@@ -1259,7 +1289,7 @@ class SolidAttentionPolicy:
         if (query.is_cuda
                 and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
             return self._select_actual_prefix_fixed(
-                request_id, layer_index, self._normalize_query(query),
+                request_id, layer_index, query,
                 num_prefix_blocks, block_budget)
         metadata = self._get_prediction_representatives(
             request_id, layer_index, num_prefix_blocks)
@@ -1275,7 +1305,7 @@ class SolidAttentionPolicy:
             self._prediction_representatives[page_index_key][layer_index] = (
                 _PredictionRepresentativeState(logical, representatives))
         return self._select_prefix_with_logical_indices(
-            self._normalize_query(query), representatives, logical,
+            query, representatives, logical,
             num_prefix_blocks, block_budget)
 
     def select_actual_prefix_blocks(
@@ -1318,7 +1348,8 @@ class SolidAttentionPolicy:
         selected_prefix = self._select_actual_prefix_tensor(
             request_id, layer_index, query, num_prefix_blocks, block_budget,
             output_device=query.device)
-        prefix_blocks = self._selection_indices_to_host(selected_prefix)
+        prefix_blocks = self._selection_indices_to_host(selected_prefix,
+                                                       control_copy=True)
         selected_prefix = selected_prefix[:len(prefix_blocks)]
         cached_metadata = self._actual_metadata.get((request_id, layer_index))
         representative_count = cached_metadata[-1] if cached_metadata else 0
@@ -1351,9 +1382,11 @@ class SolidAttentionPolicy:
         # Validation may replace the selection; its extra work is not timed.
         validation = self._validation_state(request_id)
         if validation is not None:
-            prefix_blocks = self._selection_indices_to_host(selected_prefix)
+            prefix_blocks = self._selection_indices_to_host(selected_prefix,
+                                                           control_copy=True)
         if (validation is None
-                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
+                and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
+                and (query.ndim != 3 or query.shape[0] == 1)):
             self._actual_predictions[request_id, layer_index] = (
                 num_prefix_blocks, block_budget, prefix_blocks,
                 self._normalize_query(query))
@@ -1363,6 +1396,24 @@ class SolidAttentionPolicy:
                 buffer, count, prefix_count=int(selected_prefix.shape[0])),
             prefix_count=int(selected_prefix.shape[0]),
         )
+
+    def select_prefill_blocks_device(
+        self, request_id: str, layer_index: int, query: torch.Tensor,
+        key_cache: torch.Tensor, physical_blocks: torch.Tensor,
+        sequence_length: int, context_length: int, block_size: int,
+        block_budget: int,
+    ) -> SparseKVActualSelection:
+        """Resident reference for the same chunk selector used by restore."""
+        validation = self._validation_state(request_id)
+        prefix_count = (int(validation.metadata["prefix_blocks"])
+                        if validation is not None else context_length // block_size)
+        if not 0 < prefix_count <= context_length // block_size:
+            raise ValueError("sparse prefill prefix must be complete cached blocks")
+        self._cached_representatives(request_id, layer_index, key_cache,
+                                     physical_blocks, prefix_count, query.device)
+        return self.select_actual_blocks_device(
+            request_id, layer_index, query, prefix_count,
+            (sequence_length + block_size - 1) // block_size, block_budget)
 
     def predict_restore_blocks(self, request_id: str, layer_index: int,
                                num_prefix_blocks: int,

@@ -17,7 +17,7 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVLayerSelection,
     activate_layer_barrier,
     bind_sparse_page_index_key, get_active_layer_sequence_lengths,
-    get_sparse_kv_policy,
+    get_active_sparse_kv_blocks, get_sparse_kv_policy,
     register_sparse_restore_context, select_actual_sparse_blocks_device,
     select_actual_sparse_prefix_blocks)
 from vllm.attention.ops.sparse_kv import (
@@ -960,7 +960,17 @@ class Worker(LocalOrDistributedWorkerBase):
                 virtual_engine, request_id, layer_index, tuple(dirty),
                 tuple((block, table[block]) for block in dirty))
             candidates = {}
-            for block, destination in enumerate(table):
+            consumed = get_active_sparse_kv_blocks()
+            if consumed is None:
+                candidate_blocks = range(len(table))
+            else:
+                state = self._prefetch_runtime.prediction_state(
+                    (request_id,), layer_index)
+                # Unused first-window predictions may still lack host backing.
+                predicted = () if state is None else state.predicted_prefix_blocks
+                candidate_blocks = sorted(set(consumed).union(dirty, predicted))
+            for block in candidate_blocks:
+                destination = table[block]
                 key = (virtual_engine, request_id, layer_index, block)
                 if (self._gpu_resident_blocks.get(key) == destination
                         and self._gpu_destination_owners.get(self._gpu_slot_key(
@@ -1808,6 +1818,15 @@ class Worker(LocalOrDistributedWorkerBase):
                     "sparse correction completed without full residency")
 
         suffix = tuple(range(state.num_prefix_blocks, current_blocks))
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and query.ndim == 3 and query.shape[0] > 1):
+            table, computed, _, _ = self._backing_forward[
+                (virtual_engine, state.seq_group_id)]
+            self._restore_backing_blocks(
+                virtual_engine, state.seq_group_id, layer_index, table,
+                tuple(range(state.num_prefix_blocks,
+                            (computed + self.cache_config.block_size - 1)
+                            // self.cache_config.block_size)))
         working_set = tuple(sorted(set(actual_prefix).union(suffix)))
         return SparseKVLayerSelection(
             block_indices=working_set,
@@ -1889,35 +1908,45 @@ class Worker(LocalOrDistributedWorkerBase):
                 continue
             table, computed, end, is_prompt = forward
             block_size = self.cache_config.block_size
-            # Multi-token prefix prefill still uses dense prefix attention.
-            # The one-token entry instead restores prefix via Actual Selection.
+            # Sparse prefill resolves its history after the query exists.
+            # Only an existing partial tail needs preservation before writes.
             first = (0 if is_prompt and end - computed > 1 else
                      state.num_prefix_blocks if state is not None else 0)
+            if (is_prompt and end - computed > 1 and state is not None
+                    and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE):
+                first = computed // block_size
             cached = tuple(range(first, (computed + block_size - 1) // block_size))
             if state is None and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE:
                 cached = ()
-            hits = set(self.gpu_blocks_ready(
-                virtual_engine, request_id, layer_index, cached))
-            missing = tuple(block for block in cached if block not in hits)
-            if missing:
-                if not self.wait_for_host_blocks(
-                        virtual_engine, request_id, layer_index, missing,
-                        envs.VLLM_GRANULEKV_TIMEOUT_SECONDS):
-                    self._host_stats["host_backing_misses"] += len(missing)
-                    raise RuntimeError("live KV has no completed host backing")
-                mapping = tuple((block, table[block]) for block in missing)
-                self.copy_host_blocks_to_gpu_async(
-                    virtual_engine, request_id, layer_index,
-                    torch.tensor(mapping, dtype=torch.int64, device="cpu"), missing)
-                self._mark_gpu_blocks_ready(
-                    virtual_engine, request_id, layer_index, missing, mapping)
-                self._host_stats["host_backing_hits"] += len(missing)
+            self._restore_backing_blocks(
+                virtual_engine, request_id, layer_index, table, cached)
             for block in range(computed // block_size,
                                (end + block_size - 1) // block_size):
                 fence = self._take_gpu_region_release_event(
                     virtual_engine, layer_index, table[block])
                 if fence is not None:
                     stream.wait_event(fence)
+
+    def _restore_backing_blocks(self, virtual_engine: int, request_id: str,
+                                layer_index: int, table: Sequence[int],
+                                blocks: Sequence[int]) -> None:
+        hits = set(self.gpu_blocks_ready(
+            virtual_engine, request_id, layer_index, blocks))
+        missing = tuple(block for block in blocks if block not in hits)
+        if not missing:
+            return
+        if not self.wait_for_host_blocks(
+                virtual_engine, request_id, layer_index, missing,
+                envs.VLLM_GRANULEKV_TIMEOUT_SECONDS):
+            self._host_stats["host_backing_misses"] += len(missing)
+            raise RuntimeError("live KV has no completed host backing")
+        mapping = tuple((block, table[block]) for block in missing)
+        self.copy_host_blocks_to_gpu_async(
+            virtual_engine, request_id, layer_index,
+            torch.tensor(mapping, dtype=torch.int64, device="cpu"), missing)
+        self._mark_gpu_blocks_ready(
+            virtual_engine, request_id, layer_index, missing, mapping)
+        self._host_stats["host_backing_hits"] += len(missing)
 
     def _log_prefetch_runtime_traces(self) -> None:
         """输出 worker 物理 READY 与 barrier wait，避免混入 scheduler 延迟。"""

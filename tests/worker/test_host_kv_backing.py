@@ -133,6 +133,52 @@ def test_pending_d2h_is_stream_dependency_not_cpu_wait(worker):
     assert worker.wait_for_host_blocks(0, "r", 0, (7,), 0)
 
 
+@pytest.mark.parametrize("computed,expected", [(32, ()), (33, (2,))])
+def test_sparse_prefill_restores_only_partial_tail_before_query(
+        worker, monkeypatch, computed, expected):
+    monkeypatch.setattr(module.envs,
+                        "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", True)
+    worker._prefetch_runtime = SimpleNamespace(
+        prediction_state=lambda *args: SimpleNamespace(num_prefix_blocks=2))
+    worker._backing_forward[0, "r"] = (tuple(range(8)), computed,
+                                       computed + 17, True)
+    restored = []
+    worker._restore_backing_blocks = lambda ve, req, layer, table, blocks: (
+        restored.append(tuple(blocks)))
+    worker._restore_live_backing(0, ("r",), 0)
+    assert restored == [expected]
+
+
+def test_backing_restore_reuses_owner_and_does_not_repeat_pending_copy(worker):
+    copied = []
+    worker.wait_for_host_blocks = lambda *args: True
+    worker.copy_host_blocks_to_gpu_async = (
+        lambda ve, req, layer, mapping, blocks: copied.append(mapping.tolist()))
+    table = (3, 4, 5)
+    worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
+    worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
+    assert copied == [[[0, 3], [2, 5]]]
+    worker._mark_gpu_blocks_ready(0, "r", 8, (2,), ((2, 5),))
+    worker._restore_backing_blocks(0, "r", 0, table, (0, 2))
+    assert copied[-1] == [[2, 5]]
+
+
+def test_sparse_backup_includes_unused_gpu_only_prediction(worker):
+    from vllm.core.custom_schedulers.hierarchical_io import activate_sparse_kv_blocks
+    worker._backing_forward[0, "r"] = (tuple(range(3, 103)), 33, 34, True)
+    worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args:
+        SimpleNamespace(predicted_prefix_blocks=(0,)))
+    for block, destination in enumerate((3, 4, 5)):
+        worker._mark_gpu_blocks_ready(0, "r", 0, (block,), ((block, destination),))
+    worker._host_ready_blocks.add((0, "r", 0, 1))
+    copies = []
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, fences: copies.append(mapping.tolist()) or Fence())
+    with activate_sparse_kv_blocks((1,)):
+        worker._back_up_layer(0, ("r",), 0)
+    assert copies == [[[3, 0], [5, 2]]]
+
+
 def test_host_capacity_checked_before_region_allocation(monkeypatch):
     for name in ("VLLM_GRANULEKV_ENABLE", "VLLM_GRANULEKV_HOST_BACKING_ENABLE",
                  "VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE",

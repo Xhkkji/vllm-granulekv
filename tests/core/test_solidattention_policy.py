@@ -18,6 +18,58 @@ def _representatives(num_pages: int = 8) -> torch.Tensor:
     return torch.stack((lower, upper), dim=1)
 
 
+@pytest.mark.parametrize("envelope", [False, True])
+@pytest.mark.parametrize("heads", [2, 8])
+@pytest.mark.parametrize("tokens", [1, 7])
+def test_prefill_scores_are_per_head_chunk_max(envelope, heads, tokens):
+    torch.manual_seed(19)
+    reps = torch.randn(12, 2, 4)
+    if envelope:
+        reps = torch.stack((reps - 1, reps + 1), dim=1)
+    query = torch.randn(tokens, heads, 4)
+    policy = SolidAttentionPolicy(1, 1)
+    expected = torch.stack([policy._score_pages(q, reps) for q in query]).amax(0)
+    torch.testing.assert_close(policy._score_pages(query, reps), expected)
+    policy.register_page_representatives("r", 0, reps)
+    for budget in (1, 12, 32):
+        mask = policy._topk_mask(expected[:, 1:-1],
+                                 torch.arange(1, 11), budget)
+        chosen = (1 + torch.nonzero(mask).flatten()).tolist()
+        padded = policy._select_actual_prefix_fixed(
+            "r", 0, query, 12, budget)
+        assert padded[padded >= 0].tolist() == [0, *chosen, 11]
+
+
+def test_prefill_stable_ties_do_not_select_every_query_union():
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("r", 0, _representatives(12))
+    query = torch.ones(7, 8, 2)
+    selected = policy._select_actual_prefix_fixed("r", 0, query, 12, 2)
+    assert selected[selected >= 0].tolist() == [0, 1, 2, 11]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_resident_prefill_uses_immutable_boundary_and_explicit_control(monkeypatch):
+    from vllm import envs
+    monkeypatch.setattr(envs, "VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", False)
+    policy = SolidAttentionPolicy(1, 1)
+    metadata = dict(_validation_metadata(), prefix_blocks=8)
+    policy.configure_validation("request", "record", metadata)
+    # Blocks 8 and 9 are mandatory history, not selector candidates.
+    key = torch.randn(12, 2, 1, 16, 2, device="cuda")
+    table = torch.arange(12, device="cuda")
+    query = torch.randn(7, 8, 2, device="cuda")
+    monkeypatch.setattr(torch.Tensor, "tolist",
+                        lambda _: pytest.fail("selection used CUDA tolist"))
+    actual = policy.select_prefill_blocks_device(
+        "request", 0, query, key, table, 167, 160, 16, 1)
+    assert actual.prefix_blocks[0] == 0
+    assert actual.prefix_blocks[-1] == 7
+    assert all(block < 8 for block in actual.prefix_blocks)
+    assert actual.attention.count == len(actual.prefix_blocks) + 3
+    assert "default" in policy._selection_control_buffers
+
+
 @pytest.mark.parametrize("budget", [1, 4, 32])
 @pytest.mark.parametrize("heads", [2, 8])
 @pytest.mark.parametrize("tied", [False, True])

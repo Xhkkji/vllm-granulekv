@@ -54,15 +54,24 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
   const at::cuda::OptionalCUDAGuard device_guard(
       src_device.is_cuda() ? src_device : dst_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  // NOTE(woosuk): This can be slow if the number of blocks is large.
   const int64_t num_blocks = block_mapping.size(0);
-  for (size_t i = 0; i < num_blocks; i++) {
+  for (int64_t i = 0; i < num_blocks;) {
     int64_t src_block_number = block_mapping[i][0].item<int64_t>();
     int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
+    int64_t run = 1;
+    // Preserve ordered D2D copies, which may read an earlier copy's output.
+    if (memcpy_type != cudaMemcpyDeviceToDevice) {
+      while (i + run < num_blocks &&
+             block_mapping[i + run][0].item<int64_t>() == src_block_number + run &&
+             block_mapping[i + run][1].item<int64_t>() == dst_block_number + run) {
+        ++run;
+      }
+    }
     int64_t src_offset = src_block_number * block_size_in_bytes;
     int64_t dst_offset = dst_block_number * block_size_in_bytes;
     cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
-                    block_size_in_bytes, memcpy_type, stream);
+                    run * block_size_in_bytes, memcpy_type, stream);
+    i += run;
   }
 }
 

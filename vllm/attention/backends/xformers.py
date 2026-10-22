@@ -1175,7 +1175,39 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 # - attention 计算统一走稳定的 xFormers fallback
                 device_capability = torch.cuda.get_device_capability(
                     query.device)
+                selection = get_active_sparse_kv_device_selection()
+                if selection is not None and (
+                        device_capability >= (8, 0) or self.alibi_slopes is not None):
+                    raise NotImplementedError(
+                        "sparse chunk prefill requires the V100 XFormers path")
                 if device_capability < (8, 0) and self.alibi_slopes is None:
+                    selected_blocks = (get_active_sparse_kv_blocks()
+                                       if selection is not None else None)
+                    policy = get_sparse_kv_policy()
+                    request_ids = get_active_layer_request_ids()
+                    request_id = request_ids[0] if request_ids else "default"
+                    if (selection is None
+                            and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE
+                            and policy.validation_uses_single_token_prefill(request_id)):
+                        layer_index = self._layer_index_from_name(layer.layer_name)
+                        selector = getattr(policy, "select_prefill_blocks_device", None)
+                        if not callable(selector) or prefill_meta.num_prefills != 1:
+                            raise RuntimeError(
+                                "sparse prefill requires one supported policy request")
+                        context_length = prefill_meta.seq_lens[0] - query.shape[0]
+                        actual = selector(
+                            request_id, layer_index, query, key_cache,
+                            prefill_meta.block_tables[0], prefill_meta.seq_lens[0],
+                            context_length, int(value_cache.shape[-1]),
+                            envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)
+                        selection = actual.attention
+                        total_blocks = ((prefill_meta.seq_lens[0]
+                                         + int(value_cache.shape[-1]) - 1)
+                                        // int(value_cache.shape[-1]))
+                        immutable_prefix_blocks = (
+                            total_blocks - selection.count + actual.prefix_count)
+                        selected_blocks = (*actual.prefix_blocks,
+                                           *range(immutable_prefix_blocks, total_blocks))
                     out = self._run_prefix_attention_fallback(
                         layer=layer,
                         query=query,
@@ -1184,7 +1216,21 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                         key_cache=key_cache,
                         value_cache=value_cache,
                         prefill_meta=prefill_meta,
+                        selected_blocks=selected_blocks,
+                        selected_indices=(None if selection is None else
+                                          selection.logical_block_indices),
                     )
+                    if selected_blocks is not None:
+                        layer_index = self._layer_index_from_name(layer.layer_name)
+                        dense_reference = None
+                        if policy.validation_requires_dense_reference(request_id):
+                            dense_reference = self._run_prefix_attention_fallback(
+                                layer, query, key, value, key_cache, value_cache,
+                                prefill_meta)
+                        policy.record_validation_attention(
+                            request_id, layer_index, key_cache, value_cache,
+                            prefill_meta.block_tables, out, dense_reference,
+                            sequence_length=prefill_meta.seq_lens[0])
                 else:
                     # prefix-enabled attention
                     # TODO(Hai) this triton kernel has regression issue (broke)
@@ -1447,6 +1493,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         prefill_meta: XFormersMetadata,
+        selected_blocks: Optional[Tuple[int, ...]] = None,
+        selected_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """绕开不稳定的 prefix kernel，但保留 prefix hit 与 paged KV 语义。"""
         assert prefill_meta.block_tables is not None
@@ -1454,7 +1502,14 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             prefill_meta=prefill_meta,
             device=query.device,
             block_size=int(value_cache.shape[-1]),
+            selected_blocks=selected_blocks,
+            selected_indices=selected_indices,
         )
+        if selected_blocks is not None:
+            record_sparse_kv_attention(
+                (prefill_meta.seq_lens[0] + int(value_cache.shape[-1]) - 1)
+                // int(value_cache.shape[-1]), len(selected_blocks),
+                plan.total_kv_tokens)
 
         workspace = self._get_prefix_fallback_workspace(
             prefill_meta=prefill_meta,
@@ -2787,6 +2842,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         prefill_meta: XFormersMetadata,
         device: torch.device,
         block_size: int,
+        selected_blocks: Optional[Tuple[int, ...]] = None,
+        selected_indices: Optional[torch.Tensor] = None,
     ) -> _XFormersPrefixFallbackPlan:
         """构造并缓存 prefix fallback 的跨层控制面计划。
 
@@ -2826,6 +2883,17 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             context_lens = tuple(
                 int(x) for x in prefill_meta.context_lens_tensor.tolist())
 
+        original_context_len = int(context_lens[0])
+        history_blocks = None
+        if selected_blocks is not None:
+            if prefill_meta.num_prefills != 1 or selected_indices is None:
+                raise ValueError("sparse prefill requires one device selection")
+            history_blocks = tuple(block for block in selected_blocks
+                                   if block * block_size < original_context_len)
+            context_lens = (sum(min(block_size,
+                                    original_context_len - block * block_size)
+                                for block in history_blocks),)
+
         device_key = (device.type, device.index)
         plan_key = (
             device_key,
@@ -2834,6 +2902,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             int(prefill_meta.num_prefills),
             query_lens,
             context_lens,
+            history_blocks,
         )
         cached_plan = prefill_meta._cached_prefix_fallback_plan
         if (cached_plan is not None
@@ -2905,6 +2974,12 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            if history_blocks is not None:
+                token_offsets = (
+                    selected_indices[:len(history_blocks)].to(torch.int32)
+                    .repeat_interleave(block_size) * block_size +
+                    torch.arange(block_size, device=device, dtype=torch.int32)
+                    .repeat(len(history_blocks)))[:single_context_len]
             block_indices = torch.div(
                 token_offsets,
                 int(block_size),
@@ -2923,9 +2998,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
-            # 单请求下，prefix 总是落在 full KV 的起点，因此 full position
-            # 与 token offset 相同。
-            context_full_positions = token_offsets.contiguous()
+            # History is packed before the query, even with logical gaps.
+            context_full_positions = context_compact_positions
         else:
             context_block_ids_list: list[int] = []
             context_block_offsets_list: list[int] = []

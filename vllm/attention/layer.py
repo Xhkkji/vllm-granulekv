@@ -63,7 +63,11 @@ def _observe_decode_query(layer_name: str, attn_metadata: Any,
         return
     if (attn_metadata.num_prefill_tokens != 0
             or attn_metadata.num_decode_tokens != 1):
-        return
+        if not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+                and attn_metadata.num_prefills == 1
+                and attn_metadata.num_decode_tokens == 0):
+            return
     layer_index = _layer_index_from_name(layer_name)
     if layer_index is None:
         return
@@ -72,6 +76,8 @@ def _observe_decode_query(layer_name: str, attn_metadata: Any,
         raise RuntimeError("sparse Quest policy currently supports one request")
     if query.ndim == 2:
         query = query.view(-1, num_heads, head_size)
+    if attn_metadata.num_prefill_tokens:
+        query = query[-1:]
     if query.ndim != 3 or query.shape[0] != 1:
         raise RuntimeError(
             "sparse policy query observation requires one decode token")
@@ -86,15 +92,18 @@ def _correct_decode_sparse_blocks(layer_name: str, attn_metadata: Any,
         return
     if (attn_metadata.num_prefill_tokens != 0
             or attn_metadata.num_decode_tokens != 1):
-        return
+        if not (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and attn_metadata.num_prefills == 1
+                and attn_metadata.num_decode_tokens == 0):
+            return
     layer_index = _layer_index_from_name(layer_name)
     if layer_index is None:
         return
     if query.ndim == 2:
         query = query.view(-1, num_heads, head_size)
-    if query.ndim != 3 or query.shape[0] != 1:
+    if query.ndim != 3 or query.shape[0] < 1:
         raise RuntimeError(
-            "sparse correction requires one decode query token")
+            "sparse correction requires a single request's query tokens")
     correct_local_layer(layer_index, query)
 
 

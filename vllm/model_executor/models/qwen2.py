@@ -381,13 +381,12 @@ class Qwen2Model(nn.Module):
                         hidden_states,
                         residual,
                     )
+                    # Release after compute, while the actual read set is visible.
+                    if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER:
+                        release_local_layer(layer_idx)
             finally:
                 if nvtx_pushed:
                     torch.cuda.nvtx.range_pop()
-            # 只有 layer 正常执行完成才发布消费信号。window 内非末层回调是
-            # no-op；末层会允许后续 GranuleKV unit 覆盖已经不再访问的 HBM region。
-            if envs.VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER:
-                release_local_layer(layer_idx)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

@@ -109,3 +109,101 @@ def test_single_block_swap_layout_detection(monkeypatch, paired):
     PagedAttention.swap_blocks(source, target, torch.tensor([[0, 2]]))
     assert len(calls) == (1 if paired else 2)
     assert calls[0][0] == (1, elements * (2 if paired else 1))
+
+
+@pytest.mark.parametrize("computed,tokens,selected", [
+    (38, 7, (0, 2)), (32, 17, (1,)), (38, 7, (0, 1, 2)),
+])
+@torch.inference_mode()
+def test_sparse_prefill_workspace_reads_only_selected_history(
+        computed, tokens, selected):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from vllm.attention.backends.xformers import XFormersImpl
+
+    torch.manual_seed(27)
+    blocks, size, heads, kv_heads, dim = 8, 16, 8, 2, 32
+    elements = size * kv_heads * dim
+    cache = torch.randn(2 * blocks * elements, device="cuda",
+                        dtype=torch.float16).as_strided(
+                            (2, blocks, elements), (elements, 2 * elements, 1))
+    kc, vc = PagedAttention.split_kv_cache(cache, kv_heads, dim)
+    impl = XFormersImpl.__new__(XFormersImpl)
+    impl.num_heads, impl.num_kv_heads = heads, kv_heads
+    impl.num_queries_per_kv, impl.head_size = heads // kv_heads, dim
+    impl.scale, impl.sliding_window = dim ** -0.5, None
+    table = [5, 1, 7, 2]
+    metadata = SimpleNamespace(
+        num_prefills=1, num_prefill_tokens=tokens,
+        seq_lens=[computed + tokens],
+        context_lens_tensor=torch.tensor([computed], device="cuda",
+                                         dtype=torch.int32),
+        query_start_loc=torch.tensor([0, tokens], device="cuda",
+                                     dtype=torch.int32),
+        block_tables=torch.tensor([table], device="cuda", dtype=torch.int32),
+        _cached_prefix_fallback_plan=None, _cached_prefix_fallback_plan_key=None,
+        _cached_prefix_fallback_workspace=None,
+        _cached_prefix_fallback_workspace_key=None)
+    query = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.float16)
+    key = torch.randn(tokens, kv_heads, dim, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    indices = torch.tensor(selected, device="cuda", dtype=torch.int32)
+    result = impl._run_prefix_attention_fallback(
+        SimpleNamespace(layer_name="model.layers.0.self_attn.attn"),
+        query, key, value, kc, vc, metadata,
+        selected_blocks=selected, selected_indices=indices)
+    history = [t for b in selected for t in range(b * size, min((b + 1) * size,
+                                                               computed))]
+    expected_k = torch.stack([kc[table[t // size], :, :, t % size, :]
+                              .reshape(kv_heads, dim) for t in history])
+    expected_v = torch.stack([vc[table[t // size], :, :, t % size]
+                              for t in history])
+    full_k = torch.cat((expected_k, key)).repeat_interleave(heads // kv_heads, 1)
+    full_v = torch.cat((expected_v, value)).repeat_interleave(heads // kv_heads, 1)
+    scores = torch.einsum("thd,shd->hts", query.float(), full_k.float()) * impl.scale
+    causal = (torch.arange(len(history) + tokens, device="cuda")[None, :]
+              <= len(history) + torch.arange(tokens, device="cuda")[:, None])
+    reference = torch.einsum("hts,shd->thd", scores.masked_fill(
+        ~causal, float("-inf")).softmax(-1), full_v.float())
+    torch.testing.assert_close(result.float(), reference, atol=2e-3, rtol=2e-3)
+    plan = metadata._cached_prefix_fallback_plan
+    assert plan.total_context_tokens == len(history)
+    assert plan.total_kv_tokens == len(history) + tokens
+    assert plan.context_block_ids.tolist() == [table[t // size] for t in history]
+    if len(history) == computed:
+        dense = impl._run_prefix_attention_fallback(
+            SimpleNamespace(layer_name="model.layers.0.self_attn.attn"),
+            query, key, value, kc, vc, metadata)
+        torch.testing.assert_close(result, dense, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("paired", [False, True])
+@torch.inference_mode()
+def test_swap_contiguous_runs_preserve_gaps_and_d2d_order(paired):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    elements, blocks = 8192, 8
+    strides = ((elements, 2 * elements, 1) if paired else
+               (blocks * elements, elements, 1))
+    def cache(device, fill):
+        return torch.full((2 * blocks * elements,), fill, device=device,
+                          dtype=torch.float16).as_strided(
+                              (2, blocks, elements), strides)
+    source, host, target = cache("cuda", -1), cache("cpu", -7), cache("cuda", -9)
+    for b in range(blocks):
+        source[:, b].fill_(b)
+    mapping = torch.tensor([[1, 2], [2, 3], [4, 5], [5, 6]], dtype=torch.int64)
+    PagedAttention.swap_blocks(source, host, mapping)
+    torch.cuda.synchronize()
+    expected = torch.full_like(host, -7)
+    for src, dst in mapping.tolist():
+        expected[:, dst].fill_(src)
+    torch.testing.assert_close(host, expected, atol=0, rtol=0)
+    PagedAttention.swap_blocks(host, target, mapping.flip(1))
+    expected = torch.full_like(target, -9)
+    for src, _ in mapping.tolist():
+        expected[:, src].fill_(src)
+    torch.testing.assert_close(target, expected, atol=0, rtol=0)
+    PagedAttention.swap_blocks(source, source,
+                               torch.tensor([[0, 1], [1, 2]], dtype=torch.int64))
+    assert torch.count_nonzero(source[:, :3]) == 0
