@@ -279,15 +279,19 @@ def test_fixed_shape_cache_isolates_layer_prefix_and_page():
     assert policy._actual_metadata["r", 0] is not old
 
 
-def test_prediction_reuses_only_same_observed_query_and_budget(monkeypatch):
+def test_prediction_reuses_actual_selection_without_retaining_query(monkeypatch):
+    monkeypatch.setattr(
+        'vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE', True)
+    monkeypatch.setattr('vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS', 0)
     policy = SolidAttentionPolicy(1, 1)
     policy.register_page_representatives("r", 0, _representatives())
     query = torch.ones(2, 2)
-    policy._actual_predictions["r", 0] = (8, 2, (0, 2, 7), query)
+    policy._actual_predictions["r", 0] = (8, 2, (0, 2, 7))
     policy.observe_query("r", 0, query)
-    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    assert "r" not in policy._previous_queries
     assert policy.predict_restore_blocks("r", 0, 8, 2) == (0, 2, 7)
-    policy.observe_query("r", 0, query.clone())
+    assert policy.predict_restore_blocks("r", 0, 8, 3) is None
+    policy.register_page_representatives("r", 0, _representatives())
     assert ("r", 0) not in policy._actual_predictions
 
 
@@ -341,30 +345,58 @@ def test_shared_history_metadata_stays_on_gpu_across_requests():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_partial_prefix_prediction_keeps_immutable_boundary_and_gpu_scoring(monkeypatch):
+def test_partial_prefix_prediction_reuses_only_complete_actual_history(monkeypatch):
     monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", True)
     monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
     torch.manual_seed(37)
     policy = SolidAttentionPolicy(1, 1)
     reps = torch.randn(12, 2, 2, 2)
     query = torch.randn(2, 2, device="cuda")
-    expected = tuple(policy._select_prefix_with_logical_indices(
-        query.cpu(), reps, tuple(range(12)), 12, 2).tolist())
     policy.register_page_representatives("page", 0, reps)
     policy.bind_page_index_key("r", "page")
-    policy.select_actual_blocks_device("r", 0, query, 12, 191, 192, 16, 2)
-    assert ("r", 0) not in policy._actual_predictions
+    actual = policy.select_actual_blocks_device("r", 0, query, 12, 191, 192, 16, 2)
     policy.observe_query("r", 0, query)
-    score = policy._score_pages
-    calls = []
-    def gpu_score(q, pages):
-        assert q.is_cuda and pages.device == q.device
-        calls.append(pages.shape[0])
-        return score(q, pages)
-    monkeypatch.setattr(policy, "_score_pages", gpu_score)
+    monkeypatch.setattr(policy, "_score_pages", lambda *a: pytest.fail("duplicate scoring"))
     monkeypatch.setattr(torch, "nonzero", lambda *a, **kw: pytest.fail("dynamic shape sync"))
-    assert policy.predict_restore_blocks("r", 0, 12, 2) == expected
-    assert calls == [10]
+    assert policy.predict_restore_blocks("r", 0, 12, 2) == tuple(
+        block for block in actual.history_blocks if block < 11)
+    assert actual.history_blocks[-1] == 11
+
+
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_chunk_feedback_uses_actual_immutable_subset_and_cleans_up(monkeypatch, tokens):
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", True)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("page", 0, _representatives(12))
+    policy.bind_page_index_key("r", "page")
+    assert policy.predict_restore_blocks("r", 0, 8, 2) is None
+    policy._representatives["r"][0] = (12, _representatives(12))
+    query = torch.randn(tokens, 2, 2)
+    actual = policy.select_actual_blocks_device("r", 0, query, 8, 192, 192 + tokens, 16, 2)
+    policy.observe_query("r", 0, query[-1:])
+    monkeypatch.setattr(policy, "_score_pages", lambda *a: pytest.fail("duplicate scoring"))
+    assert policy.predict_restore_blocks("r", 0, 8, 2) == tuple(
+        block for block in actual.history_blocks if block < 8)
+    assert "r" not in policy._previous_queries
+    policy.discard("r")
+    assert policy.predict_restore_blocks("r", 0, 8, 2) is None
+
+
+def test_empty_actual_prediction_is_valid_feedback(monkeypatch):
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE", True)
+    monkeypatch.setattr("vllm.envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS", 0)
+    policy = SolidAttentionPolicy(0, 0)
+    configure_sparse_kv_policy(policy)
+    try:
+        register_sparse_restore_context("empty", "prefix", 4, (0, 1))
+        assert build_sparse_restore_plan_feedback("empty", 1) is None
+        policy._actual_predictions["empty", 0] = (4, 1, ())
+        feedback = build_sparse_restore_plan_feedback("empty", 1)
+        assert feedback.block_indices_by_layer == ((),)
+    finally:
+        discard_sparse_restore_context(("empty",))
+        configure_sparse_kv_policy(None)
 
 
 def test_solidattention_cpu_warmup_and_fixed_blocks():

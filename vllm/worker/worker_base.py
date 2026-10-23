@@ -515,9 +515,12 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 item = build_sparse_restore_plan_feedback(
                     str(request_id), envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)
                 if item is not None:
+                    # Host-backed requests update their existing live plan;
+                    # their last chunk is not a prediction for another request.
+                    if (update_prediction is not None
+                            and update_prediction(str(request_id), item)):
+                        continue
                     feedback.append(item)
-                    if update_prediction is not None:
-                        update_prediction(str(request_id), item)
             if feedback:
                 for item in output:
                     item.sparse_kv_plan_feedback = tuple(feedback)

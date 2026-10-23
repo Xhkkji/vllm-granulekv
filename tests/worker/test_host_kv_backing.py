@@ -71,6 +71,28 @@ def test_host_ready_only_after_latest_d2h_completes(worker):
     assert not worker._pending_gpu_to_host
 
 
+def test_backing_feedback_is_consumed_locally_including_empty_layers(worker):
+    updates = []
+    worker._prefetch_runtime = SimpleNamespace(residency=SimpleNamespace(
+        update_prediction=lambda *args: updates.append(args)))
+    feedback = SimpleNamespace(num_prefix_blocks=4, block_indices_by_layer=((), (0, 2)))
+    assert worker.update_sparse_restore_prediction("r", feedback)
+    assert updates == [("r", 4, ((), (0, 2)))]
+
+
+def test_layer_release_submits_next_read_before_backup_with_one_event(worker, monkeypatch):
+    order = []
+    event = Fence()
+    event.record = lambda stream: order.append("release")
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kw: event)
+    worker._prefetch_next_layer = lambda ve, requests, layer: order.append(("prefetch", layer))
+    worker._back_up_layer = lambda ve, requests, layer, released: (
+        order.append(("backup", layer, released)))
+    worker._release_hierarchical_layer(0, ("r",), 3)
+    assert order == ["release", ("prefetch", 4), ("backup", 3, event)]
+    assert worker._host_stats["layer_release_event_record_count"] == 1
+
+
 def test_retired_request_cannot_publish_host_backing(worker):
     key = (0, "r", 0, 7)
     worker._pending_gpu_to_host[key] = Fence(True)
@@ -117,7 +139,7 @@ def test_prefetch_finish_retains_dma_and_counts_consumption_once(worker, consume
     worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
         lambda *args: event)
     worker.copy_host_blocks_to_gpu_async(
-        0, "r", 0, torch.tensor([[0, 3]]), (0,), reason="prefetch")
+        0, "r", 0, ((0, 3),), reason="prefetch")
     if consume:
         worker._consume_host_copies(0, "r", 0, (0,))
         worker._consume_host_copies(0, "r", 0, (0,))
@@ -164,7 +186,7 @@ def test_back_up_only_gpu_only_and_dirty_tail(worker):
     ready = Fence()
     worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
         lambda layer, mapping, fences: copies.append(mapping.tolist()) or ready)
-    worker._back_up_layer(0, ("r",), 0)
+    worker._back_up_layer(0, ("r",), 0, Fence())
     assert copies == [[[3, 0], [5, 2]]]
     assert worker._pending_gpu_to_host[0, "r", 0, 0] is ready
     assert (0, "r", 0, 2) not in worker._host_ready_blocks
@@ -274,7 +296,7 @@ def test_h2d_submit_does_not_wait_and_consumer_waits_only_selected(worker, monke
     release = Fence()
     worker._gpu_region_release_events[0, 1, 3] = ("r", release)
     worker.copy_host_blocks_to_gpu_async(
-        0, "r", 1, torch.tensor([[0, 3], [2, 5]]), (0, 2), reason="prefetch")
+        0, "r", 1, ((0, 3), (2, 5)), reason="prefetch")
     assert waits == []
     assert submitted == [(1, [[0, 3], [2, 5]], [release])]
     assert worker.gpu_blocks_ready(0, "r", 1, (0, 2)) == ()
@@ -307,15 +329,15 @@ def test_prefetch_only_ready_missing_complete_prefix_and_pending_dedup(worker):
 
 def test_h2d_rejects_current_chunk_and_wrong_destination(worker):
     worker._backing_forward[0, "r"] = ((3, 4, 5), 32, 48, True)
-    for mapping, logical in (([[2, 5]], (2,)), ([[0, 5]], (0,))):
+    for mapping in (((2, 5),), ((0, 5),), ((-1, 5),)):
         with pytest.raises(RuntimeError, match="outside historical"):
-            worker.copy_host_blocks_to_gpu_async(0, "r", 0, torch.tensor(mapping), logical)
+            worker.copy_host_blocks_to_gpu_async(0, "r", 0, mapping)
 
 
 def test_pending_copy_with_wrong_physical_owner_is_rejected(worker):
     worker._backing_forward[0, "r"] = ((3,), 16, 17, False)
     worker.cache_engine[0].copy_host_blocks_to_gpu_async = lambda *args: Fence()
-    worker.copy_host_blocks_to_gpu_async(0, "r", 0, torch.tensor([[0, 3]]), (0,))
+    worker.copy_host_blocks_to_gpu_async(0, "r", 0, ((0, 3),))
     worker._gpu_destination_owners[0, 0, 3] = (0, "other", 0, 0)
     with pytest.raises(RuntimeError, match="physical owner"):
         worker._consume_host_copies(0, "r", 0, (0,))
@@ -356,7 +378,7 @@ def test_sparse_backup_includes_unused_gpu_only_prediction(worker):
     worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
         lambda layer, mapping, fences: copies.append(mapping.tolist()) or Fence())
     with activate_sparse_kv_blocks((1,)):
-        worker._back_up_layer(0, ("r",), 0)
+        worker._back_up_layer(0, ("r",), 0, Fence())
     assert copies == [[[3, 0], [5, 2]]]
 
 

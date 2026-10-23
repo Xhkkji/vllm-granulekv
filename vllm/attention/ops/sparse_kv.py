@@ -45,6 +45,10 @@ _SPARSE_STATS: dict[str, float | int] = {
     "actual_selection_ms": 0.0,
     "selection_d2h_wait_ms": 0.0,
     "selection_tolist_calls": 0,
+    "selection_score_calls": 0,
+    "prediction_feedback_reuses": 0,
+    "prediction_feedback_rescores": 0,
+    "prediction_feedback_ms": 0.0,
     "correction_requests": 0,
     "correction_blocks": 0,
     "correction_fragments": 0,
@@ -197,6 +201,10 @@ def record_sparse_kv_selection_d2h_wait(elapsed_ms: float) -> None:
 def record_sparse_kv_selection_tolist_call() -> None:
     """Count the legacy implicit GPU-to-CPU selection conversion."""
     _SPARSE_STATS["selection_tolist_calls"] += 1
+
+
+def record_sparse_kv_policy_work(name: str, value: float = 1) -> None:
+    _SPARSE_STATS[name] += value
 
 
 def record_sparse_kv_correction(

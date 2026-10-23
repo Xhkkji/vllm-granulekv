@@ -178,8 +178,9 @@ def test_sparse_prefill_workspace_reads_only_selected_history(
 
 
 @pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("strided_mapping", [False, True])
 @torch.inference_mode()
-def test_swap_contiguous_runs_preserve_gaps_and_d2d_order(paired):
+def test_swap_contiguous_runs_preserve_gaps_and_d2d_order(paired, strided_mapping):
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     elements, blocks = 8192, 8
@@ -193,6 +194,11 @@ def test_swap_contiguous_runs_preserve_gaps_and_d2d_order(paired):
     for b in range(blocks):
         source[:, b].fill_(b)
     mapping = torch.tensor([[1, 2], [2, 3], [4, 5], [5, 6]], dtype=torch.int64)
+    if strided_mapping:
+        padded = torch.full((8, 4), -99, dtype=torch.int64)
+        padded[::2, ::2] = mapping
+        mapping = padded[::2, ::2]
+        assert mapping.stride() == (8, 2)
     PagedAttention.swap_blocks(source, host, mapping)
     torch.cuda.synchronize()
     expected = torch.full_like(host, -7)
@@ -207,3 +213,16 @@ def test_swap_contiguous_runs_preserve_gaps_and_d2d_order(paired):
     PagedAttention.swap_blocks(source, source,
                                torch.tensor([[0, 1], [1, 2]], dtype=torch.int64))
     assert torch.count_nonzero(source[:, :3]) == 0
+
+
+@pytest.mark.parametrize("mapping", [torch.zeros(2, dtype=torch.int64),
+                                   torch.zeros(2, 3, dtype=torch.int64),
+                                   torch.zeros(2, 2, dtype=torch.int32)])
+def test_swap_rejects_invalid_cpu_mapping(mapping):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from vllm import _custom_ops as ops
+    source = torch.zeros(4, 8)
+    target = torch.zeros(4, 8, device="cuda")
+    with pytest.raises(RuntimeError, match="block_mapping"):
+        ops.swap_blocks(source, target, mapping)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import time
 from dataclasses import dataclass, field
 from contextvars import ContextVar
 from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
@@ -120,26 +121,32 @@ def build_sparse_restore_plan_feedback(
     block_budget: int,
 ) -> Optional[SparseKVPlanFeedback]:
     """Build a future restore plan from the policy's current history."""
+    from vllm.attention.ops.sparse_kv import record_sparse_kv_policy_work
+
     policy = get_sparse_kv_policy()
     context = _SPARSE_RESTORE_CONTEXTS.get(request_id)
     predictor = (None if policy is None else
                  getattr(policy, "predict_restore_blocks", None))
     if context is None or not callable(predictor):
         return None
+    started = time.perf_counter()
     selections = []
     for layer_index in sorted(context.layers):
         selection = predictor(request_id, layer_index,
                               context.num_prefix_blocks, block_budget)
         if selection is None:
             return None
-        normalized = tuple(sorted(set(int(index) for index in selection)))
-        if (not normalized
-                or normalized[0] < 0
-                or normalized[-1] >= context.num_prefix_blocks):
+        normalized = tuple(selection)
+        if any(left >= right for left, right in zip(normalized, normalized[1:])):
+            raise RuntimeError("sparse restore prediction must be sorted and unique")
+        if normalized and (normalized[0] < 0
+                           or normalized[-1] >= context.num_prefix_blocks):
             raise RuntimeError("sparse restore prediction is outside prefix")
         selections.append(normalized)
     if not selections:
         return None
+    record_sparse_kv_policy_work(
+        "prediction_feedback_ms", (time.perf_counter() - started) * 1000)
     return SparseKVPlanFeedback(
         page_index_key=context.page_index_key,
         num_layers=len(selections),

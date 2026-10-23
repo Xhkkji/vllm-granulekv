@@ -17,7 +17,7 @@ from vllm.attention.ops.sparse_kv import (
     build_page_representatives_from_paged_key_cache, )
 from vllm.attention.ops.sparse_kv import (
     record_sparse_kv_selection, record_sparse_kv_selection_d2h_wait,
-    record_sparse_kv_selection_tolist_call)
+    record_sparse_kv_selection_tolist_call, record_sparse_kv_policy_work)
 from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
     SparseKVActualSelection, )
 
@@ -728,6 +728,7 @@ class SolidAttentionPolicy:
     def _score_pages(query: torch.Tensor,
                      representatives: torch.Tensor) -> torch.Tensor:
         """Score pages using the representative envelope without host copies."""
+        record_sparse_kv_policy_work("selection_score_calls")
         if query.ndim == 3 and query.shape[0] > 1:
             tokens, heads, dim = query.shape
             if representatives.ndim not in (3, 4):
@@ -1056,16 +1057,12 @@ class SolidAttentionPolicy:
 
     def observe_query(self, request_id: str, layer_index: int,
                       query: torch.Tensor) -> None:
+        if (envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
+                and envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS == 0
+                and (request_id, layer_index) in self._actual_predictions):
+            return
         query = self._normalize_query(query)
-        history = query.detach().clone()
-        self._previous_queries[request_id][layer_index] = history
-        key = (request_id, layer_index)
-        cached = self._actual_predictions.get(key)
-        if cached is not None:
-            if cached[3].data_ptr() == query.data_ptr():
-                self._actual_predictions[key] = (*cached[:3], history)
-            else:
-                self._actual_predictions.pop(key)
+        self._previous_queries[request_id][layer_index] = query.detach().clone()
 
     def register_page_representatives(
         self,
@@ -1385,11 +1382,14 @@ class SolidAttentionPolicy:
         history_blocks = self._selection_indices_to_host(
             selected_history, control_copy=True)
         selected_history = selected_history[:len(history_blocks)]
-        if (validation is None and complete == num_prefix_blocks
-                and (query.ndim != 3 or query.shape[0] == 1)):
+        if envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
+            # Feedback is published after the forward, never during this layer.
+            # Keep the chunk's actual immutable read set without rescoring its
+            # last Query or filling the budget with speculative blocks.
             self._actual_predictions[request_id, layer_index] = (
-                num_prefix_blocks, block_budget, history_blocks,
-                self._normalize_query(query))
+                num_prefix_blocks, block_budget,
+                tuple(block for block in history_blocks
+                      if block < num_prefix_blocks))
         current = torch.arange(complete, num_blocks, dtype=torch.long,
                                device=query.device)
         selected = torch.cat((selected_history, current))
@@ -1440,20 +1440,24 @@ class SolidAttentionPolicy:
     def predict_restore_blocks(self, request_id: str, layer_index: int,
                                num_prefix_blocks: int,
                                block_budget: int) -> Optional[Tuple[int, ...]]:
-        history = self._previous_queries.get(request_id, {}).get(layer_index)
-        if history is None:
-            return None
         guard_blocks = envs.VLLM_GRANULEKV_SPARSE_PREDICTION_GUARD_BLOCKS
         if guard_blocks < 0:
             raise ValueError("prediction guard blocks must be non-negative")
         cached = self._actual_predictions.get((request_id, layer_index))
-        if (cached is not None and cached[:2] == (num_prefix_blocks, block_budget)
-                and guard_blocks == 0 and cached[3] is history):
+        if (envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
+                and cached is not None
+                and cached[:2] == (num_prefix_blocks, block_budget)
+                and guard_blocks == 0):
+            record_sparse_kv_policy_work("prediction_feedback_reuses")
             return cached[2]
+        history = self._previous_queries.get(request_id, {}).get(layer_index)
+        if history is None:
+            return None
         metadata = self._get_prediction_representatives(
             request_id, layer_index, num_prefix_blocks, device=history.device)
         if metadata is None:
             return None
+        record_sparse_kv_policy_work("prediction_feedback_rescores")
         if (history.is_cuda
                 and envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE):
             selected = self._select_actual_prefix_fixed(

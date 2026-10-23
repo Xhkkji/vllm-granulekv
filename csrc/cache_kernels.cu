@@ -39,10 +39,11 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
     TORCH_CHECK(false, "Invalid device combination");
   }
 
-  // NOTE(youkaichao): keep in mind that `block_mapping` should be
-  // a cpu tensor, otherwise every `item` call will require a gpu-cpu
-  // synchronization.
   TORCH_CHECK(block_mapping.device().is_cpu(), "block_mapping must be on CPU");
+  TORCH_CHECK(block_mapping.scalar_type() == at::kLong &&
+                  block_mapping.dim() == 2 && block_mapping.size(1) == 2,
+              "block_mapping must be an int64 tensor with shape [N, 2]");
+  const auto mapping = block_mapping.accessor<int64_t, 2>();
 
   char* src_ptr = static_cast<char*>(src.data_ptr());
   char* dst_ptr = static_cast<char*>(dst.data_ptr());
@@ -56,14 +57,14 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int64_t num_blocks = block_mapping.size(0);
   for (int64_t i = 0; i < num_blocks;) {
-    int64_t src_block_number = block_mapping[i][0].item<int64_t>();
-    int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
+    int64_t src_block_number = mapping[i][0];
+    int64_t dst_block_number = mapping[i][1];
     int64_t run = 1;
     // Preserve ordered D2D copies, which may read an earlier copy's output.
     if (memcpy_type != cudaMemcpyDeviceToDevice) {
       while (i + run < num_blocks &&
-             block_mapping[i + run][0].item<int64_t>() == src_block_number + run &&
-             block_mapping[i + run][1].item<int64_t>() == dst_block_number + run) {
+             mapping[i + run][0] == src_block_number + run &&
+             mapping[i + run][1] == dst_block_number + run) {
         ++run;
       }
     }

@@ -154,6 +154,8 @@ class Worker(LocalOrDistributedWorkerBase):
             "cpu_to_gpu_bytes": 0,
             "host_buffer_cuda_pinned": 0,
             "host_gpu_submit_count": 0,
+            "host_gpu_submit_ms": 0.0,
+            "gpu_to_host_submit_ms": 0.0,
             "host_gpu_copy_blocks": 0,
             "host_gpu_copy_bytes": 0,
             "host_gpu_prefetch_blocks": 0,
@@ -958,7 +960,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 if owner[0] == virtual_engine and owner not in pending_owners)
 
     def _back_up_layer(self, virtual_engine: int, request_ids: Tuple[str, ...],
-                       layer_index: int) -> None:
+                       layer_index: int, released: object) -> None:
         """Preserve GPU-only and newly computed KV before physical reuse."""
         cache_engine = self.cache_engine[virtual_engine]
         self._poll_gpu_to_host_backing(virtual_engine)
@@ -994,9 +996,6 @@ class Worker(LocalOrDistributedWorkerBase):
                     candidates[key] = destination
             if not candidates:
                 continue
-            released = torch.cuda.Event(blocking=False, interprocess=False)
-            released.record(torch.cuda.current_stream())
-            self._host_stats["layer_release_event_record_count"] += 1
             to_copy = {key: destination for key, destination in candidates.items()
                        if key[3] in dirty or (
                            key not in self._host_staged_blocks
@@ -1019,8 +1018,11 @@ class Worker(LocalOrDistributedWorkerBase):
             mapping = torch.tensor(
                 [(destination, key[3]) for key, destination in to_copy.items()],
                 dtype=torch.int64, device="cpu")
+            submit_started = time.perf_counter()
             ready = cache_engine.copy_gpu_blocks_to_host_async(
                 layer_index, mapping, (released,))
+            self._host_stats["gpu_to_host_submit_ms"] += (
+                time.perf_counter() - submit_started) * 1000
             block_bytes = (CacheEngine.get_cache_block_size(
                 self.cache_config, self.model_config, self.parallel_config)
                            // cache_engine.num_attention_layers)
@@ -1502,20 +1504,18 @@ class Worker(LocalOrDistributedWorkerBase):
             virtual_engine: int,
             seq_group_id: str,
             layer_index: int,
-            mapping: torch.Tensor,
-            logical_blocks: Sequence[int],
+            pairs: Sequence[Tuple[int, int]],
             *,
             reason: str = "actual",
     ) -> object:
         """Submit KV copies; consumers explicitly arm their ready dependency."""
+        submit_started = time.perf_counter()
         cache_engine = self.cache_engine[virtual_engine]
-        pairs = mapping.tolist()
-        if len(pairs) != len(logical_blocks):
-            raise RuntimeError("host copy mapping and logical blocks differ")
+        logical_blocks = tuple(source for source, _ in pairs)
         forward = self._backing_forward.get((virtual_engine, seq_group_id)) if (
             envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE) else None
-        for logical, (source, destination) in zip(logical_blocks, pairs):
-            if source != logical or (forward is not None and (
+        for logical, destination in pairs:
+            if logical < 0 or (forward is not None and (
                     logical * self.cache_config.block_size >= forward[1]
                     or forward[0][logical] != destination)):
                 raise RuntimeError("host copy is outside historical read mapping")
@@ -1532,15 +1532,16 @@ class Worker(LocalOrDistributedWorkerBase):
                     and id(release_event) not in seen_events):
                 release_events.append(release_event)
                 seen_events.add(id(release_event))
+        mapping = torch.tensor(pairs, dtype=torch.int64, device="cpu").view(-1, 2)
         ready_event = cache_engine.copy_host_blocks_to_gpu_async(
             layer_index, mapping, release_events)
         self._host_stats["host_gpu_submit_count"] += 1
-        self._host_stats["host_gpu_copy_blocks"] += int(mapping.shape[0])
+        self._host_stats["host_gpu_copy_blocks"] += len(pairs)
         block_bytes = (CacheEngine.get_cache_block_size(
             self.cache_config, self.model_config, self.parallel_config) //
                        cache_engine.num_attention_layers)
         self._host_stats["host_gpu_copy_bytes"] += (
-            int(mapping.shape[0]) * block_bytes)
+            len(pairs) * block_bytes)
         self._host_stats["host_gpu_ready_events"] += 1
         for logical_block, (_, destination) in zip(logical_blocks, pairs):
             key = (virtual_engine, seq_group_id, layer_index, int(logical_block))
@@ -1558,6 +1559,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._gpu_region_release_events[self._gpu_slot_key(
                     virtual_engine, layer_index, destination)] = (
                         seq_group_id, ready_event)
+        self._host_stats["host_gpu_submit_ms"] += (
+            time.perf_counter() - submit_started) * 1000
         return ready_event
 
     def _consume_host_copies(self, virtual_engine: int, request_id: str,
@@ -1588,10 +1591,12 @@ class Worker(LocalOrDistributedWorkerBase):
         self._mark_gpu_blocks_ready(virtual_engine, request_id, layer_index,
                                    ready_blocks, mapping)
 
-    def update_sparse_restore_prediction(self, request_id: str, feedback) -> None:
+    def update_sparse_restore_prediction(self, request_id: str, feedback) -> bool:
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
             self._prefetch_runtime.residency.update_prediction(
                 request_id, feedback.num_prefix_blocks, feedback.block_indices_by_layer)
+            return True
+        return False
 
     def _prefetch_next_layer(self, virtual_engine: int, request_ids: Tuple[str, ...],
                              layer_index: int) -> None:
@@ -1617,10 +1622,9 @@ class Worker(LocalOrDistributedWorkerBase):
                        and (virtual_engine, state.seq_group_id, layer_index, block)
                        in self._host_ready_blocks)
         if blocks:
-            mapping = torch.tensor([(block, table[block]) for block in blocks],
-                                   device="cpu", dtype=torch.int64)
+            mapping = tuple((block, table[block]) for block in blocks)
             self.copy_host_blocks_to_gpu_async(
-                virtual_engine, state.seq_group_id, layer_index, mapping, blocks,
+                virtual_engine, state.seq_group_id, layer_index, mapping,
                 reason="prefetch")
 
     def _forget_host_staging(self, virtual_engine: int,
@@ -1832,15 +1836,13 @@ class Worker(LocalOrDistributedWorkerBase):
                     self._host_stats["cpu_to_gpu_blocks"] += len(ready_blocks)
                     self._host_stats["cpu_to_gpu_bytes"] += (
                         len(ready_blocks) * layer_block_bytes)
-                    host_to_gpu = torch.tensor(
-                        [(block,
-                          state.correction_mapping_by_logical[block][1])
-                         for block in ready_blocks],
-                        device="cpu", dtype=torch.int64).view(-1, 2)
+                    host_to_gpu = tuple(
+                        (block, state.correction_mapping_by_logical[block][1])
+                        for block in ready_blocks)
                     if envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
                         self.copy_host_blocks_to_gpu_async(
                             virtual_engine, state.seq_group_id, layer_index,
-                            host_to_gpu, ready_blocks)
+                            host_to_gpu)
                         self._consume_host_copies(virtual_engine, state.seq_group_id,
                                                   layer_index, ready_blocks)
                     else:
@@ -1850,14 +1852,12 @@ class Worker(LocalOrDistributedWorkerBase):
                                     virtual_engine, layer_index,
                                     state.correction_mapping_by_logical[block][1])
                         self.copy_host_blocks_to_gpu(
-                            virtual_engine, layer_index, host_to_gpu)
+                            virtual_engine, layer_index, torch.tensor(
+                                host_to_gpu, device="cpu", dtype=torch.int64).view(-1, 2))
                     if reuse_gpu_residency and not envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
                         self._mark_gpu_blocks_ready(
                             virtual_engine, state.seq_group_id, layer_index,
-                            ready_blocks, tuple(
-                                (block,
-                                 state.correction_mapping_by_logical[block][1])
-                                for block in ready_blocks))
+                            ready_blocks, host_to_gpu)
                     self._prefetch_runtime.mark_host_resident(
                         state, layer_index, ready_blocks)
                     resident_blocks.update(ready_blocks)
@@ -1961,8 +1961,6 @@ class Worker(LocalOrDistributedWorkerBase):
                                 // self.cache_config.block_size)))
             working_set = tuple(sorted(set(actual_prefix).union(
                 range(state.num_prefix_blocks, current_blocks))))
-        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
-            self._prefetch_next_layer(virtual_engine, request_ids, layer_index + 1)
         return SparseKVLayerSelection(
             block_indices=working_set,
             device_selection=device_selection,
@@ -1977,7 +1975,13 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> None:
         """模型消费完 window 后，把对应环形 KV region 标记为可覆盖。"""
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
-            self._back_up_layer(virtual_engine, request_ids, layer_index)
+            released = torch.cuda.Event(blocking=False, interprocess=False)
+            released.record(torch.cuda.current_stream())
+            self._host_stats["layer_release_event_record_count"] += 1
+            # The decoder layer has submitted attention and MLP compute.
+            # Queue the next read before this layer's release-dependent backup.
+            self._prefetch_next_layer(virtual_engine, request_ids, layer_index + 1)
+            self._back_up_layer(virtual_engine, request_ids, layer_index, released)
             # The rolling runtime owns the initial SSD restore only.  From
             # here on physical fences and CPU backing own slot reuse; do not
             # mark the restore template as a one-forward-only eviction.
@@ -2083,7 +2087,7 @@ class Worker(LocalOrDistributedWorkerBase):
         mapping = tuple((block, table[block]) for block in missing)
         self.copy_host_blocks_to_gpu_async(
             virtual_engine, request_id, layer_index,
-            torch.tensor(mapping, dtype=torch.int64, device="cpu"), missing,
+            mapping,
             reason=reason)
         self._consume_host_copies(virtual_engine, request_id, layer_index, missing)
         self._host_stats["host_backing_hits"] += len(missing)
