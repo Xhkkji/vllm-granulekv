@@ -5,7 +5,8 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
-from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+from vllm.core.block.prefix_caching_block import (PrefixCachingBlock,
+                                                 PrefixCachingBlockAllocator)
 from vllm.platforms import current_platform
 from vllm.utils import Device
 
@@ -122,6 +123,17 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             self._null_block = NullBlock(
                 self.allocate_mutable_block(None, Device.GPU))
         return self._null_block
+
+    def create_logical_block(self, prev_block: Optional[Block],
+                             token_ids: List[int], block_size: int,
+                             extra_hash: Optional[int] = None) -> Block:
+        """Build a content-chain entry without reserving CPU or GPU storage."""
+        block = PrefixCachingBlock(
+            prev_block, token_ids, block_size, self._allocators[Device.GPU],
+            extra_hash=extra_hash)
+        # Evaluate incrementally so long chains never recurse through history.
+        _ = block.content_hash
+        return block
 
     def allocate_mutable_block(self,
                                prev_block: Optional[Block],

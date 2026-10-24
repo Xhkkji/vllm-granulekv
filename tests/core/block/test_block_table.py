@@ -7,6 +7,42 @@ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.utils import Device, cdiv, chunk_list
 
 
+def test_logical_history_does_not_allocate_physical_blocks():
+    allocator = CpuGpuBlockAllocator.create(
+        allocator_type="prefix_caching", num_gpu_blocks=4,
+        num_cpu_blocks=32, block_size=16)
+    table = BlockTable(16, allocator, logical_only=True)
+    table.allocate(list(range(255)))
+    assert len(table.blocks) == 16
+    assert table.physical_block_ids == [-1] * 16
+    assert allocator.get_num_free_blocks(Device.GPU) == 4
+    assert allocator.get_num_free_blocks(Device.CPU) == 32
+    table.append_token_ids([255, 256])
+    assert table.num_full_slots == 257
+    assert table.blocks[15].content_hash is not None
+    assert table.blocks[16].prev_block is table.blocks[15]
+    assert table.physical_block_ids == [-1] * 17
+    table.free()
+    assert allocator.get_num_free_blocks(Device.GPU) == 4
+    assert allocator.get_num_free_blocks(Device.CPU) == 32
+
+
+def test_128k_logical_chain_hashes_without_gpu_allocation():
+    allocator = CpuGpuBlockAllocator.create(
+        allocator_type="prefix_caching", num_gpu_blocks=4,
+        num_cpu_blocks=32, block_size=16)
+    table = BlockTable(16, allocator, logical_only=True)
+    table.allocate(list(range(131071)))
+    table.append_token_ids([131071, 131072])
+    assert len(table.blocks) == 8193
+    assert table.blocks[8191].content_hash is not None
+    assert table.blocks[8192].content_hash is None
+    assert allocator.get_num_free_blocks(Device.GPU) == 4
+    with pytest.raises(ValueError, match="one sequence"):
+        table.fork()
+    table.free()
+
+
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("sequence_len", [1, 16, 129])
 def test_allocate_naive(block_size: int, sequence_len: int):

@@ -459,7 +459,11 @@ class LLMEngine:
             num_gpu_blocks = num_gpu_blocks_override
 
         working_set_regions = get_layer_working_set_regions()
-        if working_set_regions:
+        from vllm.core.custom_schedulers.hierarchical_io.plan import uses_bounded_gpu_slots
+        if uses_bounded_gpu_slots():
+            if num_gpu_blocks > profiled_num_gpu_blocks:
+                raise ValueError("bounded GPU slot budget exceeds profiled capacity")
+        elif working_set_regions:
             if self.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError(
                     "layer working-set validation currently requires PP=1")
@@ -1387,18 +1391,20 @@ class LLMEngine:
         getattr(scheduler, "complete_ready_async_kv_transfers")()
 
     def _submit_async_kv_scheduler_transfers(self,
-                                             virtual_engine: int) -> None:
+                                             virtual_engine: int,
+                                             finished_request_ids=()) -> None:
         """把下一笔 queued read/write 非阻塞提交给 Worker。"""
         scheduler = self.scheduler[virtual_engine]
         drain = getattr(scheduler, "drain_async_kv_transfers_to_submit", None)
         if drain is None:
             return
         requests = drain()
-        if not requests:
+        if not requests and not finished_request_ids:
             return
 
         worker_results = self.model_executor.collective_rpc(
-            "submit_async_kv_transfers", args=(virtual_engine, requests))
+            "submit_async_kv_transfers",
+            args=(virtual_engine, requests, finished_request_ids))
         events = self._merge_async_kv_worker_events(worker_results)
         apply_event = getattr(scheduler, "apply_async_kv_event")
         for event in events:
@@ -1529,7 +1535,9 @@ class LLMEngine:
         # 选中的 B/C 可以继续进入下面的 execute_model，实现 I/O-compute
         # overlap。若当前没有计算 batch，submit 仍会发生，Engine 下一轮会
         # 依靠 loading 状态继续 poll。
-        self._submit_async_kv_scheduler_transfers(virtual_engine)
+        self._submit_async_kv_scheduler_transfers(
+            virtual_engine, finished_requests_ids if
+            envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE else ())
 
         if not scheduler_outputs.is_empty():
 

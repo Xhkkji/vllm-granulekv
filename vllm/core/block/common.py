@@ -235,20 +235,22 @@ class BlockList:
     list on every iteration of the block manager
     """
 
-    def __init__(self, blocks: List[Block]):
+    def __init__(self, blocks: List[Block], logical_only: bool = False):
         self._blocks: List[Block] = []
         self._block_ids: List[int] = []
+        self._logical_only = logical_only
 
         self.update(blocks)
 
     def _add_block_id(self, block_id: Optional[BlockId]) -> None:
-        assert block_id is not None
-        self._block_ids.append(block_id)
+        assert block_id is not None or self._logical_only
+        self._block_ids.append(-1 if block_id is None else block_id)
 
     def _update_block_id(self, block_index: int,
                          new_block_id: Optional[BlockId]) -> None:
-        assert new_block_id is not None
-        self._block_ids[block_index] = new_block_id
+        assert new_block_id is not None or self._logical_only
+        self._block_ids[block_index] = (-1 if new_block_id is None else
+                                       new_block_id)
 
     def update(self, blocks: List[Block]):
         self._blocks = blocks

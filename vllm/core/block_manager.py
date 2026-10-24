@@ -8,6 +8,7 @@ from typing import Tuple
 
 import vllm.envs as envs
 from vllm.core.block.block_table import BlockTable
+from vllm.core.custom_schedulers.hierarchical_io.plan import uses_bounded_gpu_slots
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
@@ -21,7 +22,7 @@ from vllm.core.block_reservation import (BlockPrefixRestoreReservation,
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from vllm.utils import Device
+from vllm.utils import Device, cdiv
 
 SeqId = int
 EncoderSeqId = str
@@ -129,6 +130,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+        self.bounded_gpu_slots = uses_bounded_gpu_slots()
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
 
@@ -170,6 +172,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
+        if self.bounded_gpu_slots:
+            required = cdiv(seq.get_len() + num_lookahead_slots, self.block_size)
+            if required > envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS:
+                return AllocStatus.NEVER
+            return AllocStatus.LATER if self.block_tables else AllocStatus.OK
         num_required_blocks = BlockTable.get_num_required_blocks(
             seq.get_token_ids(),
             block_size=self.block_size,
@@ -205,6 +212,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             block_size=self.block_size,
             block_allocator=self.block_allocator,
             max_block_sliding_window=self.max_block_sliding_window,
+            logical_only=self.bounded_gpu_slots,
         )
         if seq.get_token_ids():
             # NOTE: If there are any factors affecting the block besides
@@ -214,6 +222,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # Add blocks to the block table only if the sequence is non empty.
             block_table.allocate(token_ids=seq.get_token_ids(),
                                  extra_hash=extra_hash)
+            if self.bounded_gpu_slots:
+                self._computed_blocks_tracker.get_num_cached_tokens(seq)
 
         return block_table
 
@@ -272,6 +282,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         This is used by speculative decoding when speculating future tokens.
         """
 
+        if self.bounded_gpu_slots:
+            return all(cdiv(seq.get_len() + num_lookahead_slots, self.block_size)
+                       <= envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS
+                       for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING))
         num_touched_blocks = 0
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             block_table = self.block_tables[seq.seq_id]
@@ -313,8 +327,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return
 
         # Update seq block ids with the latest access time
-        self._last_access_blocks_tracker.update_seq_blocks_last_access(
-            seq_id, self.block_tables[seq.seq_id].physical_block_ids)
+        if not self.bounded_gpu_slots:
+            self._last_access_blocks_tracker.update_seq_blocks_last_access(
+                seq_id, self.block_tables[seq.seq_id].physical_block_ids)
 
         # Untrack seq
         self._last_access_blocks_tracker.remove_seq(seq_id)
@@ -401,6 +416,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         This method determines which blocks can be safely skipped for all
         sequences in the sequence group.
         """
+        if self.bounded_gpu_slots:
+            # Only the prefix frontier is consumed by the model input builder.
+            # Physical addresses are resolved independently for every layer.
+            cached = min(self._computed_blocks_tracker.get_num_cached_tokens(seq)
+                         for seq in seqs) // self.block_size
+            return [-1] * cached
         computed_seq_block_ids = []
         for seq in seqs:
             all_blocks = self.block_tables[seq.seq_id].physical_block_ids
@@ -519,6 +540,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         gpu_blocks = len(
             self.block_allocator.find_cached_blocks_prefix(
                 block_hashes, device=Device.GPU))
+        if self.bounded_gpu_slots:
+            gpu_blocks = 0
         return storage_blocks, gpu_blocks
 
     def _seed_trusted_granulekv_storage_prefix(self, seq: Sequence) -> None:
@@ -581,6 +604,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         """
         if not 0 <= num_gpu_cached_blocks < num_prefix_blocks:
             return AllocStatus.NEVER
+        if self.bounded_gpu_slots:
+            if num_prefix_blocks > envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS:
+                return AllocStatus.NEVER
+            return AllocStatus.LATER if self.block_tables else AllocStatus.OK
         if (self.num_total_gpu_blocks - num_prefix_blocks
                 < self.watermark_blocks):
             return AllocStatus.NEVER
@@ -638,18 +665,25 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             # SSD 扩展部分分配独立、未注册 hash 的 pending target。即使多个
             # loading 请求共享 token prefix，也不会在 DMA 期间共享物理地址。
-            pending_targets = self.block_allocator.allocate_pending_restore_blocks(
-                prev_block=previous_target,
-                block_token_ids=token_blocks[num_gpu_cached_blocks:],
-                device=Device.GPU,
-                extra_hash=seq.extra_hash(),
-            )
+            if self.bounded_gpu_slots:
+                for tokens in token_blocks:
+                    previous_target = self.block_allocator.create_logical_block(
+                        previous_target, tokens, self.block_size, seq.extra_hash())
+                    pending_targets.append(previous_target)
+            else:
+                pending_targets = self.block_allocator.allocate_pending_restore_blocks(
+                    prev_block=previous_target,
+                    block_token_ids=token_blocks[num_gpu_cached_blocks:],
+                    device=Device.GPU,
+                    extra_hash=seq.extra_hash(),
+                )
             target_blocks.extend(pending_targets)
             block_table = BlockTable(
                 block_size=self.block_size,
                 block_allocator=self.block_allocator,
                 _blocks=target_blocks,
                 max_block_sliding_window=self.max_block_sliding_window,
+                logical_only=self.bounded_gpu_slots,
             )
             self.block_tables[seq.seq_id] = block_table
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
@@ -690,12 +724,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 source = source_blocks[logical_index]
                 target = target_blocks[logical_index]
                 assert source.block_id is not None
-                assert target.block_id is not None
+                assert self.bounded_gpu_slots or target.block_id is not None
                 mapping.append((
                     self.block_allocator.get_physical_block_id(
                         Device.CPU, source.block_id),
-                    self.block_allocator.get_physical_block_id(
-                        Device.GPU, target.block_id),
+                    (-1 if self.bounded_gpu_slots else
+                     self.block_allocator.get_physical_block_id(
+                         Device.GPU, target.block_id)),
                 ))
                 logical_blocks.append(
                     LogicalBlockKey(seq.seq_id, logical_index))
@@ -706,7 +741,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 self.free(seq)
             else:
                 for target in target_blocks:
-                    self.block_allocator.free(target)
+                    if target.block_id is not None:
+                        self.block_allocator.free(target)
             raise
 
         reservation_id = f"block-prefix-restore-{next(self._reservation_counter)}"
@@ -729,8 +765,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def commit_granulekv_prefix_restore(self, reservation_id: str) -> int:
         """发布 restored prefix，并返回可推进的连续 prefix token 数。"""
         record = self._prefix_restore_reservations.pop(reservation_id)
-        self.block_allocator.publish_pending_restore_blocks(
-            list(record.pending_target_blocks), Device.GPU)
+        if not self.bounded_gpu_slots:
+            self.block_allocator.publish_pending_restore_blocks(
+                list(record.pending_target_blocks), Device.GPU)
         self._computed_blocks_tracker.set_num_cached_tokens(
             record.seq,
             record.public.num_prefix_blocks * self.block_size,
@@ -973,7 +1010,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 previous_replicas = self._pop_storage_replicas(
                     table_record.seq_id)
                 for source_block in table_record.source_blocks:
-                    self.block_allocator.free(source_block)
+                    if source_block.block_id is not None:
+                        self.block_allocator.free(source_block)
                 retained_ids = {id(block)
                                 for block in table_record.target_blocks}
                 for replica in previous_replicas:
@@ -1038,11 +1076,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                                         newly_allocated_targets=new_targets))
                 for source_block, target_block in zip(mapping_sources,
                                                       mapping_targets):
-                    assert source_block.block_id is not None
+                    assert self.bounded_gpu_slots or source_block.block_id is not None
                     assert target_block.block_id is not None
                     physical_mapping.append((
-                        self.block_allocator.get_physical_block_id(
-                            source_device, source_block.block_id),
+                        (-1 if self.bounded_gpu_slots and source_device == Device.GPU
+                         else self.block_allocator.get_physical_block_id(
+                             source_device, source_block.block_id)),
                         self.block_allocator.get_physical_block_id(
                             target_device, target_block.block_id),
                     ))

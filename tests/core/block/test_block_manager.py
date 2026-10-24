@@ -13,6 +13,60 @@ from ..utils import (create_dummy_prompt, create_seq_group,
                      create_seq_group_encoder_decoder)
 
 
+def test_bounded_history_admission_and_clean_storage_lifecycle(monkeypatch):
+    import vllm.core.block_manager as module
+    from vllm.utils import Device
+    monkeypatch.setattr(module, "uses_bounded_gpu_slots", lambda: True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_HOST_BACKING_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 128)
+    manager = SelfAttnBlockSpaceManager(16, 4, 128, enable_caching=True)
+    group = create_seq_group(seq_prompt_len=256, seq_output_lens=[0])
+    seq = group.get_seqs()[0]
+    assert manager.can_allocate(group) == AllocStatus.OK
+    manager.allocate(group)
+    assert manager.get_block_table(seq) == [-1] * 16
+    assert manager.get_num_free_gpu_blocks() == 4
+    seq.data.update_num_computed_tokens(256)
+    seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+    reservation = manager.reserve_granulekv_prefix_store(group)
+    assert len(reservation.block_mapping) == 16
+    assert all(source == -1 for source, _ in reservation.block_mapping)
+    manager.commit_block_swap(reservation.reservation_id)
+    manager.free_granulekv_prefix_store(seq)
+    assert manager.get_num_free_gpu_blocks() == 4
+    restored = create_seq_group(seq_prompt_len=256, seq_output_lens=[0],
+                               request_id="restore")
+    seq = restored.get_seqs()[0]
+    read = manager.reserve_granulekv_prefix_restore(restored, 16, 0)
+    assert all(destination == -1 for _, destination in read.block_mapping)
+    manager.commit_granulekv_prefix_restore(read.reservation_id)
+    seq.data.update_num_computed_tokens(256)
+    seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+    write = manager.reserve_granulekv_prefix_store(restored)
+    assert write.block_mapping == ()
+    assert write.num_reused_blocks == 16
+    manager.commit_block_swap(write.reservation_id)
+    manager.free_granulekv_prefix_store(seq)
+    assert manager.get_num_free_gpu_blocks() == 4
+    assert manager.block_allocator.get_num_free_blocks(Device.CPU) == 128
+
+
+def test_bounded_history_admission_checks_host_not_gpu_capacity(monkeypatch):
+    import vllm.core.block_manager as module
+    monkeypatch.setattr(module, "uses_bounded_gpu_slots", lambda: True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 128)
+    manager = SelfAttnBlockSpaceManager(16, 4, 128, enable_caching=True)
+    fitting = create_seq_group(seq_prompt_len=2048, seq_output_lens=[0])
+    excessive = create_seq_group(seq_prompt_len=2049, seq_output_lens=[0])
+    assert manager.can_allocate(fitting) == AllocStatus.OK
+    assert manager.can_allocate(excessive) == AllocStatus.NEVER
+    assert manager.can_reserve_granulekv_prefix_restore(128, 0) == AllocStatus.OK
+    assert manager.can_reserve_granulekv_prefix_restore(129, 0) == AllocStatus.NEVER
+    manager.allocate(fitting)
+    assert manager.can_allocate(fitting) == AllocStatus.LATER
+    assert manager.get_num_free_gpu_blocks() == 4
+
+
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("num_gpu_blocks", [8, 40, 80])
 @pytest.mark.parametrize("num_seqs_per_group", [1, 4])

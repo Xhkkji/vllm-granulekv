@@ -117,6 +117,17 @@ def test_validation_host_copy_checks_selected_history_and_partial_version():
     with pytest.raises(RuntimeError, match="selected read set"):
         policy.record_validation_host_copy("r", 0, 127, 16, "prefetch", ((7, 17),))
     assert policy.validation_report("r")["host_copy_duplicate_blocks"] == 0
+    policy.record_validation_gpu_eviction("r", 0, 0, 10)
+    policy.record_validation_host_copy("r", 0, 127, 16, "actual", ((0, 11),))
+    report = policy.validation_report("r")
+    assert report["host_copy_duplicate_blocks"] == 0
+    assert report["host_copy_reload_blocks"] == 1
+    policy.record_validation_host_copy("r", 0, 127, 16, "actual", ((0, 11),))
+    assert policy.validation_report("r")["host_copy_duplicate_blocks"] == 1
+
+
+def test_qwen_working_set_bound_includes_misaligned_chunk_tail():
+    assert SolidAttentionPolicy().working_set_bound(28, 32, 1024, 16) == 965
 
 
 def test_short_history_only_selects_partial_current_and_seals_at_boundary():
@@ -129,6 +140,14 @@ def test_short_history_only_selects_partial_current_and_seals_at_boundary():
     assert actual.attention.logical_block_indices[:actual.attention.count].tolist() == [0]
     policy.update_history_representatives("r", 0, key, ids, 16, 16)
     assert policy._representatives["r"][0][1].shape == (1, 2, 2, 2)
+
+
+def test_replay_rejects_different_prepared_kv_source():
+    policy = SolidAttentionPolicy()
+    metadata = dict(_validation_metadata(), prepared_cache_identity={"attention_source": "dense"})
+    other = dict(metadata, prepared_cache_identity={"attention_source": "sparse"})
+    with pytest.raises(ValueError, match="prepared KV source"):
+        policy.configure_validation("r", "replay", metadata, [{}], other)
 
 
 def test_history_trace_records_final_selection_and_replays_boundaries():

@@ -335,6 +335,22 @@ def test_layer_barrier_exposes_and_clears_device_selection():
     assert get_active_sparse_kv_device_selection() is None
 
 
+def test_layer_physical_mapping_is_scoped_and_replaced():
+    from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_mapping
+    table, slots = object(), object()
+    selections = iter([SparseKVLayerSelection((1,), None, True, table, slots),
+                       (2,)])
+    with activate_layer_barrier(
+            lambda *_args: (), virtual_engine=0, request_ids=("r",),
+            correction_callback=lambda *_args: next(selections)):
+        with activate_sparse_kv_blocks(()):
+            correct_local_layer(0, object())
+            assert get_active_sparse_kv_mapping() == (table, slots)
+            correct_local_layer(1, object())
+            assert get_active_sparse_kv_mapping() is None
+    assert get_active_sparse_kv_mapping() is None
+
+
 def _prefetch_request(index: int, *, activate: bool) -> AsyncKVTransferRequest:
     return AsyncKVTransferRequest(
         request_id=f"unit-{index}",

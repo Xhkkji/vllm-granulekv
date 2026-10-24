@@ -44,6 +44,15 @@ def test_figure13_sweep_rejects_unaligned_or_unsorted_points():
                                    block_size=8)
 
 
+def test_figure13_zero_prefix_and_partial_prompt_tail():
+    sweep = Figure13SweepConfig.create(total_tokens=35,
+                                       prefix_tokens=(0, 32), block_size=16)
+    assert [(point.prefix_tokens, point.suffix_tokens) for point in sweep.points] == [
+        (0, 35), (32, 3)]
+    base, replacement = tuple(range(35)), tuple(range(100, 135))
+    assert build_reuse_prompt_tokens(base, replacement, sweep.points[0]) == replacement
+
+
 def _scheduler_config(max_num_seqs: int = 1,
                       policy: str = "fcfs") -> SchedulerConfig:
     config = SchedulerConfig(

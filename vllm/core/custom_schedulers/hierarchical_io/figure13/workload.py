@@ -53,8 +53,6 @@ class Figure13SweepConfig:
             raise ValueError("total_tokens must be positive")
         if block_size <= 0:
             raise ValueError("block_size must be positive")
-        if total_tokens % block_size != 0:
-            raise ValueError("total_tokens must align to block_size")
 
         prefixes = tuple(int(value) for value in prefix_tokens)
         if not prefixes:
@@ -64,7 +62,7 @@ class Figure13SweepConfig:
         if tuple(sorted(prefixes)) != prefixes:
             raise ValueError("prefix_tokens must be strictly increasing")
         for prefix in prefixes:
-            if not 0 < prefix <= total_tokens:
+            if not 0 <= prefix <= total_tokens:
                 raise ValueError("prefix token count is outside total prompt")
             if prefix % block_size != 0:
                 raise ValueError("prefix_tokens must align to block_size")

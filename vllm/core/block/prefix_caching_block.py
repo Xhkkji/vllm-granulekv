@@ -924,7 +924,7 @@ class PrefixCachingBlock(Block):
         # If the content hash is present, then the block can be made immutable.
         # Register ourselves with the allocator, potentially replacing the
         # physical block index.
-        if self.content_hash is not None:
+        if self.content_hash is not None and self.block_id is not None:
             self.block_id = self._allocator.promote_to_immutable_block(self)
 
     @property

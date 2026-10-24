@@ -212,6 +212,11 @@ class BlockAllocator(ABC):
 
 class DeviceAwareBlockAllocator(ABC):
 
+    def create_logical_block(self, prev_block: Optional[Block],
+                             token_ids: List[int], block_size: int,
+                             extra_hash: Optional[int] = None) -> Block:
+        raise NotImplementedError
+
     @abstractmethod
     def allocate_mutable_block(self,
                                prev_block: Optional[Block],

@@ -17,7 +17,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
 from vllm.core.custom_schedulers.hierarchical_io import (
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVLayerSelection,
     activate_layer_barrier,
-    bind_sparse_page_index_key, get_active_layer_sequence_lengths,
+    bind_sparse_page_index_key, discard_sparse_restore_context, get_active_layer_sequence_lengths,
     get_active_sparse_kv_blocks, get_sparse_kv_policy,
     register_sparse_restore_context, select_actual_sparse_blocks_device,
     select_actual_sparse_prefix_blocks)
@@ -109,11 +109,12 @@ class Worker(LocalOrDistributedWorkerBase):
             self._backing_retired: Set[Tuple[int, str]] = set()
         self._discarded_host_transfers: Set[Tuple[int, str]] = set()
         self._host_staging_owner: Optional[Tuple[int, str]] = None
-        # GPU residency is a worker-local cache of physical destinations.  A
-        # new transfer invalidates the old owner of the same destination;
-        # allocator ownership and block-table updates remain in the scheduler.
+        # The scheduler owns logical history; bounded physical destinations
+        # and their transfer/release fences are resolved independently per layer.
         self._gpu_resident_blocks: Dict[
             Tuple[int, str, int, int], int] = {}
+        self._gpu_slot_mappings: Dict[Tuple[int, str, int, int], int] = {}
+        self._gpu_required_blocks: Dict[Tuple[int, str, int], Set[int]] = {}
         self._gpu_destination_owners: Dict[
             Tuple[int, int, int], Tuple[int, str, int, int]] = {}
         self._gpu_pending_transfers: Dict[
@@ -174,6 +175,10 @@ class Worker(LocalOrDistributedWorkerBase):
             "gpu_resident_misses": 0,
             "gpu_resident_kept_blocks": 0,
             "gpu_resident_released_blocks": 0,
+            "gpu_slot_evictions": 0,
+            "gpu_slot_capacity_rejections": 0,
+            "host_ready_wait_ms": 0,
+            "window_ready_wait_ms": 0,
             "host_cache_hits": 0,
             "host_cache_misses": 0,
             "host_transfer_errors": 0,
@@ -305,7 +310,15 @@ class Worker(LocalOrDistributedWorkerBase):
             cache_engine.granulekv_connector is not None
             and cache_engine.granulekv_connector.host_cache_cuda_pinned
             for cache_engine in self.cache_engine)
+        result["gpu_slots_per_layer"] = self.cache_engine[0].num_gpu_blocks
+        result["gpu_kv_bytes"] = (self.cache_engine[0].num_gpu_blocks
+                                    * CacheEngine.get_cache_block_size(
+                                        self.cache_config, self.model_config,
+                                        self.parallel_config))
+        result["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+        result["cuda_peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
         if reset:
+            torch.cuda.reset_peak_memory_stats()
             for name in self._host_stats:
                 self._host_stats[name] = 0
         return result
@@ -561,10 +574,24 @@ class Worker(LocalOrDistributedWorkerBase):
             num_gpu_blocks, self.cache_config.block_size,
             self.cache_config.is_attention_free,
             self.model_config.max_model_len,
-            self.parallel_config.pipeline_parallel_size)
+            self.parallel_config.pipeline_parallel_size,
+            bounded_slots=self._uses_bounded_slots())
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+        if self._uses_bounded_slots():
+            if (envs.VLLM_ATTENTION_BACKEND != "XFORMERS"
+                    or not self.cache_config.enable_prefix_caching):
+                raise ValueError("bounded KV requires XFormers and prefix caching")
+            self._gpu_working_set_bound = get_sparse_kv_policy().working_set_bound(
+                self.model_config.get_num_attention_heads(self.parallel_config),
+                envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+                self.scheduler_config.max_num_batched_tokens,
+                self.cache_config.block_size)
+            if num_gpu_blocks < self._gpu_working_set_bound:
+                raise ValueError(
+                    f"GPU slot budget {num_gpu_blocks} is below required working-set "
+                    f"bound {self._gpu_working_set_bound}")
 
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
@@ -727,6 +754,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self,
         virtual_engine: int,
         requests: Sequence[AsyncKVTransferRequest],
+        finished_request_ids: Sequence[str] = (),
     ) -> List[AsyncKVTransferEvent]:
         """批量提交 Scheduler 本轮激活的异步 KV read/write。
 
@@ -735,6 +763,15 @@ class Worker(LocalOrDistributedWorkerBase):
         ``RollingPrefetchRuntime``，并在真实 model progress 到达时激活。
         后端容量由 scheduler policy 与 GranuleKV request table 共同限制。
         """
+        if finished_request_ids:
+            self._forget_host_staging(virtual_engine, finished_request_ids)
+            self._prefetch_runtime.forget_seq_groups(finished_request_ids)
+            self._get_cached_seq_group_metadata([], list(finished_request_ids))
+            discard_sparse_restore_context(finished_request_ids)
+            if self._uses_bounded_slots():
+                policy = get_sparse_kv_policy()
+                for request_id in finished_request_ids:
+                    policy.discard(request_id)
         cache_engine = self.cache_engine[virtual_engine]
         events: List[AsyncKVTransferEvent] = []
         prepared: list[tuple[AsyncKVTransferRequest, torch.Tensor]] = []
@@ -906,6 +943,8 @@ class Worker(LocalOrDistributedWorkerBase):
             if forward is None:
                 continue
             table, computed, end, _ = forward
+            table = self._layer_block_table(virtual_engine, request_id,
+                                            layer_index, len(table))
             # Dirty token ranges come from scheduler CPU metadata, never a
             # CUDA .tolist().  Full-block copies also preserve partial tails.
             dirty = range(computed // self.cache_config.block_size,
@@ -1042,6 +1081,85 @@ class Worker(LocalOrDistributedWorkerBase):
             self._host_failed_blocks.update(
                 (virtual_engine, seq_group_id, layer, block)
                 for block in blocks)
+
+    @staticmethod
+    def _uses_bounded_slots() -> bool:
+        from vllm.core.custom_schedulers.hierarchical_io.plan import uses_bounded_gpu_slots
+        return uses_bounded_gpu_slots()
+
+    def _reserve_gpu_slots(self, virtual_engine: int, request_id: str,
+                           layer_index: int, blocks: Sequence[int],
+                           *, prediction: bool = False) -> Tuple[int, ...]:
+        """Reserve only safe layer-local slots, preserving existing hits."""
+        capacity = self.cache_engine[virtual_engine].num_gpu_blocks
+        prefix = (virtual_engine, request_id, layer_index)
+        required = self._gpu_required_blocks.get(prefix, set())
+        wanted = set(blocks).union(required) if not prediction else required
+        if len(wanted) > capacity:
+            self._host_stats["gpu_slot_capacity_rejections"] += 1
+            raise ValueError("actual KV working set exceeds GPU slot budget")
+        if not prediction:
+            self._gpu_required_blocks[prefix] = wanted
+        accepted = []
+        prediction_room = (max(0, capacity - self._gpu_working_set_bound - sum(
+            owner[:3] == prefix and pending.prefetched and not pending.event.query()
+            for owner, pending in self._pending_h2d_transfers.items()))
+                           if prediction else 0)
+        occupied = {slot for owner, slot in self._gpu_slot_mappings.items()
+                    if owner[0] == virtual_engine and owner[2] == layer_index}
+        free_slots = iter(slot for slot in range(capacity) if slot not in occupied)
+        candidates = iter((owner, slot) for owner, slot in
+                          tuple(self._gpu_slot_mappings.items())
+                          if owner[:3] == prefix and owner[3] not in wanted)
+        for block in blocks:
+            key = (*prefix, int(block))
+            if prediction:
+                if prediction_room == 0:
+                    break
+                prediction_room -= 1
+            if key in self._gpu_slot_mappings:
+                accepted.append(int(block))
+                continue
+            destination = next(free_slots, None)
+            if destination is None and not prediction:
+                for old, slot in candidates:
+                    pending = self._pending_h2d_transfers.get(old)
+                    if pending is not None and not pending.event.query():
+                        continue
+                    if (old not in self._host_ready_blocks
+                            and old not in self._pending_gpu_to_host):
+                        continue
+                    fence = self._gpu_region_release_events.get(
+                        self._gpu_slot_key(virtual_engine, layer_index, slot))
+                    if fence is None:
+                        continue
+                    # The existing copy/compute entry consumes this fence.
+                    self._pending_h2d_transfers.pop(old, None)
+                    self._gpu_resident_blocks.pop(old, None)
+                    self._gpu_destination_owners.pop(
+                        self._gpu_slot_key(virtual_engine, layer_index, slot), None)
+                    del self._gpu_slot_mappings[old]
+                    if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off":
+                        get_sparse_kv_policy().record_validation_gpu_eviction(
+                            request_id, layer_index, old[3], slot)
+                    self._host_stats["gpu_slot_evictions"] += 1
+                    destination = slot
+                    break
+            if destination is None:
+                if prediction:
+                    continue
+                raise RuntimeError("no safely reusable GPU KV slot for actual selection")
+            self._gpu_slot_mappings[key] = destination
+            accepted.append(int(block))
+        return tuple(accepted)
+
+    def _layer_block_table(self, virtual_engine: int, request_id: str,
+                            layer_index: int, length: int) -> Tuple[int, ...]:
+        if not self._uses_bounded_slots():
+            return self._backing_forward[virtual_engine, request_id][0]
+        return tuple(self._gpu_slot_mappings.get(
+            (virtual_engine, request_id, layer_index, block), -1)
+                     for block in range(length))
 
     def _gpu_slot_key(self, virtual_engine: int, layer_index: int,
                       destination_block: int) -> Tuple[int, int, int]:
@@ -1197,6 +1315,9 @@ class Worker(LocalOrDistributedWorkerBase):
                                                destination_block)
                 resident_key = (virtual_engine, seq_group_id, layer_index,
                                 int(logical_block))
+                if (self._uses_bounded_slots() and
+                        self._gpu_slot_mappings.get(resident_key) != destination_block):
+                    continue
                 self._gpu_destination_owners[owner_key] = resident_key
                 self._gpu_resident_blocks[resident_key] = int(destination_block)
 
@@ -1247,6 +1368,25 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
             return event
+        if (self._uses_bounded_slots() and request.destination == "gpu"
+                and request.operation == AsyncKVTransferOperation.READ
+                and any(destination < 0 for _, destination in request.block_mapping)):
+            from dataclasses import replace
+            logical = tuple(key.logical_index for key in request.logical_blocks)
+            layers = request.layer_range or (0, cache_engine.num_attention_layers)
+            projected = []
+            for layer in range(*layers):
+                self._reserve_gpu_slots(virtual_engine, request.seq_group_id,
+                                        layer, logical)
+                projected.append(tuple(self._gpu_slot_mappings[
+                    virtual_engine, request.seq_group_id, layer, block]
+                                       for block in logical))
+            if any(destinations != projected[0] for destinations in projected[1:]):
+                raise RuntimeError("initial SSD window requires matching fresh slot maps")
+            pairs = tuple((source, destination) for (source, _), destination in
+                          zip(request.block_mapping, projected[0]))
+            request = replace(request, block_mapping=pairs)
+            mapping = torch.tensor(pairs, device="cpu", dtype=torch.int64).view(-1, 2)
         if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
                 and request.destination == "host"
                 and request.operation == AsyncKVTransferOperation.WRITE):
@@ -1395,6 +1535,11 @@ class Worker(LocalOrDistributedWorkerBase):
             raise RuntimeError("host-to-GPU mapping and logical blocks differ")
         for logical_block, (_, destination_block) in zip(logical_blocks,
                                                          mapping):
+            resident_key = (virtual_engine, seq_group_id, layer_index,
+                            int(logical_block))
+            if (self._uses_bounded_slots() and
+                    self._gpu_slot_mappings.get(resident_key) != destination_block):
+                raise RuntimeError("GPU ownership publication targets an unreserved slot")
             owner_key = self._gpu_slot_key(virtual_engine, layer_index,
                                            destination_block)
             # Async transfers have already armed the stream fence. Publishing
@@ -1406,8 +1551,6 @@ class Worker(LocalOrDistributedWorkerBase):
             else:
                 self._invalidate_gpu_destination(
                     virtual_engine, layer_index, int(destination_block))
-            resident_key = (virtual_engine, seq_group_id, layer_index,
-                            int(logical_block))
             self._gpu_destination_owners[owner_key] = resident_key
             self._gpu_resident_blocks[resident_key] = int(destination_block)
 
@@ -1429,7 +1572,8 @@ class Worker(LocalOrDistributedWorkerBase):
                              layer_index: int,
                              logical_blocks: Sequence[int],
                              timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + timeout_seconds
+        wait_started = time.monotonic()
+        deadline = wait_started + timeout_seconds
         if not self.host_blocks_ready(virtual_engine, seq_group_id,
                                        layer_index, logical_blocks):
             self._host_stats["cpu_cache_loading_waits"] += 1
@@ -1463,6 +1607,8 @@ class Worker(LocalOrDistributedWorkerBase):
             else:
                 self.poll_async_kv_transfers(virtual_engine)
             time.sleep(0.0001)
+        self._host_stats["host_ready_wait_ms"] += (
+            time.monotonic() - wait_started) * 1000
         return True
 
     def copy_host_blocks_to_gpu(self, virtual_engine: int, layer_index: int,
@@ -1485,10 +1631,16 @@ class Worker(LocalOrDistributedWorkerBase):
         logical_blocks = tuple(source for source, _ in pairs)
         forward = self._backing_forward.get((virtual_engine, seq_group_id)) if (
             envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE) else None
+        table = (self._layer_block_table(virtual_engine, seq_group_id, layer_index,
+                                         len(forward[0])) if forward is not None
+                 else None)
         for logical, destination in pairs:
+            if (self._uses_bounded_slots() and self._gpu_slot_mappings.get(
+                    (virtual_engine, seq_group_id, layer_index, logical)) != destination):
+                raise RuntimeError("host copy targets an unreserved GPU slot")
             if logical < 0 or (forward is not None and (
                     logical * self.cache_config.block_size >= forward[1]
-                    or forward[0][logical] != destination)):
+                    or table[logical] != destination)):
                 raise RuntimeError("host copy is outside historical read mapping")
         if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off" and forward is not None:
             get_sparse_kv_policy().record_validation_host_copy(
@@ -1593,6 +1745,14 @@ class Worker(LocalOrDistributedWorkerBase):
                        and (virtual_engine, state.seq_group_id, layer_index, block)
                        in self._host_ready_blocks)
         if blocks:
+            if self._uses_bounded_slots():
+                blocks = self._reserve_gpu_slots(
+                    virtual_engine, state.seq_group_id, layer_index, blocks,
+                    prediction=True)
+                table = self._layer_block_table(virtual_engine, state.seq_group_id,
+                                                layer_index, len(table))
+            if not blocks:
+                return
             mapping = tuple((block, table[block]) for block in blocks)
             self.copy_host_blocks_to_gpu_async(
                 virtual_engine, state.seq_group_id, layer_index, mapping,
@@ -1604,6 +1764,11 @@ class Worker(LocalOrDistributedWorkerBase):
         finished = frozenset(request_ids)
         if not finished:
             return
+        if self._uses_bounded_slots():
+            for collection in (self._gpu_slot_mappings, self._gpu_required_blocks):
+                for key in tuple(collection):
+                    if key[0] == virtual_engine and key[1] in finished:
+                        del collection[key]
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
             self._backing_retired.update((virtual_engine, item)
                                          for item in finished)
@@ -1698,6 +1863,9 @@ class Worker(LocalOrDistributedWorkerBase):
         """Select historical KV once and resolve its missing backing."""
         if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
             return None
+        if self._uses_bounded_slots():
+            return self._correct_bounded_history(
+                virtual_engine, request_ids, layer_index, query)
         state = self._prefetch_runtime.prediction_state(
             request_ids, layer_index)
         if state is None:
@@ -1938,6 +2106,37 @@ class Worker(LocalOrDistributedWorkerBase):
             device_selection_required=selected_list_enabled,
         )
 
+    def _correct_bounded_history(self, virtual_engine: int,
+                                  request_ids: Tuple[str, ...], layer_index: int,
+                                  query: torch.Tensor) -> SparseKVLayerSelection:
+        if len(request_ids) != 1:
+            raise ValueError("bounded KV requires one request")
+        request_id = request_ids[0]
+        forward = self._backing_forward[virtual_engine, request_id]
+        _, computed, end, _ = forward
+        state = self._prefetch_runtime.prediction_state(request_ids, layer_index)
+        immutable = 0 if state is None else state.num_prefix_blocks
+        started = time.perf_counter()
+        actual = select_actual_sparse_blocks_device(
+            request_id, layer_index, query, immutable, computed, end,
+            self.cache_config.block_size, envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET)
+        record_sparse_kv_actual_selection((time.perf_counter() - started) * 1000)
+        size = self.cache_config.block_size
+        count = (end + size - 1) // size
+        current = tuple(range(computed // size, count))
+        working = tuple(sorted(set(actual.history_blocks).union(current)))
+        self._reserve_gpu_slots(virtual_engine, request_id, layer_index, working)
+        table = self._layer_block_table(virtual_engine, request_id, layer_index, count)
+        self._restore_backing_blocks(virtual_engine, request_id, layer_index,
+                                     table, actual.history_blocks)
+        physical = torch.tensor([table], dtype=torch.int32, device=query.device)
+        slots = torch.tensor(
+            [table[token // size] * size + token % size
+             for token in range(computed, end)],
+            dtype=torch.int64, device=query.device)
+        return SparseKVLayerSelection(
+            working, actual.attention, True, physical, slots)
+
     def _release_hierarchical_layer(
             self,
             virtual_engine: int,
@@ -2018,6 +2217,13 @@ class Worker(LocalOrDistributedWorkerBase):
                 continue
             table, computed, end, is_prompt = forward
             block_size = self.cache_config.block_size
+            if self._uses_bounded_slots():
+                current = tuple(range(computed // block_size,
+                                      (end + block_size - 1) // block_size))
+                self._gpu_required_blocks[virtual_engine, request_id, layer_index] = set(current)
+                self._reserve_gpu_slots(virtual_engine, request_id, layer_index, current)
+                table = self._layer_block_table(virtual_engine, request_id,
+                                                layer_index, len(table))
             # Sparse attention resolves its history after the query exists.
             # Only an existing partial tail needs preservation before writes.
             first = (0 if is_prompt and end - computed > 1 else
@@ -2029,6 +2235,8 @@ class Worker(LocalOrDistributedWorkerBase):
                         and envs.VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE))):
                 first = computed // block_size
             cached = tuple(range(first, (computed + block_size - 1) // block_size))
+            if self._uses_bounded_slots():
+                cached = ((computed // block_size,) if computed % block_size else ())
             if state is None and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE:
                 cached = ()
             self._restore_backing_blocks(
@@ -2040,6 +2248,9 @@ class Worker(LocalOrDistributedWorkerBase):
                     virtual_engine, layer_index, table[block])
                 if fence is not None:
                     stream.wait_event(fence)
+                if self._uses_bounded_slots():
+                    self._pending_h2d_transfers.pop(
+                        (virtual_engine, request_id, layer_index, block), None)
 
     def _restore_backing_blocks(self, virtual_engine: int, request_id: str,
                                 layer_index: int, table: Sequence[int],
@@ -2066,6 +2277,8 @@ class Worker(LocalOrDistributedWorkerBase):
     def _log_prefetch_runtime_traces(self) -> None:
         """输出 worker 物理 READY 与 barrier wait，避免混入 scheduler 延迟。"""
         traces = self._prefetch_runtime.pop_traces()
+        self._host_stats["window_ready_wait_ms"] += sum(
+            trace.wait_ns / 1.0e6 for trace in traces)
         if not envs.VLLM_V0_SWAP_TRACE:
             return
         for trace in traces:
@@ -2273,7 +2486,8 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
 
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,
-                                max_model_len, pipeline_parallel_size) -> None:
+                                max_model_len, pipeline_parallel_size,
+                                bounded_slots=False) -> None:
     if is_attention_free and num_gpu_blocks != 0:
         raise ValueError("No memory should be allocated for the cache blocks "
                          f"for an attention-free model, but {num_gpu_blocks} "
@@ -2283,7 +2497,7 @@ def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,
                          "Try increasing `gpu_memory_utilization` when "
                          "initializing the engine.")
     max_seq_len = block_size * (num_gpu_blocks // pipeline_parallel_size)
-    if not is_attention_free and max_model_len > max_seq_len:
+    if not is_attention_free and not bounded_slots and max_model_len > max_seq_len:
         raise ValueError(
             f"The model's max seq len ({max_model_len}) "
             "is larger than the maximum number of tokens that can be "

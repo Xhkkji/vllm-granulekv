@@ -27,6 +27,7 @@ from ...common.selectors import ExplicitSelector, TailSelector
 class SolidAttentionSelector:
     name = "solidattention"
 
+
     def __init__(self, block_budget: int = 0,
                  selections: Optional[Sequence[Sequence[int]]] = None) -> None:
         self._delegate = (ExplicitSelector(selections, self.name)
@@ -80,6 +81,13 @@ class SolidAttentionPolicy:
     """
 
     name = "solidattention"
+
+    def working_set_bound(self, num_query_heads: int, block_budget: int,
+                          chunk_tokens: int, block_size: int) -> int:
+        current_blocks = (chunk_tokens + 2 * block_size - 2) // block_size
+        return (num_query_heads * block_budget + self.init_blocks
+                + self.local_blocks + current_blocks)
+
     _REPLAY_METADATA_KEYS = (
         "model",
         "prompt_sha256",
@@ -143,6 +151,9 @@ class SolidAttentionPolicy:
             if current_metadata.get("position_cache_length") != (
                     source_metadata.get("position_cache_length")):
                 raise ValueError("sparse replay position cache differs from trace")
+            if current_metadata.get("prepared_cache_identity") != (
+                    source_metadata.get("prepared_cache_identity")):
+                raise ValueError("sparse replay prepared KV source differs from trace")
             for key in self._REPLAY_METADATA_KEYS:
                 if key not in current_metadata or key not in source_metadata:
                     raise ValueError(
@@ -215,20 +226,33 @@ class SolidAttentionPolicy:
         replay_unconsumed = len(set(state.replay) - set(state.records_by_key))
         first_record = state.records_by_key.get(
             (state.first_mismatch_step, state.first_mismatch_layer), {})
-        copied = set()
+        copied = {}
+        seen = set()
         duplicate_copies = 0
+        reloaded = 0
         for transfer in state.host_copies:
+            if transfer["reason"] == "eviction":
+                for logical, _ in transfer["mapping"]:
+                    copied.pop((transfer["layer_index"], logical), None)
+                continue
             for logical, _ in transfer["mapping"]:
                 version = min(transfer["block_size"], transfer["history_tokens"]
                               - logical * transfer["block_size"])
                 identity = (transfer["layer_index"], logical, version)
-                duplicate_copies += identity in copied
-                copied.add(identity)
+                versions = copied.setdefault(identity[:2], set())
+                duplicate_copies += version in versions
+                reloaded += identity in seen and version not in versions
+                versions.add(version)
+                seen.add(identity)
+        copies = [item for item in state.host_copies if item["reason"] != "eviction"]
         return {
             "mode": state.mode,
             "host_copy_duplicate_blocks": duplicate_copies,
-            "host_copy_mapping_blocks": sum(len(item["mapping"]) for item in state.host_copies),
-            "host_copies": state.host_copies,
+            "host_copy_reload_blocks": reloaded,
+            "host_copy_mapping_blocks": sum(len(item["mapping"]) for item in copies),
+            "host_copies": copies,
+            "gpu_evictions": [item for item in state.host_copies
+                              if item["reason"] == "eviction"],
             "metadata": dict(state.metadata),
             "records": list(state.records),
             "attention_checks": sum("attention_output" in record
@@ -435,6 +459,14 @@ class SolidAttentionPolicy:
             digest.update(repr(tuple(host.shape)).encode("ascii"))
             digest.update(host.view(torch.uint8).numpy().tobytes())
         return digest.hexdigest()
+
+    def record_validation_gpu_eviction(self, request_id: str, layer_index: int,
+                                       logical_block: int, destination: int) -> None:
+        state = self._validation_states.get(request_id)
+        if state is not None and state.mode != "off":
+            state.host_copies.append(dict(
+                request_id=request_id, layer_index=layer_index, reason="eviction",
+                mapping=[[logical_block, destination]]))
 
     def record_validation_host_copy(self, request_id: str, layer_index: int,
                                     history_tokens: int, block_size: int,
@@ -1356,6 +1388,10 @@ class SolidAttentionPolicy:
         complete = history_tokens // block_size
         num_blocks = (sequence_length + block_size - 1) // block_size
         cached = self._representatives[request_id].get(layer_index)
+        if cached is None and complete == 0 and num_prefix_blocks == 0:
+            cached = (0, torch.empty((0, 2, 0, query.shape[-1]),
+                                     device=query.device, dtype=query.dtype))
+            self._representatives[request_id][layer_index] = cached
         if cached is None:
             source = self._get_prediction_representatives(
                 request_id, layer_index, num_prefix_blocks, device=query.device)

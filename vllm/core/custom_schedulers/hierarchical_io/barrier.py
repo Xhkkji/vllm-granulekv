@@ -31,6 +31,8 @@ class SparseKVLayerSelection:
     block_indices: Tuple[int, ...]
     device_selection: Optional[Any] = None
     device_selection_required: bool = False
+    block_table: Optional[Any] = None
+    slot_mapping: Optional[Any] = None
 
 
 LayerCorrectionResult = Optional[Tuple[int, ...] | SparseKVLayerSelection]
@@ -75,6 +77,8 @@ _ACTIVE_SPARSE_KV_DEVICE_SELECTION: ContextVar[Optional[Any]] = ContextVar(
     "granulekv_sparse_kv_device_selection", default=None)
 _ACTIVE_SPARSE_KV_DEVICE_REQUIRED: ContextVar[bool] = ContextVar(
     "granulekv_sparse_kv_device_required", default=False)
+_ACTIVE_SPARSE_KV_MAPPING: ContextVar[Optional[Tuple[Any, Any]]] = ContextVar(
+    "granulekv_sparse_kv_mapping", default=None)
 
 
 @contextmanager
@@ -148,10 +152,14 @@ def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...
                 selected.device_selection)
             _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(
                 selected.device_selection_required)
+            _ACTIVE_SPARSE_KV_MAPPING.set(
+                None if selected.block_table is None else
+                (selected.block_table, selected.slot_mapping))
         else:
             blocks = tuple(selected)
             _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
             _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
+            _ACTIVE_SPARSE_KV_MAPPING.set(None)
         _ACTIVE_SPARSE_KV_BLOCKS.set(blocks)
         return blocks
     return None
@@ -172,9 +180,11 @@ def activate_sparse_kv_blocks(
     token = _ACTIVE_SPARSE_KV_BLOCKS.set(selected)
     device_token = _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
     required_token = _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
+    mapping_token = _ACTIVE_SPARSE_KV_MAPPING.set(None)
     try:
         yield
     finally:
+        _ACTIVE_SPARSE_KV_MAPPING.reset(mapping_token)
         _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.reset(required_token)
         _ACTIVE_SPARSE_KV_DEVICE_SELECTION.reset(device_token)
         _ACTIVE_SPARSE_KV_BLOCKS.reset(token)
@@ -183,6 +193,10 @@ def activate_sparse_kv_blocks(
 def get_active_sparse_kv_blocks() -> Optional[Tuple[int, ...]]:
     """返回当前 layer 允许 attention 访问的 logical KV blocks。"""
     return _ACTIVE_SPARSE_KV_BLOCKS.get()
+
+
+def get_active_sparse_kv_mapping() -> Optional[Tuple[Any, Any]]:
+    return _ACTIVE_SPARSE_KV_MAPPING.get()
 
 
 def get_active_sparse_kv_device_selection() -> Optional[Any]:

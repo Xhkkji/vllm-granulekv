@@ -405,6 +405,15 @@ class RollingPrefetchConfig:
         return max(1, self.lead_units)
 
 
+def uses_bounded_gpu_slots() -> bool:
+    """The existing sparse host-backed path owns layer-local physical slots."""
+    import vllm.envs as envs
+    return (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+            and envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
+            and envs.VLLM_GRANULEKV_SPARSE_GPU_SELECT_ENABLE
+            and envs.VLLM_GRANULEKV_SPARSE_SELECTED_BLOCKS_ENABLE)
+
+
 def get_layer_working_set_regions(
         environ: Optional[Mapping[str, str]] = None) -> int:
     """计算 layer working-set 的真实 GPU region 数，关闭时返回 0。

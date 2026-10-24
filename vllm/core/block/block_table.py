@@ -46,12 +46,14 @@ class BlockTable:
         block_allocator: DeviceAwareBlockAllocator,
         _blocks: Optional[List[Block]] = None,
         max_block_sliding_window: Optional[int] = None,
+        logical_only: bool = False,
     ):
         self._block_size = block_size
         self._allocator = block_allocator
+        self.logical_only = logical_only
         if _blocks is None:
             _blocks = []
-        self._blocks: BlockList = BlockList(_blocks)
+        self._blocks: BlockList = BlockList(_blocks, logical_only=logical_only)
 
         self._max_block_sliding_window = max_block_sliding_window
         self._num_full_slots = self._get_num_token_ids()
@@ -202,6 +204,10 @@ class BlockTable:
 
         for _ in range(blocks_to_allocate):
             assert len(self._blocks) > 0
+            if self.logical_only:
+                self._blocks.append(self._allocator.create_logical_block(
+                    self._blocks[-1], [], self._block_size, extra_hash))
+                continue
             self._blocks.append(
                 self._allocator.allocate_mutable_block(
                     prev_block=self._blocks[-1],
@@ -221,6 +227,8 @@ class BlockTable:
             BlockTable: A new BlockTable instance with a copy of the blocks from
                 the current instance.
         """
+        if self.logical_only:
+            raise ValueError("bounded KV supports one sequence, not block-table fork")
         assert self._is_allocated
         assert len(self._blocks) > 0
         forked_blocks = self._allocator.fork(self._blocks[-1])
@@ -240,7 +248,8 @@ class BlockTable:
         is set to `None`.
         """
         for block in self.blocks:
-            self._allocator.free(block)
+            if block.block_id is not None:
+                self._allocator.free(block)
         self._blocks.reset()
 
     @property
@@ -285,6 +294,13 @@ class BlockTable:
             device: Device,
             extra_hash: Optional[int] = None) -> List[Block]:
         blocks: List[Block] = []
+        if self.logical_only:
+            for tokens in chunk_list(token_ids, self._block_size):
+                block = self._allocator.create_logical_block(
+                    prev_block, tokens, self._block_size, extra_hash)
+                blocks.append(block)
+                prev_block = block
+            return blocks
 
         block_token_ids = []
         tail_token_ids = []

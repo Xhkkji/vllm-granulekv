@@ -1031,6 +1031,14 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_mapping
+        physical_mapping = get_active_sparse_kv_mapping()
+        if physical_mapping is not None:
+            from dataclasses import replace
+            attn_metadata = replace(
+                attn_metadata, block_tables=physical_mapping[0],
+                slot_mapping=physical_mapping[1],
+                _cached_prefill_metadata=None, _cached_decode_metadata=None)
         attn_type = self.attn_type
         # Check that appropriate attention metadata attributes are
         # selected for the desired attention type
