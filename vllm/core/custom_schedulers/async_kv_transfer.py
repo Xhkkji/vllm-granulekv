@@ -86,13 +86,6 @@ class AsyncKVTransferRequest:
     # False 表示这次 RPC 只把 descriptor template 放进 Worker，不占用 GranuleKV
     # request slot。真正激活时 Worker 会回传 PENDING，再由 Scheduler 更新状态。
     activate_on_submit: bool = True
-    # Optional background SSD -> host staging attached to this GPU restore.
-    # It is intentionally outside the scheduler completion lifecycle: the GPU
-    # request still owns admission, while the worker tracks host readiness.
-    host_block_mapping: Optional[BlockMapping] = None
-    host_layer_range: Optional[Tuple[int, int]] = None
-    host_tail_block_mapping: Optional[BlockMapping] = None
-    host_tail_layer_range: Optional[Tuple[int, int]] = None
 
     def __post_init__(self) -> None:
         if (self.consumer_num_blocks is not None
@@ -104,11 +97,6 @@ class AsyncKVTransferRequest:
                     self.consumer_block_indices[1:]))):
             raise ValueError(
                 "consumer block indices must be strictly increasing")
-        if self.host_block_mapping is not None and self.host_layer_range is None:
-            raise ValueError("host staging requires a host layer range")
-        if ((self.host_tail_block_mapping is None) !=
-                (self.host_tail_layer_range is None)):
-            raise ValueError("host tail mapping and layer range must be paired")
         if (self.consumer_local_block_start is not None
                 and self.consumer_local_block_start < 0):
             raise ValueError("consumer_local_block_start must be non-negative")
@@ -210,10 +198,6 @@ class AsyncKVTransferQueue:
         correction_block_mapping: Optional[Sequence[Tuple[int, int]]] = None,
         correction_logical_blocks: Optional[Sequence[LogicalBlockKey]] = None,
         destination: str = "gpu",
-        host_block_mapping: Optional[Sequence[Tuple[int, int]]] = None,
-        host_layer_range: Optional[Tuple[int, int]] = None,
-        host_tail_block_mapping: Optional[Sequence[Tuple[int, int]]] = None,
-        host_tail_layer_range: Optional[Tuple[int, int]] = None,
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/GranuleKV request slot。"""
         if priority is None:
@@ -248,14 +232,6 @@ class AsyncKVTransferQueue:
             correction_logical_blocks=(
                 None if correction_logical_blocks is None else
                     tuple(correction_logical_blocks)),
-            host_block_mapping=(
-                None if host_block_mapping is None else tuple(
-                    tuple(pair) for pair in host_block_mapping)),
-            host_layer_range=host_layer_range,
-            host_tail_block_mapping=(
-                None if host_tail_block_mapping is None else tuple(
-                    tuple(pair) for pair in host_tail_block_mapping)),
-            host_tail_layer_range=host_tail_layer_range,
         )
         self._transfers[request_id] = PendingAsyncKVTransfer(request=request)
         return request

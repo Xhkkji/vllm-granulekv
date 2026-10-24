@@ -422,10 +422,10 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
     assert activated == [("unit-0", "mapping-0")]
 
     ready.update(("unit-0", "unit-1"))
-    runtime.wait_ready(0, ("seq-0", ), 0, submit, poll, max_active=2)
+    runtime.wait_ready(0, ("seq-0", ), 0, submit, poll, available_slots=lambda: 2)
     assert activated == [("unit-0", "mapping-0"),
                          ("unit-1", "mapping-1")]
-    events = runtime.poll_units(0, poll)
+    events = runtime.poll_units(0, poll, submit, lambda: 2)
     assert [(event.request_id, event.state) for event in events] == [
         ("unit-1", AsyncKVTransferState.PENDING),
         ("unit-0", AsyncKVTransferState.READY),
@@ -441,6 +441,89 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
     }
 
 
+def test_window_host_completion_does_not_publish_gpu_or_delay_admission():
+    from dataclasses import replace
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig(
+        enabled=True, lead_units=1, max_lead_units=1))
+    gpu = _correction_prefetch_request(0, first=True)
+    host = replace(gpu, request_id="host-0", destination="host",
+                   correction_block_mapping=None, correction_logical_blocks=None,
+                   consumer_block_indices=None, consumer_blocks_by_layer=None,
+                   consumer_num_blocks=None, consumer_local_block_start=None)
+    future = replace(_correction_prefetch_request(1, first=False),
+                     destination="host")
+    submitted = []
+    def submit(request, mapping):
+        submitted.append(request.request_id)
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.PENDING)
+    def poll(request):
+        assert request.request_id == gpu.request_id
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.READY)
+    runtime.submit_or_stage(0, gpu, (), submit)
+    runtime.submit_or_stage(0, host, (), submit)
+    runtime.submit_or_stage(0, future, (), submit)
+    runtime.complete_request(0, AsyncKVTransferEvent(
+        gpu.request_id, AsyncKVTransferState.READY))
+    runtime.wait_ready(0, (gpu.seq_group_id,), 0, submit, poll,
+                       available_slots=lambda: 0)
+    assert submitted == [gpu.request_id, host.request_id]
+    assert runtime.prediction_state((gpu.seq_group_id,), 1).resident_prefix_blocks == (3,)
+    runtime.poll_units(0, lambda r: AsyncKVTransferEvent(
+        r.request_id, AsyncKVTransferState.PENDING), submit, lambda: 1)
+    assert submitted[-1] == future.request_id
+    done = AsyncKVTransferEvent(future.request_id, AsyncKVTransferState.READY)
+    runtime.complete_request(0, done)
+    runtime.complete_request(0, done)
+    events = runtime.poll_units(0, lambda r: AsyncKVTransferEvent(
+        r.request_id, AsyncKVTransferState.PENDING), submit, lambda: 0)
+    assert sum(event.request_id == future.request_id for event in events) == 1
+    assert runtime.prediction_state((gpu.seq_group_id,), 1).resident_prefix_blocks == (3,)
+    assert runtime._plans  # The first host member is still in flight.
+    runtime.complete_request(0, AsyncKVTransferEvent(host.request_id, AsyncKVTransferState.READY))
+    runtime.poll_units(0, poll, submit, lambda: 1)
+    assert not runtime._plans
+
+
+def test_parent_waits_first_window_host_member_even_if_gpu_is_ready():
+    config = HierarchicalIOConfig(enabled=True, num_layers=4, window_layers=2)
+    plan = config.build_plan("members", num_blocks=2)
+    controller = HierarchicalRestoreController()
+    controller.register(plan, [("gpu0", 0), ("host0", 0), ("host1", 1)])
+    assert controller.mark_ready("gpu0").first_unit_became_ready
+    assert not controller.mark_ready("host1").all_terminal
+    with pytest.raises(RuntimeError, match="active"):
+        controller.release(plan.plan_id)
+    progress = controller.mark_ready("host0")
+    assert progress.all_ready and not progress.first_unit_became_ready
+    controller.release(plan.plan_id)
+
+
+def test_failed_window_stops_activation_and_unsubmitted_members_can_be_discarded():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig(enabled=True))
+    first = _prefetch_request(0, activate=True)
+    future = _prefetch_request(1, activate=False)
+    submitted = []
+
+    def submit(request, mapping):
+        submitted.append(request.request_id)
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.PENDING)
+
+    def fail(request):
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.ERROR,
+                                    "window read failed")
+
+    runtime.submit_or_stage(0, first, first.block_mapping, submit)
+    runtime.submit_or_stage(0, future, future.block_mapping, submit)
+    runtime.poll_units(0, fail, submit, lambda: 4)
+    assert submitted == [first.request_id]
+    with pytest.raises(RuntimeError, match="window failed"):
+        runtime.wait_ready(0, (first.seq_group_id,), 2, submit, fail,
+                           available_slots=lambda: 4)
+    runtime.discard_units(0, (future.request_id,))
+    runtime.poll_units(0, fail, submit, lambda: 4)
+    assert not runtime._plans
+
+
 def test_working_set_unit_is_rejected_after_consumption():
     runtime = RollingPrefetchRuntime(
         RollingPrefetchConfig(enabled=True,
@@ -454,10 +537,10 @@ def test_working_set_unit_is_rejected_after_consumption():
                                     AsyncKVTransferState.READY)
 
     runtime.submit_or_stage(0, request, "mapping", ready)
-    runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, max_active=1)
+    runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, available_slots=lambda: 1)
     runtime.release_layer(0, ("seq-0", ), 1)
     with pytest.raises(RuntimeError, match="already evicted"):
-        runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, max_active=1)
+        runtime.wait_ready(0, ("seq-0", ), 0, ready, ready, available_slots=lambda: 1)
 
 
 def test_sparse_residency_is_checked_before_layer_consumption():
@@ -479,7 +562,7 @@ def test_sparse_residency_is_checked_before_layer_consumption():
             request.request_id, AsyncKVTransferState.PENDING),
         lambda _request: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.READY),
-        max_active=1,
+        available_slots=lambda: 1,
     )
     assert runtime.require_resident_layer(("seq-sparse", ), 0) == (0, )
     assert runtime.require_resident_layer(("seq-sparse", ), 1) == (3, )
@@ -518,7 +601,7 @@ def test_sparse_residency_does_not_expand_selected_unit_to_all_blocks():
             request.request_id, AsyncKVTransferState.PENDING),
         lambda _request: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.READY),
-        max_active=1,
+        available_slots=lambda: 1,
     )
     assert runtime.require_resident_layer(("seq-subset", ), 0) == (1, )
 
@@ -538,7 +621,7 @@ def test_sparse_residency_miss_is_reported_separately_from_prediction():
             request.request_id, AsyncKVTransferState.PENDING),
         lambda _request: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.READY),
-        max_active=1,
+        available_slots=lambda: 1,
     )
     runtime.residency.evict_unit(request.request_id)
     with pytest.raises(RuntimeError, match="evicted"):
@@ -591,7 +674,7 @@ def test_single_layer_correction_updates_only_current_layer():
         "prediction_restore_fragments": 4,
     }
     runtime.wait_ready(0, ("seq-correction", ), 0, pending, ready,
-                       max_active=2)
+                       available_slots=lambda: 2)
     state = runtime.prediction_state(("seq-correction", ), 0)
     assert state is not None
     assert state.predicted_prefix_blocks == (0, 3)
@@ -612,7 +695,7 @@ def test_single_layer_correction_updates_only_current_layer():
         tuple,
         correction_submit,
         ready,
-        max_active=2,
+        available_slots=lambda: 2,
         timeout_seconds=1.0,
     )
     assert result.block_count == 1
@@ -647,7 +730,7 @@ def test_single_layer_correction_error_does_not_publish_residency():
                 current.request_id, AsyncKVTransferState.ERROR, "io error"),
             lambda current: AsyncKVTransferEvent(
                 current.request_id, AsyncKVTransferState.ERROR, "io error"),
-            max_active=1,
+            available_slots=lambda: 1,
             timeout_seconds=1.0,
         )
     after = runtime.prediction_state(("seq-correction", ), 0)
@@ -665,7 +748,7 @@ def test_single_layer_correction_accepts_immediate_ready():
     assert state is not None
     result = runtime.correct_layer(
         0, state, 0, (2, ), tuple, immediate, immediate,
-        max_active=1, timeout_seconds=1.0)
+        available_slots=lambda: 1, timeout_seconds=1.0)
     assert result.block_count == 1
     after = runtime.prediction_state(("seq-correction", ), 0)
     assert after is not None
@@ -687,7 +770,7 @@ def test_single_layer_correction_timeout_keeps_block_nonresident():
         runtime.correct_layer(
             0, state, 0, (2, ), tuple, pending, pending,
             lambda current: cancelled.append(current.request_id),
-            max_active=1, timeout_seconds=0.001, sleep_seconds=0.0001)
+            available_slots=lambda: 1, timeout_seconds=0.001, sleep_seconds=0.0001)
     assert len(cancelled) == 1
     after = runtime.prediction_state(("seq-correction", ), 0)
     assert after is not None
@@ -727,7 +810,7 @@ def test_sparse_residency_adds_live_suffix_blocks_from_current_length():
             request.request_id, AsyncKVTransferState.PENDING),
         lambda _request: AsyncKVTransferEvent(
             request.request_id, AsyncKVTransferState.READY),
-        max_active=1,
+        available_slots=lambda: 1,
     )
 
     assert runtime.require_resident_layer(
@@ -740,7 +823,7 @@ def test_first_window_admission_is_separate_from_full_restore():
                                     window_layers=2,
                                     created_monotonic_ns=100)
     controller = HierarchicalRestoreController()
-    controller.register(plan, ["w0", "w1", "w2", "w3"])
+    controller.register(plan, [(f"w{i}", i) for i in range(4)])
 
     # 后续 window 可以乱序完成，但不能冒充 first-window-ready admission。
     progress = controller.mark_ready("w2", now_monotonic_ns=150)
@@ -765,7 +848,7 @@ def test_window_error_prevents_parent_publish_until_all_terminal():
                                     num_layers=4,
                                     window_layers=2)
     controller = HierarchicalRestoreController()
-    controller.register(plan, ["w0", "w1"])
+    controller.register(plan, [("w0", 0), ("w1", 1)])
 
     failed = controller.mark_error("w1")
     assert failed.failed

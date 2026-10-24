@@ -1062,6 +1062,10 @@ class LLMEngine:
         if len(ctx.output_queue) == 0:
             return None
 
+        # Publish completed SSD replicas before the output processor can finish
+        # a sequence and reserve its store mapping. Polling never waits for DMA.
+        self._poll_async_kv_scheduler(self.scheduler_contexts.index(ctx))
+
         # Get pending async postprocessor
         if request_id:
             # When we process only one request, no pop is required
@@ -1351,6 +1355,14 @@ class LLMEngine:
         因此默认路径会直接返回，不增加任何 RPC 开销。
         """
         scheduler = self.scheduler[virtual_engine]
+        drain_discards = getattr(scheduler, "drain_staged_async_kv_discards",
+                                 None)
+        if drain_discards is not None:
+            request_ids = drain_discards()
+            if request_ids:
+                self.model_executor.collective_rpc(
+                    "discard_staged_async_kv_transfers",
+                    args=(virtual_engine, request_ids))
         has_pending = getattr(scheduler, "has_active_async_kv_transfer", None)
         if has_pending is None or not has_pending():
             return
@@ -1378,14 +1390,6 @@ class LLMEngine:
                                              virtual_engine: int) -> None:
         """把下一笔 queued read/write 非阻塞提交给 Worker。"""
         scheduler = self.scheduler[virtual_engine]
-        drain_discards = getattr(scheduler, "drain_staged_async_kv_discards",
-                                 None)
-        if drain_discards is not None:
-            request_ids = drain_discards()
-            if request_ids:
-                self.model_executor.collective_rpc(
-                    "discard_staged_async_kv_transfers",
-                    args=(virtual_engine, request_ids))
         drain = getattr(scheduler, "drain_async_kv_transfers_to_submit", None)
         if drain is None:
             return

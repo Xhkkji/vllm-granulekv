@@ -330,6 +330,10 @@ class GranuleKVConnector:
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         self._run_sync_request(src_to_dst, operation="read")
 
+    @property
+    def available_request_slots(self) -> int:
+        return self.client.available_request_slots
+
     def submit_request(
         self,
         request_id: str,

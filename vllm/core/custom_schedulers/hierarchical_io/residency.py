@@ -103,6 +103,8 @@ class PrefetchResidencyDirectory:
         if request.prefetch_plan_id is None:
             return
         self._register_correction_plan(request)
+        if request.destination == "host":
+            return
         if request.prefetch_plan_id in self._correction_plans:
             self._restore_stats["prediction_restore_requests"] += 1
             layer_count = (0 if request.layer_range is None else

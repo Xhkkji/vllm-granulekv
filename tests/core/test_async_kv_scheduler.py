@@ -347,8 +347,10 @@ def test_granulekv_sparse_prefetch_selector_is_profiling_only(monkeypatch):
         reuse_seq, Device.GPU) == 0
 
 
+@pytest.mark.parametrize("host_staging", [False, True])
 def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
-        monkeypatch):
+        monkeypatch, host_staging):
+    monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE", str(int(host_staging)))
     monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
     monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
@@ -379,6 +381,17 @@ def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
     scheduler.add_seq_group(reuse_group)
     assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
+    if host_staging:
+        assert [(r.layer_range, r.destination) for r in windows] == [
+            ((0, 2), "gpu"), ((0, 2), "host"), ((2, 4), "host")]
+        coverage = [(layer, key.logical_index) for r in windows
+                    for layer in range(*r.layer_range) for key in r.logical_blocks]
+        assert sorted(coverage) == [(layer, block) for layer in range(4)
+                                    for block in range(2)]
+        assert all(pair[1] == key.logical_index for r in windows
+                   if r.destination == "host"
+                   for pair, key in zip(r.block_mapping, r.logical_blocks))
+        return
     assert [len(request.block_mapping) for request in windows] == [1, 1]
     assert all(request.consumer_num_blocks == 3 for request in windows)
     assert all(request.consumer_block_indices == (1, 2)
@@ -438,6 +451,77 @@ def test_granulekv_layer_barrier_dispatches_after_first_unit(monkeypatch):
     assert scheduler.block_manager.get_granulekv_cached_prefix_blocks(
         reuse_seq, Device.GPU) == 2
     assert scheduler.running.count(reuse_group) == 1
+
+
+@pytest.mark.parametrize("suffix_tokens", [0, 4])
+@pytest.mark.parametrize("terminal", ["ready", "error", "abort"])
+def test_finished_restore_registers_replicas_before_store(
+        monkeypatch, suffix_tokens, terminal):
+    monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "1")
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+    prefix = list(range(8))
+    source, source_group = create_dummy_prompt(
+        "980", prompt_tokens=prefix, block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+        store.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    scheduler.get_and_reset_finished_requests_ids()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+
+    seq, group = create_dummy_prompt(
+        "981", prompt_tokens=prefix + list(range(100, 100 + suffix_tokens)),
+        block_size=4)
+    scheduler.add_seq_group(group)
+    assert scheduler._maybe_start_granulekv_prefix_restore() == 1
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+        windows[0].request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    schedule_and_update_computed_tokens(scheduler)
+    seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+    scheduler.free_seq(seq)
+    scheduler.free_finished_seq_groups()
+    assert not scheduler.prefix_saving
+    assert seq.seq_id in scheduler.block_manager.block_tables
+    assert not scheduler.get_and_reset_finished_requests_ids()
+    assert scheduler.has_unfinished_seqs()
+    if terminal == "abort":
+        scheduler.abort_seq_group(group.request_id)
+        assert seq.seq_id in scheduler.block_manager.block_tables
+        assert not scheduler.get_and_reset_finished_requests_ids()
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+        windows[1].request_id, AsyncKVTransferState.ERROR
+        if terminal == "error" else AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    assert not scheduler.hierarchical_prefix_loading
+    if terminal == "ready":
+        writes = scheduler.drain_async_kv_transfers_to_submit()
+        assert len(writes) == 1
+        assert [block.logical_index for block in writes[0].logical_blocks] == (
+            [2] if suffix_tokens else [])
+        scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+            writes[0].request_id, AsyncKVTransferState.READY))
+        scheduler.complete_ready_async_kv_transfers()
+    else:
+        assert not scheduler.prefix_saving
+        assert seq.status == (SequenceStatus.FINISHED_ABORTED
+                              if terminal == "abort" else
+                              SequenceStatus.FINISHED_IGNORED)
+    assert seq.seq_id not in scheduler.block_manager.block_tables
+    assert scheduler.get_and_reset_finished_requests_ids() == [group.request_id]
+    scheduler.complete_ready_async_kv_transfers()
+    assert not scheduler.get_and_reset_finished_requests_ids()
 
 
 def test_granulekv_hierarchical_full_hit_recomputes_only_last_token(monkeypatch):
@@ -531,6 +615,49 @@ def test_granulekv_hierarchical_abort_waits_for_all_windows(monkeypatch):
     assert not scheduler.hierarchical_prefix_loading
     assert not scheduler.hierarchical_prefix_admitted
     assert not scheduler.block_manager._prefix_restore_reservations
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_rolling_restore_failure_discards_future_windows_and_drains_active(monkeypatch, abort):
+    for key, value in {
+        "PREFIX_ENABLE": "1", "HIERARCHICAL_IO_ENABLE": "1",
+        "HIERARCHICAL_NUM_LAYERS": "6", "HIERARCHICAL_WINDOW_LAYERS": "2",
+        "HIERARCHICAL_ROLLING_ENABLE": "1", "HIERARCHICAL_LAYER_BARRIER": "1",
+        "HIERARCHICAL_LEAD_WINDOWS": "1", "HIERARCHICAL_MAX_LEAD_WINDOWS": "1",
+    }.items():
+        monkeypatch.setenv("VLLM_GRANULEKV_" + key, value)
+    scheduler = _create_scheduler(enable_prefix_caching=True)
+    source, source_group = create_dummy_prompt("990", prompt_tokens=list(range(8)), block_size=4)
+    scheduler.add_seq_group(source_group)
+    schedule_and_update_computed_tokens(scheduler)
+    source.status = SequenceStatus.FINISHED_STOPPED
+    scheduler.free_seq(source)
+    scheduler.free_finished_seq_groups()
+    store = scheduler.drain_async_kv_transfers_to_submit()[0]
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(store.request_id, AsyncKVTransferState.READY))
+    scheduler.complete_ready_async_kv_transfers()
+    scheduler.get_and_reset_finished_requests_ids()
+    assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
+    seq, group = create_dummy_prompt("991", prompt_tokens=list(range(8)) + [50], block_size=4)
+    scheduler.add_seq_group(group)
+    scheduler._maybe_start_granulekv_prefix_restore()
+    windows = scheduler.drain_async_kv_transfers_to_submit()
+    assert len(windows) == 3
+    assert [r.activate_on_submit for r in windows] == [True, False, False]
+    if abort:
+        scheduler.abort_seq_group(group.request_id)
+        assert seq.seq_id in scheduler.block_manager.block_tables
+        assert not scheduler.get_and_reset_finished_requests_ids()
+    scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+        windows[0].request_id, AsyncKVTransferState.READY if abort else AsyncKVTransferState.ERROR))
+    scheduler.complete_ready_async_kv_transfers()
+    scheduler.complete_ready_async_kv_transfers()
+    assert set(scheduler.drain_staged_async_kv_discards()) == {r.request_id for r in windows[1:]}
+    assert not scheduler.hierarchical_prefix_loading
+    assert not scheduler.async_kv_policy.has_outstanding
+    assert group not in scheduler.running
+    assert seq.seq_id not in scheduler.block_manager.block_tables
+    assert scheduler.get_and_reset_finished_requests_ids() == [group.request_id]
 
 
 @pytest.mark.parametrize(
@@ -1035,3 +1162,29 @@ def test_scheduler_consumes_dynamic_sparse_restore_feedback(monkeypatch):
 def test_prediction_metadata_key_ignores_generated_complete_blocks():
     sequence = type("Sequence", (), {"get_prompt_len": lambda self: 8192})()
     assert _prompt_prefix_block_count(sequence, 16) == 512
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_engine_discards_cancelled_templates_before_poll_can_activate_them(active):
+    from types import SimpleNamespace
+    from vllm.engine.llm_engine import LLMEngine
+
+    order = []
+    scheduler = SimpleNamespace(
+        drain_staged_async_kv_discards=lambda: ("future",),
+        has_active_async_kv_transfer=lambda: active,
+        apply_async_kv_event=lambda event: None,
+        complete_ready_async_kv_transfers=lambda: order.append("complete"))
+
+    def rpc(method, args):
+        order.append(method)
+        if method == "discard_staged_async_kv_transfers":
+            assert args == (0, ("future",))
+        return [[]]
+
+    engine = SimpleNamespace(scheduler=[scheduler],
+                             model_executor=SimpleNamespace(collective_rpc=rpc),
+                             _merge_async_kv_worker_events=LLMEngine._merge_async_kv_worker_events)
+    LLMEngine._poll_async_kv_scheduler(engine, 0)
+    assert order == (["discard_staged_async_kv_transfers", "poll_async_kv_transfers", "complete"]
+                     if active else ["discard_staged_async_kv_transfers"])

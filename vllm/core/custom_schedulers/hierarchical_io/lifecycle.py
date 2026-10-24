@@ -55,12 +55,14 @@ class HierarchicalRestoreController:
         self._request_to_plan: Dict[str, Tuple[str, int]] = {}
 
     def register(self, plan: PrefetchPlan,
-                 request_ids: Sequence[str]) -> None:
-        ids = tuple(request_ids)
+                 requests: Sequence[Tuple[str, int]]) -> None:
+        ids = tuple(request_id for request_id, _ in requests)
         if plan.plan_id in self._states:
             raise ValueError(f"duplicate hierarchical plan: {plan.plan_id}")
-        if len(ids) != len(plan.units) or len(set(ids)) != len(ids):
-            raise ValueError("one unique request_id is required per unit")
+        if (len(set(ids)) != len(ids)
+                or {index for _, index in requests} != set(range(len(plan.units)))
+                or requests[0][1] != 0):
+            raise ValueError("unique requests must cover every window; admission first")
         if any(request_id in self._request_to_plan for request_id in ids):
             raise ValueError("hierarchical request_id is already registered")
 
@@ -70,7 +72,7 @@ class HierarchicalRestoreController:
             terminal_request_ids=set(),
             ready_request_ids=set(),
         )
-        for index, request_id in enumerate(ids):
+        for request_id, index in requests:
             self._request_to_plan[request_id] = (plan.plan_id, index)
 
     def contains_request(self, request_id: str) -> bool:
@@ -87,7 +89,7 @@ class HierarchicalRestoreController:
         state, unit = self._mark_terminal(request_id)
         state.ready_request_ids.add(request_id)
         became_ready = False
-        if (unit.index == 0
+        if (request_id == state.request_ids[0]
                 and state.first_unit_ready_monotonic_ns is None):
             state.first_unit_ready_monotonic_ns = (
                 time.monotonic_ns()

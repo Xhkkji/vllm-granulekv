@@ -11,6 +11,40 @@ from vllm.attention.ops.sparse_kv import (
     validate_sparse_kv_prediction)
 
 
+@pytest.mark.parametrize("with_output", [False, True])
+def test_host_window_selection_precedes_single_query_metadata(monkeypatch, with_output):
+    from types import SimpleNamespace
+    import vllm.attention.layer as module
+    from vllm.core.custom_schedulers.hierarchical_io import (
+        activate_layer_barrier, activate_sparse_kv_blocks)
+
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_HOST_BACKING_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE", False)
+    converted = object()
+    original = SimpleNamespace(num_prefills=1, num_prefill_tokens=1, num_decode_tokens=0,
+                               single_token_sparse_prefill=lambda: converted)
+    seen = []
+    layer = SimpleNamespace(num_heads=1, head_size=2, kv_cache=[None],
+                            impl=SimpleNamespace(forward=lambda *args, **kw: seen.append(args[5])))
+    name = "model.layers.4.self_attn.attn"
+    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(
+        attn_metadata=original, no_compile_layers={name: layer}, virtual_engine=0))
+    monkeypatch.setattr(module, "wait_for_kv_layer_from_connector", lambda *a: None)
+    monkeypatch.setattr(module, "maybe_save_kv_layer_to_connector", lambda *a: None)
+    monkeypatch.setattr(module, "_observe_decode_query", lambda *a: None)
+    tensor = torch.ones(1, 1, 2)
+    with activate_layer_barrier(lambda *a: None, virtual_engine=0,
+                               request_ids=("req",),
+                               correction_callback=lambda *a: (0, 4)):
+        with activate_sparse_kv_blocks(None):
+            if with_output:
+                module.unified_attention_with_output(tensor, tensor, tensor, tensor, name)
+            else:
+                module.unified_attention(tensor, tensor, tensor, name)
+    assert seen == [converted]
+
+
 def test_compact_block_table_accepts_gpu_selection():
     try:
         table = torch.tensor([[11, 22, 33, 44]],

@@ -67,8 +67,9 @@ class _UnitState:
 @dataclass
 class _PlanState:
     plan_id: str
-    units: Dict[int, _UnitState]
+    units: Dict[Tuple[int, str], _UnitState]
     lead_units: int
+    activation_limit: int = 0
 
 
 class RollingPrefetchRuntime:
@@ -102,11 +103,12 @@ class RollingPrefetchRuntime:
             _PlanState(plan_id=plan_id,
                        units={},
                        lead_units=self.config.lead_units))
-        if unit_index in plan.units:
+        member = (unit_index, request.destination)
+        if member in plan.units:
             raise RuntimeError(
                 f"duplicate prefetch unit: {plan_id}/{unit_index}")
         unit = _UnitState(request=request, mapping=mapping)
-        plan.units[unit_index] = unit
+        plan.units[member] = unit
         self.residency.register(request)
         if not request.activate_on_submit:
             return ()
@@ -123,9 +125,18 @@ class RollingPrefetchRuntime:
         self,
         virtual_engine: int,
         poll: PollCallback,
+        submit: SubmitCallback,
+        available_slots: Callable[[], int],
     ) -> Tuple[AsyncKVTransferEvent, ...]:
         """非阻塞推进当前 engine 的 active units，并回收待上报事件。"""
         self._progress(virtual_engine, poll)
+        for (engine, _), plan in self._plans.items():
+            if engine != virtual_engine:
+                continue
+            first = next(iter(plan.units.values()), None)
+            if first is not None and first.terminal is not None:
+                plan.activation_limit = max(plan.activation_limit, plan.lead_units)
+            self._activate_until(plan, plan.activation_limit, None, submit, available_slots)
         events = tuple(self._events)
         self._events.clear()
         for plan_key, plan in tuple(self._plans.items()):
@@ -155,7 +166,7 @@ class RollingPrefetchRuntime:
         submit: SubmitCallback,
         poll: PollCallback,
         *,
-        max_active: int,
+        available_slots: Callable[[], int],
         sleep_seconds: float = 0.0001,
     ) -> None:
         """滚动激活未来 unit，并等待当前 consumer 对应 unit READY。
@@ -186,15 +197,21 @@ class RollingPrefetchRuntime:
                 raise RuntimeError(
                     "layer working-set KV was already evicted; this minimal "
                     "validation path only supports one model forward")
-            self._activate_until(virtual_engine, plan, request_id_set,
-                                 current_index + plan.lead_units, consumer_index,
-                                 submit, poll, max_active, sleep_seconds)
+            plan.activation_limit = max(plan.activation_limit,
+                                        current_index + plan.lead_units)
+            self._activate_until(plan, plan.activation_limit, consumer_index,
+                                 submit, available_slots)
             wait_started_ns = time.monotonic_ns()
             while current.terminal is None:
+                failed = next((unit.terminal for unit in plan.units.values()
+                               if unit.terminal is not None and
+                               unit.terminal.state == AsyncKVTransferState.ERROR), None)
+                if failed is not None:
+                    raise RuntimeError(f"prefetch window failed: {failed.error}")
                 if not current.active:
-                    self._activate_until(virtual_engine, plan, request_id_set,
-                                         current_index, consumer_index, submit,
-                                         poll, max_active, sleep_seconds)
+                    self._progress(virtual_engine, poll)
+                    self._activate_until(plan, current_index, consumer_index,
+                                         submit, available_slots)
                     if not current.active and current.terminal is None:
                         time.sleep(sleep_seconds)
                         continue
@@ -225,9 +242,8 @@ class RollingPrefetchRuntime:
                     wait_ns=wait_ns,
                     lead_units=plan.lead_units,
                 ))
-            self._activate_until(virtual_engine, plan, request_id_set,
-                                 current_index + plan.lead_units, consumer_index,
-                                 submit, poll, max_active, sleep_seconds)
+            self._activate_until(plan, current_index + plan.lead_units,
+                                 consumer_index, submit, available_slots)
 
     def release_layer(
         self,
@@ -247,7 +263,7 @@ class RollingPrefetchRuntime:
         for (engine, plan_id), plan in self._plans.items():
             if engine != virtual_engine:
                 continue
-            for unit_index, unit in plan.units.items():
+            for (unit_index, _), unit in plan.units.items():
                 request = unit.request
                 if (request.seq_group_id not in request_id_set
                         or request.layer_range is None
@@ -340,7 +356,7 @@ class RollingPrefetchRuntime:
         poll: PollCallback,
         cancel: Optional[CancelCallback] = None,
         *,
-        max_active: int,
+        available_slots: Callable[[], int],
         timeout_seconds: float,
         sleep_seconds: float = 0.0001,
         poll_correction_only: bool = False,
@@ -349,7 +365,7 @@ class RollingPrefetchRuntime:
         if self.config.working_set_enabled:
             raise RuntimeError(
                 "sparse correction does not support layer working-set mode")
-        if max_active <= 0 or timeout_seconds <= 0:
+        if timeout_seconds <= 0:
             raise ValueError("invalid sparse correction runtime limits")
         projection = self.residency.project_correction(
             state, layer_index, missing_blocks)
@@ -369,7 +385,7 @@ class RollingPrefetchRuntime:
         mapping = prepare_mapping(projection.block_mapping)
         total_started = time.perf_counter()
         deadline = time.monotonic() + timeout_seconds
-        while self._active_count(virtual_engine) >= max_active:
+        while available_slots() <= 0:
             self._progress(virtual_engine, poll)
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -420,26 +436,23 @@ class RollingPrefetchRuntime:
 
     def _activate_until(
         self,
-        virtual_engine: int,
         plan: _PlanState,
-        request_ids: frozenset[str],
         last_unit_index: int,
-        consumer_index: int,
+        consumer_index: Optional[int],
         submit: SubmitCallback,
-        poll: PollCallback,
-        max_active: int,
-        sleep_seconds: float,
+        available_slots: Callable[[], int],
     ) -> None:
+        if any(unit.terminal is not None
+               and unit.terminal.state == AsyncKVTransferState.ERROR
+               for unit in plan.units.values()):
+            return
         due = tuple(
-            unit for index, unit in sorted(plan.units.items())
+            unit for (index, _), unit in sorted(plan.units.items())
             if index <= last_unit_index
-            and unit.request.seq_group_id in request_ids
             and not unit.active and unit.terminal is None)
         for unit in due:
-            while self._active_count(virtual_engine) >= max_active:
-                self._progress(virtual_engine, poll)
-                if self._active_count(virtual_engine) >= max_active:
-                    time.sleep(sleep_seconds)
+            if unit.request.block_mapping and available_slots() <= 0:
+                return
             self._activate(unit, submit, report_activation=True,
                            layer_index=consumer_index,
                            lead_units=plan.lead_units)
@@ -486,10 +499,27 @@ class RollingPrefetchRuntime:
                 if not unit.active or unit.terminal is not None:
                     continue
                 event = poll(unit.request)
+                if unit.terminal is not None:
+                    continue
                 if event.state == AsyncKVTransferState.PENDING:
                     continue
                 self._finish(unit, event)
                 self._events.append(event)
+
+    def complete_request(self, virtual_engine: int,
+                         event: AsyncKVTransferEvent) -> None:
+        """Reconcile targeted host polling with parent completion exactly once."""
+        if event.state == AsyncKVTransferState.PENDING:
+            return
+        for (engine, _), plan in self._plans.items():
+            if engine != virtual_engine:
+                continue
+            for unit in plan.units.values():
+                if unit.request.request_id == event.request_id:
+                    if unit.terminal is None:
+                        self._finish(unit, event)
+                        self._events.append(event)
+                    return
 
     def _finish(self, unit: _UnitState,
                 event: AsyncKVTransferEvent) -> None:
@@ -510,12 +540,6 @@ class RollingPrefetchRuntime:
                 unit_index=unit_index,
                 monotonic_ns=unit.ready_monotonic_ns,
             ))
-
-    def _active_count(self, virtual_engine: int) -> int:
-        return sum(
-            1 for (engine, _), plan in self._plans.items()
-            if engine == virtual_engine for unit in plan.units.values()
-            if unit.active and unit.terminal is None)
 
     @staticmethod
     def _identity(request: AsyncKVTransferRequest) -> Tuple[str, int]:

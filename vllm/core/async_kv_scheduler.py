@@ -473,7 +473,8 @@ class AsyncKVScheduler(Scheduler):
         selected_block_counts = []
         selected_logical_counts = []
         read_fragments_estimate = 0
-        host_stage_active = False
+        host_staging = (envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE
+                        and plan.consumer_enabled and plan.access_plan is not None)
         for unit in plan.units:
             # dense layer plan 的 block_indices 为 None，投影结果与历史逻辑
             # 完全一致。sparse-style selector 只改变 unit 的 block 选择，不
@@ -503,48 +504,16 @@ class AsyncKVScheduler(Scheduler):
             else:
                 consumer_block_indices = unit.block_indices
                 consumer_blocks_by_layer = unit.consumer_blocks_by_layer
-            host_block_mapping = None
-            host_layer_range = None
-            host_tail_block_mapping = None
-            host_tail_layer_range = None
-            host_staging = (
-                envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE
-                and plan.consumer_enabled and plan.access_plan is not None)
-            if host_staging and unit.index == 0:
-                gpu_prefix = frozenset(
-                    key.logical_index for key in logical_blocks)
-                host_block_mapping = tuple(
-                    (int(pair[0]), int(key.logical_index))
-                    for pair, key in zip(reservation.block_mapping,
-                                         reservation.logical_blocks)
-                    if key.logical_index not in gpu_prefix)
-                host_layer_range = (
-                    0, self.hierarchical_io_config.num_layers)
-                tail_start = unit.layer_range[1]
-                if tail_start < self.hierarchical_io_config.num_layers:
-                    host_tail_block_mapping = tuple(
-                        (int(pair[0]), int(key.logical_index))
-                        for pair, key in zip(reservation.block_mapping,
-                                             reservation.logical_blocks)
-                        if key.logical_index in gpu_prefix)
-                    if not host_tail_block_mapping:
-                        host_tail_block_mapping = None
-                    else:
-                        host_tail_layer_range = (
-                            tail_start,
-                            self.hierarchical_io_config.num_layers)
-                host_stage_active = bool(
-                    host_block_mapping or host_tail_block_mapping)
-            if host_stage_active and unit.index > 0:
-                # The first unit's complement is the single SSD -> host bulk
-                # transfer. Future units remain in the runtime so layer
-                # barriers keep their existing ordering, but must not issue a
-                # second SSD read for blocks that are now host-owned.
-                block_mapping = ()
-                logical_blocks = ()
+            destination = "gpu"
+            if host_staging and unit.index > 0:
+                destination = "host"
+                logical_blocks = reservation.logical_blocks
+                block_mapping = tuple(
+                    (int(pair[0]), key.logical_index)
+                    for pair, key in zip(reservation.block_mapping, logical_blocks))
             selected_block_counts.append(len(block_mapping))
             selected_logical_counts.append(len(logical_blocks))
-            read_fragments_estimate += len(block_mapping) * unit.num_layers * 2
+            read_fragments_estimate += len(block_mapping) * unit.num_layers
             requests.append(
                 self.async_kv_policy.enqueue(
                     seq_group.request_id,
@@ -577,14 +546,29 @@ class AsyncKVScheduler(Scheduler):
                         if unit.index == 0 and plan.access_plan is not None
                         and plan.access_plan.source ==
                         "solidattention_dynamic" else None),
-                    host_block_mapping=host_block_mapping,
-                    host_layer_range=host_layer_range,
-                    host_tail_block_mapping=host_tail_block_mapping,
-                    host_tail_layer_range=host_tail_layer_range,
+                    destination=destination,
                 ))
+            if host_staging and unit.index == 0:
+                gpu_blocks = {key.logical_index for key in logical_blocks}
+                complement = tuple(
+                    (pair, key) for pair, key in zip(
+                        reservation.block_mapping, reservation.logical_blocks)
+                    if key.logical_index not in gpu_blocks)
+                requests.append(self.async_kv_policy.enqueue(
+                    seq_group.request_id, reservation.reservation_id,
+                    AsyncKVTransferOperation.READ,
+                    tuple((int(pair[0]), key.logical_index)
+                          for pair, key in complement),
+                    tuple(key for _, key in complement),
+                    layer_range=unit.layer_range,
+                    prefetch_plan_id=plan.plan_id,
+                    prefetch_unit_index=unit.index,
+                    destination="host"))
+                read_fragments_estimate += len(complement) * unit.num_layers
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(
-            plan, tuple(request.request_id for request in requests))
+            plan, tuple((request.request_id, request.prefetch_unit_index)
+                        for request in requests))
         self.hierarchical_prefix_loading[plan.plan_id] = seq_group
 
         logger.info(
@@ -608,11 +592,12 @@ class AsyncKVScheduler(Scheduler):
                       (unit.layer_range for unit in plan.units)),
             read_fragments_estimate,
         )
-        for request, unit in zip(requests, plan.units):
+        for request in requests:
+            unit = plan.units[request.prefetch_unit_index]
             logger.info(
                 "[GRANULEKV_HIERARCHICAL] phase=window_queued plan_id=%s "
                 "request_id=%s window=%d/%d layer_range=[%d,%d) "
-                "selected_blocks=%d",
+                "selected_blocks=%d destination=%s",
                 plan.plan_id,
                 request.request_id,
                 unit.index,
@@ -620,6 +605,7 @@ class AsyncKVScheduler(Scheduler):
                 unit.start_layer,
                 unit.end_layer,
                 len(request.block_mapping),
+                request.destination,
             )
 
     def _preempt_long_context_victims_for_waiting(self) -> int:
@@ -1026,6 +1012,13 @@ class AsyncKVScheduler(Scheduler):
             raise RuntimeError(
                 f"missing hierarchical prefix plan: {progress.plan_id}")
 
+        if progress.failed:
+            self._discard_queued_restore_windows(progress.plan_id)
+            if seq_group in self.running:
+                self.running.remove(seq_group)
+            if seq_group in ready_groups:
+                ready_groups.remove(seq_group)
+
         logger.info(
             "[GRANULEKV_HIERARCHICAL] phase=window_%s plan_id=%s "
             "request_id=%s seq_group_id=%s window=%d layer_range=[%d,%d)",
@@ -1038,6 +1031,7 @@ class AsyncKVScheduler(Scheduler):
             progress.unit.end_layer,
         )
         if (progress.first_unit_became_ready
+                and not progress.failed and not progress.cancelled
                 and (not progress.profiling_only or progress.consumer_enabled)):
             # 这是 Step 2 的 first-window-ready admission。该集合表示调度器
             # 已接受请求并可在未来交给 layer pipeline；当前不修改 RUNNING
@@ -1143,14 +1137,11 @@ class AsyncKVScheduler(Scheduler):
                 for seq in seq_group.get_seqs():
                     if not seq.is_finished():
                         seq.status = SequenceStatus.FINISHED_IGNORED
-                super()._free_finished_seq_group(seq_group)
             else:
                 for seq in seq_group.get_seqs():
-                    if not seq.is_finished():
-                        seq.status = (SequenceStatus.FINISHED_ABORTED
-                                      if progress.cancelled else
-                                      SequenceStatus.FINISHED_IGNORED)
-                super()._free_finished_seq_group(seq_group)
+                    seq.status = (SequenceStatus.FINISHED_ABORTED
+                                  if progress.cancelled else
+                                  SequenceStatus.FINISHED_IGNORED)
             logger.info(
                 "[GRANULEKV_HIERARCHICAL] phase=restore_aborted "
                 "plan_id=%s seq_group_id=%s failed=%s cancelled=%s "
@@ -1167,6 +1158,14 @@ class AsyncKVScheduler(Scheduler):
         self.hierarchical_prefix_restores.release(progress.plan_id)
         del self.hierarchical_prefix_loading[progress.plan_id]
         self._hierarchical_rolling_staged_plans.discard(progress.plan_id)
+        if seq_group.is_finished():
+            # Replica registration must precede store reservation. A request
+            # can finish while later restore windows still own its tables.
+            if seq_group in self.running:
+                self.running.remove(seq_group)
+            if seq_group in ready_groups:
+                ready_groups.remove(seq_group)
+            self._free_finished_seq_group(seq_group)
 
     @staticmethod
     def _advance_restored_prefix_frontier(
@@ -1238,6 +1237,10 @@ class AsyncKVScheduler(Scheduler):
         ``free_finished_seq_groups``。GranuleKV prefix 必须在这里保住 GPU table，
         否则稍后的 group hook 已经没有可写入 GranuleKV 的 KV source。
         """
+        if any(seq is candidate
+               for group in self.hierarchical_prefix_loading.values()
+               for candidate in group.get_seqs()):
+            return
         if (self.granulekv_prefix_enabled and seq.is_finished()
                 and seq.seq_id in self.block_manager.block_tables):
             seq_group = next(
@@ -1268,6 +1271,9 @@ class AsyncKVScheduler(Scheduler):
         请求对客户端已经完成，但 block 资源会保留到 GranuleKV DONE；Engine 通过
         ``prefix_saving`` 继续推进空调度轮次，不会提前复用 DMA source。
         """
+        if any(group is seq_group
+               for group in self.hierarchical_prefix_loading.values()):
+            return True
         if (not self.granulekv_prefix_enabled or not seq_group.is_finished()
                 or (not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and (
                     envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
@@ -1355,6 +1361,16 @@ class AsyncKVScheduler(Scheduler):
             if real_request_id in request_ids:
                 self._remove_from_swapped(seq_group)
 
+        # The base abort also sends worker cleanup notifications. Keep admitted
+        # restores out of that path until every DMA has reached a terminal state.
+        for seq_group in self.hierarchical_prefix_loading.values():
+            parent = seq_id_to_seq_group.get(seq_group.request_id)
+            real_request_id = (parent.group_id if parent is not None
+                               else seq_group.request_id)
+            if real_request_id in request_ids:
+                for queue in (self.waiting, self.running, self.swapped):
+                    if seq_group in queue:
+                        queue.remove(seq_group)
         super().abort_seq_group(request_ids, seq_id_to_seq_group)
         # 层级 restore 的 group 已从 waiting 摘出，但在 full restore 前也未放
         # 入 running，因此父类看不到它。这里只标记父事务取消；所有 window
@@ -1374,13 +1390,7 @@ class AsyncKVScheduler(Scheduler):
             # 未激活 unit 没有 DMA，可以立即在 Scheduler 标记 ERROR，并让
             # Worker 丢弃 staged descriptor。已激活 unit 仍自然完成，父事务
             # 等全部 unit 终态后才释放目标 block。
-            queued = self.async_kv_policy.requests_for_plan(
-                plan_id, state=AsyncKVTransferState.QUEUED)
-            for request in queued:
-                self.async_kv_policy.fail_queued(
-                    request.request_id, "prefetch plan was cancelled")
-                if plan_id in self._hierarchical_rolling_staged_plans:
-                    self._staged_async_kv_discards.append(request.request_id)
+            self._discard_queued_restore_windows(plan_id)
 
         if self._staged_async_kv_discards:
             self.complete_ready_async_kv_transfers()
@@ -1426,11 +1436,13 @@ class AsyncKVScheduler(Scheduler):
         for plan_id in tuple(rolling_plan_ids):
             if plan_id in self._hierarchical_rolling_staged_plans:
                 continue
-            initial = self.async_kv_policy.activate_plan(
-                plan_id, self.hierarchical_io_config.rolling.initial_units)
+            initial_count = sum(
+                request.prefetch_unit_index < self.hierarchical_io_config.rolling.initial_units
+                for request in self.async_kv_policy.requests_for_plan(plan_id))
+            initial = self.async_kv_policy.activate_plan(plan_id, initial_count)
             # 没拿到完整首批 slot 时暂不 stage。否则 Worker 只有未来模板，
             # 首窗却仍是 QUEUED，首窗 READY admission 永远无法发生。
-            if len(initial) < self.hierarchical_io_config.rolling.initial_units:
+            if len(initial) < initial_count:
                 continue
             requests.extend(initial)
             requests.extend(self.async_kv_policy.stage_plan(plan_id))
@@ -1441,6 +1453,14 @@ class AsyncKVScheduler(Scheduler):
         requests.extend(self.async_kv_policy.activate_next(
             excluded_plan_ids=tuple(rolling_plan_ids)))
         return tuple(requests)
+
+    def _discard_queued_restore_windows(self, plan_id: str) -> None:
+        for request in self.async_kv_policy.requests_for_plan(
+                plan_id, state=AsyncKVTransferState.QUEUED):
+            self.async_kv_policy.fail_queued(
+                request.request_id, "prefetch plan failed or was cancelled")
+            if plan_id in self._hierarchical_rolling_staged_plans:
+                self._staged_async_kv_discards.append(request.request_id)
 
     def drain_staged_async_kv_discards(self) -> Tuple[str, ...]:
         """返回需要 Worker 删除、且确认从未激活的 descriptor templates。"""

@@ -460,9 +460,9 @@ def unified_attention(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
                                   self.num_heads, self.head_size)
+    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     output = self.impl.forward(self, query, key, value, kv_cache,
                                attn_metadata)
     # Record this query only after the current attention has consumed it.  The
@@ -504,9 +504,9 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     _correct_decode_sparse_blocks(layer_name, attn_metadata, query,
                                   self.num_heads, self.head_size)
+    attn_metadata = _sparse_prefill_metadata(attn_metadata)
     self.impl.forward(self,
                       query,
                       key,

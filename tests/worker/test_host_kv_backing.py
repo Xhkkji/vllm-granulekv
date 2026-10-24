@@ -42,6 +42,8 @@ def worker(monkeypatch):
                  "_gpu_pending_transfers", "_pending_h2d_transfers"):
         setattr(result, name, {})
     result._pending_host_writes = {}
+    result._prefetch_runtime = module.RollingPrefetchRuntime(
+        module.RollingPrefetchConfig())
     for name in ("_host_ready_blocks", "_host_staged_blocks",
                  "_host_failed_blocks", "_backing_retired", "_ssd_read_blocks"):
         setattr(result, name, set())
