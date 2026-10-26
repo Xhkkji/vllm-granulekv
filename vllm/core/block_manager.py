@@ -8,7 +8,8 @@ from typing import Tuple
 
 import vllm.envs as envs
 from vllm.core.block.block_table import BlockTable
-from vllm.core.custom_schedulers.hierarchical_io.plan import uses_bounded_gpu_slots
+from vllm.core.custom_schedulers.hierarchical_io.plan import (
+    uses_bounded_gpu_slots, uses_host_kv_writeback)
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
 from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
@@ -916,7 +917,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             raise ValueError("prefix store requires a normally finished sequence")
         return self._reserve_swap(
             seq_group, None, Device.GPU, Device.CPU,
-            complete_only=envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE)
+            complete_only=uses_host_kv_writeback())
 
     def can_reserve_granulekv_prefix_store(self,
                                      seq_group: SequenceGroup) -> bool:
@@ -924,7 +925,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         required = 0
         for seq in seq_group.get_seqs():
             source_blocks = tuple(self.block_tables[seq.seq_id].blocks)
-            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+            if uses_host_kv_writeback():
                 source_blocks = source_blocks[:
                     seq.data.get_num_computed_tokens() // self.block_size]
             if any(

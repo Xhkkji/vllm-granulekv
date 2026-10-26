@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 import vllm.envs as envs
+from vllm.core.custom_schedulers.hierarchical_io.plan import uses_host_kv_writeback
 from vllm.attention import get_attn_backend
 from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
 from vllm.core.custom_schedulers.async_kv_transfer import (
@@ -66,12 +67,12 @@ class CacheEngine:
         self.granulekv_host_staging = (
             self.granulekv_enabled
             and envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE)
-        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+        if (uses_host_kv_writeback()
                 and not (envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE
                          and self.granulekv_host_staging
                          and envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE)):
             raise ValueError("host backing requires async pinned host transfers")
-        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
+        if uses_host_kv_writeback():
             required = ((model_config.max_model_len + cache_config.block_size - 1)
                         // cache_config.block_size)
             if envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS < required:

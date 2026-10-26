@@ -11,6 +11,7 @@ from collections import deque
 from typing import Callable, Iterable, List, Optional, Set, Tuple
 
 import vllm.envs as envs
+from vllm.core.custom_schedulers.hierarchical_io.plan import uses_host_kv_writeback
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.block.interfaces import BlockAllocator
 from vllm.core.block_reservation import (BlockPrefixRestoreReservation,
@@ -299,7 +300,7 @@ class AsyncKVScheduler(Scheduler):
         # The fixed host cache has a single owner. A finished host write
         # retains its admission slot until DMA completes, just like a read.
         host_write_slots = (len(self.prefix_saving)
-                            if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE else 0)
+                            if uses_host_kv_writeback() else 0)
         return host_write_slots + sum(
             group.get_max_num_running_seqs()
             for group in (*self.loading.values(),
@@ -802,7 +803,7 @@ class AsyncKVScheduler(Scheduler):
             page_index_key = _prefix_page_index_key(
                 seq_group, self.cache_config.block_size, num_prefix_blocks)
         host_write = (prefix and operation == AsyncKVTransferOperation.WRITE
-                      and envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE)
+                      and uses_host_kv_writeback())
         mapping = (tuple((key.logical_index, pair[1]) for key, pair in zip(
             reservation.logical_blocks, reservation.block_mapping))
                    if host_write else reservation.block_mapping)
@@ -1287,7 +1288,7 @@ class AsyncKVScheduler(Scheduler):
                for group in self.hierarchical_prefix_loading.values()):
             return True
         if (not self.granulekv_prefix_enabled or not seq_group.is_finished()
-                or (not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and (
+                or (not uses_host_kv_writeback() and (
                     envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
                     or seq_group.request_id in self._sparse_restore_seq_group_ids))):
             # working-set 已覆盖早期层，不能从当前 HBM regions 回写完整 KV。
@@ -1299,7 +1300,7 @@ class AsyncKVScheduler(Scheduler):
                            SequenceStatus.FINISHED_LENGTH_CAPPED)
             for seq in seqs)
         has_full_block = any((seq.data.get_num_computed_tokens()
-                              if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                              if uses_host_kv_writeback()
                               else seq.get_len()) >= self.cache_config.block_size
                              for seq in seqs)
         has_block_table = all(seq.seq_id in self.block_manager.block_tables

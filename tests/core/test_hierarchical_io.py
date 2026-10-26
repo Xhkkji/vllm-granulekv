@@ -311,6 +311,9 @@ def test_layer_working_set_regions_cover_current_and_max_lead_windows():
     values["VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS"] = "4"
     values["VLLM_GRANULEKV_HIERARCHICAL_MAX_LEAD_WINDOWS"] = "1"
     assert get_layer_working_set_regions(values) == 28
+    values["VLLM_GRANULEKV_HOST_BACKING_ENABLE"] = "0"
+    values["VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE"] = "1"
+    assert get_layer_working_set_regions(values) == 8
 
 
 def test_layer_barrier_reports_consumption_after_wait():

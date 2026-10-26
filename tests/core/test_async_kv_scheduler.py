@@ -39,9 +39,23 @@ def _create_scheduler(enable_prefix_caching: bool = False) -> AsyncKVScheduler:
     return AsyncKVScheduler(scheduler_config, cache_config, None)
 
 
-def test_host_prefix_write_excludes_partial_and_uncomputed_blocks(monkeypatch):
+@pytest.mark.parametrize("dense_writeback", [False, True])
+@pytest.mark.parametrize("abort", [False, True])
+def test_host_prefix_write_excludes_partial_and_uncomputed_blocks(
+        monkeypatch, dense_writeback, abort):
     monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_HOST_BACKING_ENABLE",
+                       "0" if dense_writeback else "1")
+    if dense_writeback:
+        monkeypatch.setenv("VLLM_GRANULEKV_ENABLE", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", "0")
+        monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_ROLLING_ENABLE", "1")
+        monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "28")
+        monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "4")
     scheduler = _create_scheduler(enable_prefix_caching=True)
     seq, group = create_dummy_prompt("808", prompt_tokens=list(range(10)),
                                      block_size=4)
@@ -57,10 +71,18 @@ def test_host_prefix_write_excludes_partial_and_uncomputed_blocks(monkeypatch):
     assert [key.logical_index for key in request.logical_blocks] == [0, 1]
     assert [pair[0] for pair in request.block_mapping] == [0, 1]
     assert seq.seq_id in scheduler.block_manager.block_tables
+    assert scheduler.has_unfinished_seqs()
+    if abort:
+        scheduler.abort_seq_group(group.request_id)
+        assert seq.seq_id in scheduler.block_manager.block_tables
+        assert scheduler.has_unfinished_seqs()
     scheduler.apply_async_kv_event(AsyncKVTransferEvent(
         request.request_id, AsyncKVTransferState.READY))
     scheduler.complete_ready_async_kv_transfers()
     assert seq.seq_id not in scheduler.block_manager.block_tables
+    assert not scheduler.has_unfinished_seqs()
+    if abort:
+        return
     assert scheduler.block_manager.reset_prefix_cache(Device.GPU)
     reuse, reuse_group = create_dummy_prompt(
         "809", prompt_tokens=list(range(10)), block_size=4)

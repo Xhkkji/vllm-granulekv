@@ -29,6 +29,7 @@ from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
 from vllm.engine.output_processor.stop_checker import StopChecker
+from vllm.core.custom_schedulers.hierarchical_io.plan import uses_host_kv_writeback
 from vllm.engine.output_processor.util import create_output_by_sequence_group
 from vllm.entrypoints.openai.logits_processors import (
     get_logits_processors as get_openai_logits_processors)
@@ -1537,7 +1538,7 @@ class LLMEngine:
         # 依靠 loading 状态继续 poll。
         self._submit_async_kv_scheduler_transfers(
             virtual_engine, finished_requests_ids if
-            envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE else ())
+            uses_host_kv_writeback() else ())
 
         if not scheduler_outputs.is_empty():
 

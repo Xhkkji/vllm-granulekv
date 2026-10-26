@@ -402,6 +402,17 @@ class RollingPrefetchConfig:
         return max(1, self.lead_units)
 
 
+def uses_host_kv_writeback() -> bool:
+    """Reuse pinned backing for writes without changing Dense's ring layout."""
+    import vllm.envs as envs
+    return (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE or (
+        envs.VLLM_GRANULEKV_ENABLE
+        and envs.VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE
+        and envs.VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE
+        and not envs.VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE
+        and not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE))
+
+
 def uses_bounded_gpu_slots() -> bool:
     """The existing sparse host-backed path owns layer-local physical slots."""
     import vllm.envs as envs

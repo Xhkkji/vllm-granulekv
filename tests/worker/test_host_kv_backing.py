@@ -251,7 +251,11 @@ def test_retired_request_cannot_publish_host_backing(worker):
     assert not worker._pending_gpu_to_host
 
 
-def test_finish_invalidates_owners_but_keeps_pending_backup_fence(worker):
+@pytest.mark.parametrize("dense", [False, True])
+def test_finish_invalidates_owners_but_keeps_pending_backup_fence(
+        worker, request, dense):
+    if dense:
+        request.getfixturevalue("dense_writeback")
     key = (0, "r", 0, 7)
     fence = Fence()
     worker._discarded_host_transfers = set()
@@ -341,6 +345,80 @@ def test_discarded_host_read_does_not_release_inflight_prefetch_source(worker):
     assert worker._host_staging_owner == (0, "r")
     assert (0, "r") in worker._backing_retired
     assert not worker._host_ready_blocks
+
+
+@pytest.fixture
+def dense_writeback(worker, monkeypatch):
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_HOST_BACKING_ENABLE", False)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_LAYER_WORKING_SET_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE", True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", False)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", False)
+    return worker
+
+
+def test_dense_back_up_only_dirty_tail(dense_writeback):
+    worker = dense_writeback
+    worker._backing_forward[0, "r"] = ((3, 4, 5), 33, 34, False)
+    copies = []
+    ready = Fence()
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, fences: copies.append(mapping.tolist()) or ready)
+    worker._back_up_layer(0, ("r",), 0, Fence())
+    assert copies == [[[5, 2]]]
+    assert worker._pending_gpu_to_host == {(0, "r", 0, 2): ready}
+    assert worker._gpu_region_release_events[0, 0, 5][1] is ready
+    assert worker._host_ready_blocks == set()
+
+
+def test_dense_write_completion_does_not_index_absent_host_prefix(dense_writeback):
+    worker = dense_writeback
+    worker._pending_host_writes[0, "write"] = SimpleNamespace(
+        sparse_page_index_key="prefix", consumer_num_blocks=8,
+        logical_blocks=(LogicalBlockKey(0, 7),))
+    worker._complete_host_write(0, worker.cache_engine[0],
+        AsyncKVTransferEvent("write", AsyncKVTransferState.READY))
+    assert not worker._pending_host_writes
+
+
+def test_dense_window_release_preserves_backup_fence(dense_writeback):
+    worker = dense_writeback
+    ready = Fence()
+    key = (0, "r", 0, 5)
+    worker._gpu_destination_owners[0, 0, 5] = key
+    worker._pending_gpu_to_host[key] = ready
+    worker._gpu_region_release_events[0, 0, 5] = ("r", ready)
+    worker._gpu_transfer_regions[0, "io"] = ("r", (0, 4), ((10, 5),))
+    worker._record_gpu_region_release_event(0, ("r",), 3)
+    assert worker._gpu_region_release_events[0, 0, 5] == ("r", ready)
+
+
+def test_dense_layer_release_also_advances_window(dense_writeback):
+    worker = dense_writeback
+    released = []
+    worker._back_up_layer = lambda *args: released.append("backup")
+    worker._prefetch_runtime = SimpleNamespace(
+        release_layer=lambda *args: released.append("release"))
+    worker._log_prefetch_runtime_traces = lambda: None
+    worker._release_hierarchical_layer(0, ("r",), 3)
+    assert released == ["backup", "release"]
+
+
+def test_dense_compute_waits_for_previous_ring_backup(dense_writeback, monkeypatch):
+    worker = dense_writeback
+    worker._backing_forward[0, "r"] = ((3, 4, 5), 33, 34, False)
+    event = Fence()
+    worker._gpu_region_release_events[0, 0, 5] = ("r", event)
+    worker._prefetch_runtime.wait_ready = lambda *args, **kw: None
+    worker._prefetch_runtime.require_resident_layer = lambda *args: None
+    worker._log_prefetch_runtime_traces = lambda: None
+    waited = []
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(
+        wait_event=waited.append))
+    worker._wait_for_hierarchical_layer(0, ("r",), 8)
+    assert waited == [event]
+    assert (0, 0, 5) not in worker._gpu_region_release_events
 
 
 def test_back_up_only_gpu_only_and_dirty_tail(worker):
@@ -586,7 +664,11 @@ def test_standard_worker_input_initializes_backing_metadata(worker):
 
 
 @pytest.mark.parametrize("layer_range", [(8, 9), (8, 12), (0, 28)])
-def test_native_read_is_deferred_until_backup_source_is_released(worker, layer_range):
+@pytest.mark.parametrize("dense", [False, True])
+def test_native_read_is_deferred_until_backup_source_is_released(
+        worker, layer_range, request, dense):
+    if dense:
+        request.getfixturevalue("dense_writeback")
     fence = Fence()
     worker._gpu_region_release_events[0, 0, 3] = ("r", fence)
     request = AsyncKVTransferRequest(
@@ -610,7 +692,11 @@ def test_native_read_is_deferred_until_backup_source_is_released(worker, layer_r
         32768 * (layer_range[1] - layer_range[0]))
 
 
-def test_host_write_waits_for_d2h_then_uses_existing_native_request(worker):
+@pytest.mark.parametrize("dense", [False, True])
+def test_host_write_waits_for_d2h_then_uses_existing_native_request(
+        worker, request, dense):
+    if dense:
+        request.getfixturevalue("dense_writeback")
     key = (0, "r", 0, 7)
     ready = Fence()
     worker._host_staged_blocks.add(key)
