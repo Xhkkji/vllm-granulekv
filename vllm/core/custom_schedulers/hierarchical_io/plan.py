@@ -101,9 +101,9 @@ class SparseKVAccessPlan:
     命中的 block，也能覆盖需要从 SSD 恢复的 block；后端只负责把两者的
     交集转换成真实 I/O。
 
-    ``None`` 表示该层使用完整 prefix，即 dense attention。未来真实 sparse
-    attention 只需要为每层填入 block 下标，不需要修改 scheduler/GranuleKV 的
-    stage、activate、poll 和 barrier 生命周期。
+    ``None`` 表示该层使用完整 prefix，即 dense attention；空 tuple 表示稀疏
+    预测暂时没有候选 block，后续仍由 actual selection 做 miss correction。
+    两者不能混淆。
     """
 
     num_layers: int
@@ -122,8 +122,6 @@ class SparseKVAccessPlan:
         for indices in self.block_indices_by_layer:
             if indices is None:
                 continue
-            if not indices:
-                raise ValueError("sparse KV layer selection must not be empty")
             if any(index < 0 or index >= self.num_blocks for index in indices):
                 raise ValueError("sparse KV block index is outside prefix")
             if any(left >= right for left, right in zip(indices, indices[1:])):
@@ -142,7 +140,7 @@ class SparseKVAccessPlan:
         selections = tuple(
             tuple(sorted(set(int(index) for index in indices)))
             for indices in block_indices_by_layer)
-        if not selections or any(not indices for indices in selections):
+        if not selections:
             raise ValueError("sparse layer selections must not be empty")
         if any(index < 0 or index >= num_blocks for indices in selections
                for index in indices):
@@ -238,8 +236,7 @@ class PrefetchUnit:
                 "one consumer block selection is required per unit layer")
         if self.block_indices is None:
             return
-        if not self.block_indices:
-            raise ValueError("prefetch unit block selection must be non-empty")
+        # Empty is a valid sparse selection, distinct from None (dense).
         if any(index < 0 for index in self.block_indices):
             raise ValueError("prefetch block index must be non-negative")
         if any(left >= right for left, right in zip(

@@ -473,7 +473,14 @@ class RollingPrefetchRuntime:
             self._events.append(
                 AsyncKVTransferEvent(unit.request.request_id,
                                      AsyncKVTransferState.PENDING))
-        event = submit(unit.request, unit.mapping)
+        # An empty sparse prediction is a valid control-plane unit.  It still
+        # participates in residency/ordering, but must not become an empty
+        # GranuleKV request or an accidental dense restore.
+        if unit.request.block_mapping:
+            event = submit(unit.request, unit.mapping)
+        else:
+            event = AsyncKVTransferEvent(unit.request.request_id,
+                                         AsyncKVTransferState.READY)
         plan_id, unit_index = self._identity(unit.request)
         self._traces.append(
             PrefetchRuntimeTrace(

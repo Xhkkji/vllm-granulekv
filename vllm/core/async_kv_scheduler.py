@@ -563,6 +563,18 @@ class AsyncKVScheduler(Scheduler):
                     layer_range=unit.layer_range,
                     prefetch_plan_id=plan.plan_id,
                     prefetch_unit_index=unit.index,
+                    consumer_block_indices=consumer_block_indices,
+                    consumer_blocks_by_layer=consumer_blocks_by_layer,
+                    consumer_num_blocks=(
+                        sequence_block_count if plan.consumer_enabled else
+                        (None if plan.access_plan is None else
+                         plan.access_plan.num_blocks)),
+                    consumer_local_block_start=(
+                        reservation.num_prefix_blocks
+                        if plan.consumer_enabled else None),
+                    sparse_page_index_key=_prefix_page_index_key(
+                        seq_group, self.cache_config.block_size,
+                        reservation.num_prefix_blocks),
                     destination="host"))
                 read_fragments_estimate += len(complement) * unit.num_layers
         requests = tuple(requests)

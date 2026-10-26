@@ -154,6 +154,25 @@ def test_dynamic_window_union_builds_seven_four_layer_requests():
     assert plan.consumer_blocks_for_layer(13) == normalized[13]
 
 
+def test_empty_sparse_prediction_is_not_dense_or_rejected():
+    access = SparseKVAccessPlan.from_layer_selections(
+        num_blocks=8,
+        block_indices_by_layer=((1, ), ()),
+        source="solidattention_dynamic",
+    )
+    plan = build_layer_restore_plan(
+        plan_id="sparse-empty-layer",
+        num_layers=2,
+        window_layers=2,
+        access_plan=access,
+    )
+
+    assert plan.units[0].block_indices == (1, )
+    assert plan.consumer_blocks_for_layer(0) == (1, )
+    assert plan.consumer_blocks_for_layer(1) == ()
+    assert plan.units[0].block_indices is not None
+
+
 def test_exact_restore_groups_only_adjacent_identical_layer_selections():
     access = SparseKVAccessPlan(
         num_layers=4,
@@ -455,6 +474,31 @@ def test_rolling_runtime_activates_future_unit_from_model_progress():
         ("physical_ready", 1),
         ("barrier_ready", 0),
     }
+
+
+def test_empty_sparse_unit_reaches_ready_without_backend_submit():
+    from dataclasses import replace
+
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = replace(
+        _correction_prefetch_request(0, first=True),
+        request_id="empty-sparse-unit",
+        block_mapping=(),
+        logical_blocks=(),
+        consumer_block_indices=(),
+        consumer_blocks_by_layer=((),),
+    )
+
+    events = runtime.submit_or_stage(
+        0, request, "empty-mapping",
+        lambda *_args: pytest.fail("empty sparse unit submitted to backend"))
+
+    assert events[0].state == AsyncKVTransferState.READY
+    assert runtime.require_resident_layer((request.seq_group_id, ), 0) == ()
+    state = runtime.prediction_state((request.seq_group_id, ), 0)
+    assert state.predicted_prefix_blocks == ()
+    correction = runtime.residency.project_correction(state, 0, (1, ))
+    assert correction.block_mapping == ((11, 21), )
 
 
 def test_window_host_completion_does_not_publish_gpu_or_delay_admission():

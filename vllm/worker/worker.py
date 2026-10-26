@@ -1722,11 +1722,12 @@ class Worker(LocalOrDistributedWorkerBase):
         return False
 
     def _prefetch_next_layer(self, virtual_engine: int, request_ids: Tuple[str, ...],
-                             layer_index: int) -> None:
+                             layer_index: int, *, poll_host: bool = True) -> None:
         cache_engine = self.cache_engine[virtual_engine]
         if layer_index >= cache_engine.num_attention_layers:
             return
-        self._poll_host_transfers(virtual_engine)
+        if poll_host:
+            self._poll_host_transfers(virtual_engine)
         state = self._prefetch_runtime.prediction_state(request_ids, layer_index)
         if state is None:
             return
@@ -1757,6 +1758,23 @@ class Worker(LocalOrDistributedWorkerBase):
             self.copy_host_blocks_to_gpu_async(
                 virtual_engine, state.seq_group_id, layer_index, mapping,
                 reason="prefetch")
+
+    def _prefetch_next_window(self, virtual_engine: int,
+                              request_ids: Tuple[str, ...],
+                              start_layer: int) -> None:
+        """Submit prediction H2D copies for one future layer window."""
+        window_layers = int(envs.VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS)
+        if window_layers <= 0:
+            return
+        cache_engine = self.cache_engine[virtual_engine]
+        if start_layer >= cache_engine.num_attention_layers:
+            return
+        end_layer = min(start_layer + window_layers,
+                        cache_engine.num_attention_layers)
+        self._poll_host_transfers(virtual_engine)
+        for layer_index in range(start_layer, end_layer):
+            self._prefetch_next_layer(virtual_engine, request_ids,
+                                      layer_index, poll_host=False)
 
     def _forget_host_staging(self, virtual_engine: int,
                              request_ids: Sequence[str]) -> None:
@@ -2148,9 +2166,6 @@ class Worker(LocalOrDistributedWorkerBase):
             released = torch.cuda.Event(blocking=False, interprocess=False)
             released.record(torch.cuda.current_stream())
             self._host_stats["layer_release_event_record_count"] += 1
-            # The decoder layer has submitted attention and MLP compute.
-            # Queue the next read before this layer's release-dependent backup.
-            self._prefetch_next_layer(virtual_engine, request_ids, layer_index + 1)
             self._back_up_layer(virtual_engine, request_ids, layer_index, released)
             # The rolling runtime owns the initial SSD restore only.  From
             # here on physical fences and CPU backing own slot reuse; do not
@@ -2192,7 +2207,17 @@ class Worker(LocalOrDistributedWorkerBase):
                 virtual_engine, cache_engine, unit.request_id, "window"),
             available_slots=lambda: cache_engine.granulekv_connector.available_request_slots,
         )
-            # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block
+        # A window is the scheduling unit: once its first layer is ready, issue
+        # the next window's per-layer prediction copies exactly once.  The
+        # rolling runtime has already activated the next logical SSD/host
+        # request through lead=1; this call only submits H2D work from backing.
+        window_layers = int(envs.VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS)
+        if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
+                and window_layers > 0
+                and layer_index % window_layers == 0):
+            self._prefetch_next_window(virtual_engine, request_ids,
+                                       layer_index + window_layers)
+        # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block
         # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
         # consumer_block_indices=None，因此此检查不会改变原有 attention。
         sparse_kv_blocks = self._prefetch_runtime.require_resident_layer(

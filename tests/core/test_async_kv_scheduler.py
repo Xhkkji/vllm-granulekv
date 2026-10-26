@@ -353,9 +353,10 @@ def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
     monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CPU_STAGING_ENABLE", str(int(host_staging)))
     monkeypatch.setenv("VLLM_GRANULEKV_PREFIX_ENABLE", "1")
     monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_IO_ENABLE", "1")
-    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "4")
-    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "2")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_NUM_LAYERS", "28")
+    monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", "4")
     monkeypatch.setenv("VLLM_GRANULEKV_HIERARCHICAL_LAYER_BARRIER", "1")
+    monkeypatch.setenv("VLLM_GRANULEKV_MAX_IN_FLIGHT", "8")
     monkeypatch.setenv("VLLM_GRANULEKV_SPARSE_CONSUMER_ENABLE", "1")
     monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_SELECTOR", "tail_n")
     monkeypatch.setenv("VLLM_GRANULEKV_PREFETCH_BLOCK_COUNT", "1")
@@ -381,22 +382,33 @@ def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
     scheduler.add_seq_group(reuse_group)
     assert scheduler._maybe_start_granulekv_prefix_restore() == 1
     windows = scheduler.drain_async_kv_transfers_to_submit()
+    expected_ranges = [(start, start + 4) for start in range(0, 28, 4)]
     if host_staging:
         assert [(r.layer_range, r.destination) for r in windows] == [
-            ((0, 2), "gpu"), ((0, 2), "host"), ((2, 4), "host")]
+            (expected_ranges[0], "gpu"),
+            (expected_ranges[0], "host"),
+            *((layer_range, "host") for layer_range in expected_ranges[1:]),
+        ]
         coverage = [(layer, key.logical_index) for r in windows
                     for layer in range(*r.layer_range) for key in r.logical_blocks]
-        assert sorted(coverage) == [(layer, block) for layer in range(4)
+        assert sorted(coverage) == [(layer, block) for layer in range(28)
                                     for block in range(2)]
         assert all(pair[1] == key.logical_index for r in windows
                    if r.destination == "host"
                    for pair, key in zip(r.block_mapping, r.logical_blocks))
+        assert all(r.consumer_blocks_by_layer == ((1, 2),) * 4
+                   for r in windows if r.destination == "host")
+        assert all(r.consumer_local_block_start == 2
+                   for r in windows if r.destination == "host")
+        assert all(r.sparse_page_index_key is not None
+                   for r in windows if r.destination == "host")
         return
-    assert [len(request.block_mapping) for request in windows] == [1, 1]
+    assert [request.layer_range for request in windows] == expected_ranges
+    assert all(len(request.block_mapping) == 1 for request in windows)
     assert all(request.consumer_num_blocks == 3 for request in windows)
     assert all(request.consumer_block_indices == (1, 2)
                for request in windows)
-    assert all(request.consumer_blocks_by_layer == ((1, 2), (1, 2))
+    assert all(request.consumer_blocks_by_layer == ((1, 2),) * 4
                for request in windows)
 
 
@@ -1157,6 +1169,27 @@ def test_scheduler_consumes_dynamic_sparse_restore_feedback(monkeypatch):
     assert plan.source == "quest_dynamic"
     assert plan.block_indices_by_layer == ((0, 2), (1, 3))
     assert scheduler._peek_sparse_restore_plan("other", 4) is None
+
+
+def test_scheduler_accepts_missing_layer_prediction_as_empty_sparse_set(
+        monkeypatch):
+    scheduler = AsyncKVScheduler.__new__(AsyncKVScheduler)
+    scheduler._sparse_restore_plans = {}
+    scheduler.hierarchical_io_config = type(
+        "Config", (), {
+            "consumer_enabled": True,
+            "num_layers": 3,
+        })()
+    feedback = SparseKVPlanFeedback("prefix-empty-layer", 3, 4,
+                                    ((1, ), (), (2, )))
+    monkeypatch.setattr(envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE",
+                        True)
+
+    scheduler.accept_sparse_kv_plan_feedback((feedback, ))
+    plan = scheduler._peek_sparse_restore_plan("prefix-empty-layer", 4)
+
+    assert plan is not None
+    assert plan.block_indices_by_layer == ((1, ), (), (2, ))
 
 
 def test_prediction_metadata_key_ignores_generated_complete_blocks():

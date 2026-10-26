@@ -23,6 +23,8 @@ from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
 
 from ...common.selectors import ExplicitSelector, TailSelector
 
+_SCORE_TABLE_BYTES = 256 * 1024 * 1024
+
 
 class SolidAttentionSelector:
     name = "solidattention"
@@ -769,18 +771,32 @@ class SolidAttentionPolicy:
             if heads % kv_heads:
                 raise ValueError("representatives do not match query heads")
             grouped = query.reshape(tokens, kv_heads, heads // kv_heads, dim)
-            if representatives.ndim == 4:
-                if representatives.shape[1] != 2:
-                    raise ValueError("representative envelope must have axis 2")
-                scores = (
-                    torch.einsum("tkhd,pkd->tkhp", grouped.clamp_min(0),
-                                 representatives[:, 1]) +
-                    torch.einsum("tkhd,pkd->tkhp", grouped.clamp_max(0),
-                                 representatives[:, 0]))
-            else:
-                scores = torch.einsum("tkhd,pkd->tkhp", grouped.abs(),
-                                      representatives)
-            return scores.amax(dim=0).reshape(heads, representatives.shape[0])
+            if representatives.ndim == 4 and representatives.shape[1] != 2:
+                raise ValueError("representative envelope must have axis 2")
+            row_bytes = heads * representatives.shape[0] * query.element_size()
+            max_queries = max(1, _SCORE_TABLE_BYTES // max(1, row_bytes))
+            chunk_size = (tokens if tokens <= max_queries else
+                          1 << (max_queries.bit_length() - 1))
+            max_scores = None
+            for start in range(0, tokens, chunk_size):
+                chunk = grouped[start:start + chunk_size]
+                if representatives.ndim == 4:
+                    scores = torch.einsum("tkhd,pkd->tkhp", chunk.clamp_min(0),
+                                          representatives[:, 1])
+                    scores.add_(torch.einsum(
+                        "tkhd,pkd->tkhp", chunk.clamp_max(0),
+                        representatives[:, 0]))
+                else:
+                    scores = torch.einsum("tkhd,pkd->tkhp", chunk.abs(),
+                                          representatives)
+                # Reduce only after adding both envelope terms.
+                chunk_max = scores.amax(dim=0)
+                if max_scores is None:
+                    max_scores = chunk_max
+                else:
+                    torch.maximum(max_scores, chunk_max, out=max_scores)
+                del scores, chunk_max
+            return max_scores.reshape(heads, representatives.shape[0])
         query = SolidAttentionPolicy._normalize_query(query)
         if representatives.ndim == 4:
             if representatives.shape[1] != 2:

@@ -134,9 +134,14 @@ def build_sparse_restore_plan_feedback(
     for layer_index in sorted(context.layers):
         selection = predictor(request_id, layer_index,
                               context.num_prefix_blocks, block_budget)
+        # ``None`` means this layer has no historical prediction.  Keep that
+        # distinction out of the dense sentinel used by SparseKVAccessPlan:
+        # every layer is recorded as sparse, even when no prior observation
+        # exists.  Actual selection will load its misses on the consumer path.
         if selection is None:
-            return None
-        normalized = tuple(selection)
+            normalized = ()
+        else:
+            normalized = tuple(selection)
         if any(left >= right for left, right in zip(normalized, normalized[1:])):
             raise RuntimeError("sparse restore prediction must be sorted and unique")
         if normalized and (normalized[0] < 0

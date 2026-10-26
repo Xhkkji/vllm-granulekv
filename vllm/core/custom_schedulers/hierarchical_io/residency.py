@@ -437,9 +437,6 @@ class PrefetchResidencyDirectory:
                 continue
             predicted = frozenset(int(index) for index in selection
                                   if int(index) < prefix_count)
-            if not predicted:
-                raise RuntimeError(
-                    "sparse correction plan has empty prefix prediction")
             plan.predicted_by_layer[layer_index] = predicted
             plan.resident_by_layer[layer_index] = set(baseline)
 

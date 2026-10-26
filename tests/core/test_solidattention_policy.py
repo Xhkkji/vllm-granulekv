@@ -216,6 +216,78 @@ def test_prefill_stable_ties_do_not_select_every_query_union():
     assert selected[selected >= 0].tolist() == [0, 1, 2, 11]
 
 
+@pytest.mark.parametrize("envelope", [False, True])
+@pytest.mark.parametrize("device,dtype", [("cpu", torch.float32),
+                                         ("cuda", torch.float16)])
+@pytest.mark.parametrize("query_limit,expected_chunks",
+                         [(7, [7]), (3, [2, 2, 2, 1]), (1, [1] * 7)])
+def test_prefill_score_workspace_preserves_selection(
+        monkeypatch, envelope, device, dtype, query_limit, expected_chunks):
+    import weakref
+
+    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(19)
+    query = torch.randn(7, 28, 8, device=device, dtype=dtype)
+    reps = torch.randn(19, 4, 8, device=device, dtype=dtype)
+    if envelope:
+        reps = torch.stack((reps - 1, reps + 1), dim=1)
+    original_query, original_reps = query.clone(), reps.clone()
+    grouped = query.reshape(7, 4, 7, 8)
+    einsum = torch.einsum
+    if envelope:
+        expected = (einsum("tkhd,pkd->tkhp", grouped.clamp_min(0), reps[:, 1])
+                    + einsum("tkhd,pkd->tkhp", grouped.clamp_max(0), reps[:, 0]))
+    else:
+        expected = einsum("tkhd,pkd->tkhp", grouped.abs(), reps)
+    expected = expected.amax(0).reshape(28, 19)
+    monkeypatch.setattr(module, "_SCORE_TABLE_BYTES",
+                        query_limit * 28 * 19 * query.element_size())
+    chunks, work_calls, outputs = [], [], []
+    terms = 2 if envelope else 1
+
+    def capture(equation, q, r):
+        if len(chunks) % terms == 0:
+            assert all(output() is None for output in outputs)
+        chunks.append(q.shape[0])
+        result = einsum(equation, q, r)
+        outputs.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(torch, "einsum", capture)
+    monkeypatch.setattr(module, "record_sparse_kv_policy_work", work_calls.append)
+    actual = SolidAttentionPolicy._score_pages(query, reps)
+    torch.testing.assert_close(actual, expected)
+    assert chunks == [size for size in expected_chunks for _ in range(terms)]
+    assert work_calls == ["selection_score_calls"]
+    assert all(output() is None for output in outputs)
+    torch.testing.assert_close(query, original_query, rtol=0, atol=0)
+    torch.testing.assert_close(reps, original_reps, rtol=0, atol=0)
+    candidates = torch.arange(19, device=device)
+    torch.testing.assert_close(
+        SolidAttentionPolicy._union_topk(actual, candidates, 2),
+        SolidAttentionPolicy._union_topk(expected, candidates, 2),
+        rtol=0, atol=0)
+
+
+def test_prefill_score_workspace_preserves_ties_and_nan(monkeypatch):
+    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+
+    query = torch.ones(7, 8, 2)
+    reps = _representatives(12)
+    monkeypatch.setattr(module, "_SCORE_TABLE_BYTES", 3 * 8 * 12 * 4)
+    policy = SolidAttentionPolicy(1, 1)
+    policy.register_page_representatives("r", 0, reps)
+    selected = policy._select_actual_prefix_fixed("r", 0, query, 12, 2)
+    assert selected[selected >= 0].tolist() == [0, 1, 2, 11]
+    query[-1, 0, 0] = float("nan")
+    expected = torch.stack([policy._score_pages(q, reps) for q in query]).amax(0)
+    torch.testing.assert_close(policy._score_pages(query, reps), expected,
+                               equal_nan=True)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_resident_prefill_uses_immutable_boundary_and_explicit_control(monkeypatch):
     from vllm import envs
@@ -409,13 +481,55 @@ def test_empty_actual_prediction_is_valid_feedback(monkeypatch):
     configure_sparse_kv_policy(policy)
     try:
         register_sparse_restore_context("empty", "prefix", 4, (0, 1))
-        assert build_sparse_restore_plan_feedback("empty", 1) is None
+        no_history = build_sparse_restore_plan_feedback("empty", 1)
+        assert no_history is not None
+        assert no_history.block_indices_by_layer == ((), )
         policy._actual_predictions["empty", 0] = (4, 1, ())
         feedback = build_sparse_restore_plan_feedback("empty", 1)
         assert feedback.block_indices_by_layer == ((),)
     finally:
         discard_sparse_restore_context(("empty",))
         configure_sparse_kv_policy(None)
+
+
+def test_missing_prediction_layer_is_encoded_as_empty_sparse_selection(monkeypatch):
+    import vllm.core.custom_schedulers.hierarchical_io.sparse_policy as module
+
+    class Policy:
+        name = "mixed"
+
+        @staticmethod
+        def predict_restore_blocks(request_id, layer_index, num_blocks, budget):
+            return {0: (1, ), 1: None, 2: ()}[layer_index]
+
+    monkeypatch.setattr(module, "get_sparse_kv_policy", lambda: Policy())
+    register_sparse_restore_context("mixed", "prefix", 4, (0, 3))
+    try:
+        feedback = module.build_sparse_restore_plan_feedback("mixed", 2)
+        assert feedback is not None
+        assert feedback.block_indices_by_layer == ((1, ), (), ())
+    finally:
+        discard_sparse_restore_context(("mixed", ))
+
+
+def test_no_prediction_for_any_layer_emits_empty_sparse_feedback(monkeypatch):
+    import vllm.core.custom_schedulers.hierarchical_io.sparse_policy as module
+
+    class Policy:
+        name = "no-history"
+
+        @staticmethod
+        def predict_restore_blocks(*_args):
+            return None
+
+    monkeypatch.setattr(module, "get_sparse_kv_policy", lambda: Policy())
+    register_sparse_restore_context("no-history", "prefix", 4, (0, 2))
+    try:
+        feedback = module.build_sparse_restore_plan_feedback("no-history", 2)
+        assert feedback is not None
+        assert feedback.block_indices_by_layer == ((), ())
+    finally:
+        discard_sparse_restore_context(("no-history", ))
 
 
 def test_solidattention_cpu_warmup_and_fixed_blocks():

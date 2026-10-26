@@ -199,17 +199,47 @@ def test_backing_feedback_is_consumed_locally_including_empty_layers(worker):
     assert updates == [("r", 4, ((), (0, 2)))]
 
 
-def test_layer_release_submits_next_read_before_backup_with_one_event(worker, monkeypatch):
+def test_layer_release_only_records_backup_fence(worker, monkeypatch):
     order = []
     event = Fence()
     event.record = lambda stream: order.append("release")
     monkeypatch.setattr(torch.cuda, "Event", lambda **kw: event)
-    worker._prefetch_next_layer = lambda ve, requests, layer: order.append(("prefetch", layer))
+    worker._prefetch_next_layer = lambda *args: pytest.fail(
+        "layer release must not trigger per-layer prefetch")
     worker._back_up_layer = lambda ve, requests, layer, released: (
         order.append(("backup", layer, released)))
     worker._release_hierarchical_layer(0, ("r",), 3)
-    assert order == ["release", ("prefetch", 4), ("backup", 3, event)]
+    assert order == ["release", ("backup", 3, event)]
     assert worker._host_stats["layer_release_event_record_count"] == 1
+
+
+def test_prefetch_next_window_covers_four_layers_once(worker, monkeypatch):
+    monkeypatch.setattr(module.envs,
+                        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
+    calls = []
+    worker._poll_host_transfers = lambda *args: calls.append("poll")
+    worker._prefetch_next_layer = lambda ve, requests, layer, **kwargs: calls.append(layer)
+
+    worker._prefetch_next_window(0, ("r",), 4)
+
+    assert calls == ["poll", 4, 5, 6, 7]
+
+
+def test_wait_triggers_next_window_only_at_window_start(worker, monkeypatch):
+    monkeypatch.setattr(module.envs,
+                        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
+    worker._prefetch_runtime.wait_ready = lambda *args, **kwargs: None
+    worker._prefetch_runtime.require_resident_layer = (
+        lambda *args, **kwargs: None)
+    worker._restore_live_backing = lambda *args, **kwargs: None
+    worker._log_prefetch_runtime_traces = lambda: None
+    windows = []
+    worker._prefetch_next_window = lambda ve, requests, start: windows.append(start)
+
+    for layer in (0, 1, 2, 3, 4, 5):
+        worker._wait_for_hierarchical_layer(0, ("r",), layer)
+
+    assert windows == [4, 8]
 
 
 def test_retired_request_cannot_publish_host_backing(worker):
