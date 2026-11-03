@@ -98,6 +98,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self._host_ready_blocks: Set[Tuple[int, str, int, int]] = set()
         self._host_failed_blocks: Set[Tuple[int, str, int, int]] = set()
         self._host_staged_blocks: Set[Tuple[int, str, int, int]] = set()
+        self._host_prefetch_windows: Dict[Tuple[int, str], Tuple[int, int]] = {}
         if uses_host_kv_writeback():
             self._pending_gpu_to_host: Dict[
                 Tuple[int, str, int, int], object] = {}
@@ -1073,6 +1074,13 @@ class Worker(LocalOrDistributedWorkerBase):
             self._host_ready_blocks.update(
                 (virtual_engine, seq_group_id, layer, block)
                 for block in blocks)
+        window = self._host_prefetch_windows.get((virtual_engine, seq_group_id))
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and window is not None:
+            # Resume the existing prediction when its backing arrives late.
+            for layer in range(max(window[0], layer_range[0]),
+                               min(window[1], layer_range[1])):
+                self._prefetch_next_layer(virtual_engine, (seq_group_id,), layer,
+                                          poll_host=False)
 
     def _mark_host_failed(
         self,
@@ -1783,6 +1791,9 @@ class Worker(LocalOrDistributedWorkerBase):
             return
         end_layer = min(start_layer + window_layers,
                         cache_engine.num_attention_layers)
+        for request_id in request_ids:
+            self._host_prefetch_windows[virtual_engine, request_id] = (
+                start_layer, end_layer)
         self._poll_host_transfers(virtual_engine)
         for layer_index in range(start_layer, end_layer):
             self._prefetch_next_layer(virtual_engine, request_ids,
@@ -1794,6 +1805,8 @@ class Worker(LocalOrDistributedWorkerBase):
         finished = frozenset(request_ids)
         if not finished:
             return
+        for request_id in finished:
+            self._host_prefetch_windows.pop((virtual_engine, request_id), None)
         if self._uses_bounded_slots():
             for collection in (self._gpu_slot_mappings, self._gpu_required_blocks):
                 for key in tuple(collection):
@@ -2210,6 +2223,11 @@ class Worker(LocalOrDistributedWorkerBase):
     ) -> Optional[Tuple[int, ...]]:
         """按 layer progress 激活未来 unit，并等待当前 unit 物理 READY。"""
         cache_engine = self.cache_engine[virtual_engine]
+        window_layers = int(envs.VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS)
+        window_start = window_layers > 0 and layer_index % window_layers == 0
+        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and window_start:
+            for request_id in request_ids:
+                self._host_prefetch_windows.pop((virtual_engine, request_id), None)
         self._prefetch_runtime.wait_ready(
             virtual_engine,
             request_ids,
@@ -2234,16 +2252,14 @@ class Worker(LocalOrDistributedWorkerBase):
                         virtual_engine, layer_index, table[block])
                     if event is not None:
                         torch.cuda.current_stream().wait_event(event)
-        # A window is the scheduling unit: once its first layer is ready, issue
-        # the next window's per-layer prediction copies exactly once.  The
-        # rolling runtime has already activated the next logical SSD/host
-        # request through lead=1; this call only submits H2D work from backing.
-        window_layers = int(envs.VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS)
+        # Arm the next window once; later host polls resume its ready copies.
         if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
-                and window_layers > 0
-                and layer_index % window_layers == 0):
-            self._prefetch_next_window(virtual_engine, request_ids,
-                                       layer_index + window_layers)
+                and window_layers > 0):
+            if window_start:
+                self._prefetch_next_window(virtual_engine, request_ids,
+                                           layer_index + window_layers)
+            else:
+                self._poll_host_transfers(virtual_engine)
         # wait_ready 只保证物理 GranuleKV event 到达 READY；随后再用 logical block
         # 目录验证当前 sparse consumer 的全部 block 已驻留。dense unit 的
         # consumer_block_indices=None，因此此检查不会改变原有 attention。
@@ -2404,6 +2420,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 raise ValueError("host backing requires one sequence")
             seq_id, data = next(iter(metadata.seq_data.items()))
             owner = (ve, metadata.request_id)
+            self._host_prefetch_windows.pop(owner, None)
             if owner in self._backing_retired:
                 self._drain_host_staging_owner(
                     ve, metadata.request_id,

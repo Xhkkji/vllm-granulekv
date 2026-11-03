@@ -40,6 +40,7 @@ def worker(monkeypatch):
                  "_gpu_slot_mappings", "_gpu_required_blocks",
                  "_gpu_region_release_events", "_pending_gpu_to_host",
                  "_backing_forward", "_deferred_gpu_transfers",
+                 "_host_prefetch_windows",
                  "_host_async_kv_transfers", "_gpu_transfer_regions",
                  "_gpu_pending_transfers", "_pending_h2d_transfers"):
         setattr(result, name, {})
@@ -233,6 +234,7 @@ def test_wait_triggers_next_window_only_at_window_start(worker, monkeypatch):
         lambda *args, **kwargs: None)
     worker._restore_live_backing = lambda *args, **kwargs: None
     worker._log_prefetch_runtime_traces = lambda: None
+    worker._poll_host_transfers = lambda *args: None
     windows = []
     worker._prefetch_next_window = lambda ve, requests, start: windows.append(start)
 
@@ -240,6 +242,66 @@ def test_wait_triggers_next_window_only_at_window_start(worker, monkeypatch):
         worker._wait_for_hierarchical_layer(0, ("r",), layer)
 
     assert windows == [4, 8]
+
+
+def test_late_host_ready_resumes_window_prefetch_once(worker, monkeypatch):
+    monkeypatch.setattr(module.envs,
+                        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
+    worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
+    worker._backing_forward[0, "r"] = ((10, 11, 12), 32, 48, True)
+    worker._prefetch_runtime.prediction_state = lambda *args: SimpleNamespace(
+        seq_group_id="r", predicted_prefix_blocks=(0, 2))
+    worker._discarded_host_transfers = set()
+    record = ("read", "r", (0, 1, 2), (4, 8))
+    worker._host_async_kv_transfers[0, "read"] = record
+    state = AsyncKVTransferState.PENDING
+    worker.cache_engine[0].poll_async_kv_transfer = lambda request: (
+        AsyncKVTransferEvent(request, state))
+    copies = []
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: copies.append((layer, mapping.tolist()))
+        or Fence())
+
+    worker._prefetch_next_window(0, ("r",), 4)
+    assert copies == []
+    state = AsyncKVTransferState.READY
+    worker._prefetch_runtime.wait_ready = lambda *args, **kwargs: None
+    worker._prefetch_runtime.require_resident_layer = lambda *args: None
+    worker._restore_live_backing = lambda *args: None
+    worker._log_prefetch_runtime_traces = lambda: None
+    worker._wait_for_hierarchical_layer(0, ("r",), 1)
+    worker._mark_host_ready(0, record)
+
+    assert copies == [(layer, [[0, 10]]) for layer in range(4, 8)]
+    assert worker._host_stats["host_gpu_prefetch_blocks"] == 4
+    # Actual selection consumes the pending copy instead of submitting again.
+    worker._restore_backing_blocks(0, "r", 4, (10, 11, 12), (0,))
+    assert len(copies) == 4
+    assert worker._host_stats["host_gpu_prefetch_hits"] == 1
+    assert all((0, "r", layer, block) in worker._host_ready_blocks
+               for layer in range(4, 8) for block in range(3))
+
+
+def test_window_prefetch_expires_before_boundary_poll(worker, monkeypatch):
+    monkeypatch.setattr(module.envs,
+                        "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
+    worker._host_prefetch_windows[0, "r"] = (4, 8)
+    copies = []
+    worker._prefetch_next_layer = lambda *args, **kwargs: copies.append(args[2])
+    worker._prefetch_runtime.wait_ready = lambda *args, **kwargs: (
+        worker._mark_host_ready(0, ("late", "r", (0,), (4, 8))))
+    worker._prefetch_runtime.require_resident_layer = lambda *args: None
+    worker._restore_live_backing = lambda *args: None
+    worker._poll_host_transfers = lambda *args: None
+    worker._log_prefetch_runtime_traces = lambda: None
+
+    worker._wait_for_hierarchical_layer(0, ("r",), 4)
+    assert copies == [8, 9, 10, 11]
+    assert worker._host_prefetch_windows[0, "r"] == (8, 12)
+    worker._mark_host_ready(0, ("old", "r", (0,), (4, 8)))
+    assert copies == [8, 9, 10, 11]
+    worker._wait_for_hierarchical_layer(0, ("r",), 24)
+    assert (0, "r") not in worker._host_prefetch_windows
 
 
 def test_retired_request_cannot_publish_host_backing(worker):
@@ -263,9 +325,11 @@ def test_finish_invalidates_owners_but_keeps_pending_backup_fence(
     worker._gpu_resident_blocks[key] = 3
     worker._gpu_destination_owners[0, 0, 3] = key
     worker._gpu_region_release_events[0, 0, 3] = ("r", fence)
+    worker._host_prefetch_windows[0, "r"] = (4, 8)
     worker._pending_gpu_to_host[key] = fence
     worker._host_staged_blocks.add(key)
     worker._forget_host_staging(0, ("r",))
+    assert (0, "r") not in worker._host_prefetch_windows
     assert not worker._gpu_resident_blocks
     assert not worker._gpu_destination_owners
     assert key not in worker._host_ready_blocks

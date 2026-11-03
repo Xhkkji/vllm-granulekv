@@ -27,6 +27,7 @@ def _worker():
     worker._gpu_pending_transfers = {}
     worker._gpu_region_release_events = {}
     worker._gpu_transfer_regions = {}
+    worker._host_prefetch_windows = {}
     worker._ssd_read_blocks = set()
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(
