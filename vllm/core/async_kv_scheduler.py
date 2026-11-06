@@ -506,12 +506,14 @@ class AsyncKVScheduler(Scheduler):
                 consumer_block_indices = unit.block_indices
                 consumer_blocks_by_layer = unit.consumer_blocks_by_layer
             destination = "gpu"
-            if host_staging and unit.index > 0:
-                destination = "host"
-                logical_blocks = reservation.logical_blocks
-                block_mapping = tuple(
+            host_mapping = ()
+            if host_staging:
+                destination = "mixed"
+                gpu_blocks = {key.logical_index for key in logical_blocks}
+                host_mapping = tuple(
                     (int(pair[0]), key.logical_index)
-                    for pair, key in zip(reservation.block_mapping, logical_blocks))
+                    for pair, key in zip(reservation.block_mapping, reservation.logical_blocks)
+                    if key.logical_index not in gpu_blocks)
             selected_block_counts.append(len(block_mapping))
             selected_logical_counts.append(len(logical_blocks))
             read_fragments_estimate += len(block_mapping) * unit.num_layers
@@ -548,36 +550,9 @@ class AsyncKVScheduler(Scheduler):
                         and plan.access_plan.source ==
                         "solidattention_dynamic" else None),
                     destination=destination,
+                    host_block_mapping=host_mapping,
                 ))
-            if host_staging and unit.index == 0:
-                gpu_blocks = {key.logical_index for key in logical_blocks}
-                complement = tuple(
-                    (pair, key) for pair, key in zip(
-                        reservation.block_mapping, reservation.logical_blocks)
-                    if key.logical_index not in gpu_blocks)
-                requests.append(self.async_kv_policy.enqueue(
-                    seq_group.request_id, reservation.reservation_id,
-                    AsyncKVTransferOperation.READ,
-                    tuple((int(pair[0]), key.logical_index)
-                          for pair, key in complement),
-                    tuple(key for _, key in complement),
-                    layer_range=unit.layer_range,
-                    prefetch_plan_id=plan.plan_id,
-                    prefetch_unit_index=unit.index,
-                    consumer_block_indices=consumer_block_indices,
-                    consumer_blocks_by_layer=consumer_blocks_by_layer,
-                    consumer_num_blocks=(
-                        sequence_block_count if plan.consumer_enabled else
-                        (None if plan.access_plan is None else
-                         plan.access_plan.num_blocks)),
-                    consumer_local_block_start=(
-                        reservation.num_prefix_blocks
-                        if plan.consumer_enabled else None),
-                    sparse_page_index_key=_prefix_page_index_key(
-                        seq_group, self.cache_config.block_size,
-                        reservation.num_prefix_blocks),
-                    destination="host"))
-                read_fragments_estimate += len(complement) * unit.num_layers
+            read_fragments_estimate += len(host_mapping) * unit.num_layers
         requests = tuple(requests)
         self.hierarchical_prefix_restores.register(
             plan, tuple((request.request_id, request.prefetch_unit_index)
@@ -862,6 +837,11 @@ class AsyncKVScheduler(Scheduler):
         """在调度边界提交已完成 reservation，并处理失败或取消。"""
         ready = self.async_kv_policy.pop_ready()
         ready_groups: List[SequenceGroup] = []
+        for request in self.async_kv_policy.gpu_ready_requests():
+            if (request.destination == "mixed" and
+                    self.hierarchical_prefix_restores.contains_request(request.request_id)):
+                self._complete_hierarchical_prefix_window(
+                    request, succeeded=True, ready_groups=ready_groups, gpu_only=True)
         for request in ready:
             if self.hierarchical_prefix_restores.contains_request(
                     request.request_id):
@@ -1012,9 +992,15 @@ class AsyncKVScheduler(Scheduler):
         *,
         succeeded: bool,
         ready_groups: List[SequenceGroup],
+        gpu_only: bool = False,
     ) -> None:
         """推进一个 window，并在父事务终态执行唯一一次 commit/abort。"""
-        if succeeded:
+        if gpu_only:
+            progress = self.hierarchical_prefix_restores.mark_gpu_ready(
+                request.request_id)
+            if not progress.first_unit_became_ready:
+                return
+        elif succeeded:
             progress = self.hierarchical_prefix_restores.mark_ready(
                 request.request_id)
         else:
@@ -1035,7 +1021,7 @@ class AsyncKVScheduler(Scheduler):
         logger.info(
             "[GRANULEKV_HIERARCHICAL] phase=window_%s plan_id=%s "
             "request_id=%s seq_group_id=%s window=%d layer_range=[%d,%d)",
-            "ready" if succeeded else "error",
+            "gpu_ready" if gpu_only else ("ready" if succeeded else "error"),
             progress.plan_id,
             request.request_id,
             seq_group.request_id,

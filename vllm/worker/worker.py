@@ -892,10 +892,18 @@ class Worker(LocalOrDistributedWorkerBase):
             host_request_id = key[1]
             event = cache_engine.poll_async_kv_transfer(host_request_id)
             events.append(event)
+            self._observe_gpu_transfer(virtual_engine, event)
+            self._prefetch_runtime.complete_request(virtual_engine, event)
+            if (event.state != AsyncKVTransferState.ERROR and
+                    (event.host_ready or event.state == AsyncKVTransferState.READY)
+                    and key not in self._discarded_host_transfers):
+                _, owner, blocks, layers = record
+                if any((virtual_engine, owner, layer, block) not in self._host_ready_blocks
+                       for layer in range(*layers) for block in blocks):
+                    self._mark_host_ready(virtual_engine, record)
             if event.state == AsyncKVTransferState.PENDING:
                 continue
             del self._host_async_kv_transfers[key]
-            self._prefetch_runtime.complete_request(virtual_engine, event)
             discard = key in self._discarded_host_transfers
             self._discarded_host_transfers.discard(key)
             if discard:
@@ -910,9 +918,7 @@ class Worker(LocalOrDistributedWorkerBase):
                                 *self._pending_gpu_to_host, *self._pending_h2d_transfers)))):
                     self._host_staging_owner = None
                 continue
-            if event.state == AsyncKVTransferState.READY:
-                self._mark_host_ready(virtual_engine, record)
-            else:
+            if event.state == AsyncKVTransferState.ERROR:
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
         return events
@@ -966,7 +972,9 @@ class Worker(LocalOrDistributedWorkerBase):
                     (request_id,), layer_index)
                 # Unused first-window predictions may still lack host backing.
                 predicted = () if state is None else state.predicted_prefix_blocks
-                candidate_blocks = sorted(set(consumed).union(dirty, predicted))
+                resident = (key[3] for key in self._gpu_resident_blocks
+                            if key[:3] == (virtual_engine, request_id, layer_index))
+                candidate_blocks = sorted(set(consumed).union(dirty, predicted, resident))
             for block in candidate_blocks:
                 destination = table[block]
                 key = (virtual_engine, request_id, layer_index, block)
@@ -1318,14 +1326,14 @@ class Worker(LocalOrDistributedWorkerBase):
     def _observe_gpu_transfer(self, virtual_engine: int,
                               event: AsyncKVTransferEvent) -> None:
         if (not envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE
-                or event.state == AsyncKVTransferState.PENDING):
+                or (event.state == AsyncKVTransferState.PENDING and not event.gpu_ready)):
             return
         record = self._gpu_pending_transfers.pop(
             (virtual_engine, event.request_id), None)
         if record is None:
             return
         seq_group_id, layer_range, pairs, logical_blocks = record
-        if event.state != AsyncKVTransferState.READY:
+        if event.state != AsyncKVTransferState.READY and not event.gpu_ready:
             return
         for layer_index in range(*layer_range):
             for ( _, destination_block), logical_block in zip(
@@ -1387,12 +1395,18 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
             return event
-        if (self._uses_bounded_slots() and request.destination == "gpu"
+        if (self._uses_bounded_slots() and request.destination in ("gpu", "mixed")
                 and request.operation == AsyncKVTransferOperation.READ
                 and any(destination < 0 for _, destination in request.block_mapping)):
             from dataclasses import replace
             logical = tuple(key.logical_index for key in request.logical_blocks)
             layers = request.layer_range or (0, cache_engine.num_attention_layers)
+            if (request.destination == "mixed" and
+                    len(logical) + self._gpu_working_set_bound > cache_engine.num_gpu_blocks):
+                raise ValueError(
+                    f"mixed window {layers}: complete prediction union {len(logical)} + "
+                    f"actual reserve {self._gpu_working_set_bound} exceeds "
+                    f"GPU capacity {cache_engine.num_gpu_blocks}")
             projected = []
             for layer in range(*layers):
                 self._reserve_gpu_slots(virtual_engine, request.seq_group_id,
@@ -1441,7 +1455,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     self.cache_config, self.model_config, self.parallel_config)
                 * (layers[1] - layers[0]) // cache_engine.num_attention_layers)
         if (uses_host_kv_writeback()
-                and request.destination == "gpu"
+                and request.destination in ("gpu", "mixed")
                 and request.operation == AsyncKVTransferOperation.READ
                 and request.layer_range is not None):
             for layer in range(*request.layer_range):
@@ -1457,9 +1471,9 @@ class Worker(LocalOrDistributedWorkerBase):
                             virtual_engine, request.request_id] = (request, mapping)
                         return AsyncKVTransferEvent(
                             request.request_id, AsyncKVTransferState.PENDING)
-        if request.destination == "gpu":
+        if request.destination in ("gpu", "mixed"):
             self._register_gpu_transfer(virtual_engine, request, mapping)
-        if (request.destination == "gpu"
+        if (request.destination in ("gpu", "mixed")
                 and request.operation == AsyncKVTransferOperation.READ
                 and mapping.numel()):
             block_bytes = CacheEngine.get_cache_block_size(
@@ -1473,13 +1487,42 @@ class Worker(LocalOrDistributedWorkerBase):
                    if request.layer_range is not None else
                    cache_engine.num_attention_layers)
                 // cache_engine.num_attention_layers)
+        if request.destination == "mixed":
+            owner = (virtual_engine, request.seq_group_id)
+            if self._host_staging_owner not in (None, owner):
+                self._drain_host_staging_owner(
+                    virtual_engine, self._host_staging_owner[1],
+                    envs.VLLM_GRANULEKV_TIMEOUT_SECONDS)
+            self._host_staging_owner = owner
+            blocks = tuple(dst for _, dst in request.host_block_mapping)
+            layers = request.layer_range
+            record = (request.request_id, request.seq_group_id, blocks, layers)
+            for layer in range(*layers):
+                self._host_staged_blocks.update(
+                    (virtual_engine, request.seq_group_id, layer, block) for block in blocks)
+            self._host_stats["cpu_direct_read_requests"] += bool(blocks)
+            self._host_stats["cpu_direct_read_blocks"] += len(blocks)
+            self._host_stats["cpu_direct_read_bytes"] += (
+                len(blocks) * CacheEngine.get_cache_block_size(
+                    self.cache_config, self.model_config, self.parallel_config)
+                * (layers[1] - layers[0]) // cache_engine.num_attention_layers)
+            self._host_async_kv_transfers[virtual_engine, request.request_id] = record
         event = cache_engine.submit_async_kv_transfer(
             request.request_id,
             request.operation,
             mapping,
             layer_range=request.layer_range,
-            destination=request.destination)
+            destination=request.destination,
+            **({"host_block_mapping": request.host_block_mapping}
+               if request.destination == "mixed" else {}))
         self._observe_gpu_transfer(virtual_engine, event)
+        if request.destination == "mixed" and event.state != AsyncKVTransferState.PENDING:
+            record = self._host_async_kv_transfers.pop((virtual_engine, request.request_id))
+            if event.state == AsyncKVTransferState.READY:
+                self._mark_host_ready(virtual_engine, record)
+            else:
+                self._host_stats["host_transfer_errors"] += 1
+                self._mark_host_failed(virtual_engine, record)
         if uses_host_kv_writeback():
             self._complete_host_write(virtual_engine, cache_engine, event)
         return event
@@ -1792,8 +1835,9 @@ class Worker(LocalOrDistributedWorkerBase):
         end_layer = min(start_layer + window_layers,
                         cache_engine.num_attention_layers)
         for request_id in request_ids:
+            previous = self._host_prefetch_windows.get((virtual_engine, request_id))
             self._host_prefetch_windows[virtual_engine, request_id] = (
-                start_layer, end_layer)
+                min(previous[0], start_layer) if previous else start_layer, end_layer)
         self._poll_host_transfers(virtual_engine)
         for layer_index in range(start_layer, end_layer):
             self._prefetch_next_layer(virtual_engine, request_ids,
@@ -1904,6 +1948,14 @@ class Worker(LocalOrDistributedWorkerBase):
         query: torch.Tensor,
     ) -> Optional[Tuple[int, ...] | SparseKVLayerSelection]:
         """Select historical KV once and resolve its missing backing."""
+        for request_id in request_ids:
+            owner = (virtual_engine, request_id)
+            window = self._host_prefetch_windows.get(owner)
+            if window is not None:
+                if layer_index + 1 >= window[1]:
+                    self._host_prefetch_windows.pop(owner)
+                else:
+                    self._host_prefetch_windows[owner] = (max(window[0], layer_index + 1), window[1])
         if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
             return None
         if self._uses_bounded_slots():
@@ -2225,9 +2277,6 @@ class Worker(LocalOrDistributedWorkerBase):
         cache_engine = self.cache_engine[virtual_engine]
         window_layers = int(envs.VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS)
         window_start = window_layers > 0 and layer_index % window_layers == 0
-        if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE and window_start:
-            for request_id in request_ids:
-                self._host_prefetch_windows.pop((virtual_engine, request_id), None)
         self._prefetch_runtime.wait_ready(
             virtual_engine,
             request_ids,
@@ -2256,6 +2305,8 @@ class Worker(LocalOrDistributedWorkerBase):
         if (envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE
                 and window_layers > 0):
             if window_start:
+                # Retain late current-window predictions through its GPU barrier.
+                self._poll_host_transfers(virtual_engine)
                 self._prefetch_next_window(virtual_engine, request_ids,
                                            layer_index + window_layers)
             else:

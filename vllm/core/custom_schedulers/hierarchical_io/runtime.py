@@ -62,6 +62,7 @@ class _UnitState:
     ready_monotonic_ns: Optional[int] = None
     terminal_reported: bool = False
     consumed: bool = False
+    gpu_ready: bool = False
 
 
 @dataclass
@@ -134,7 +135,7 @@ class RollingPrefetchRuntime:
             if engine != virtual_engine:
                 continue
             first = next(iter(plan.units.values()), None)
-            if first is not None and first.terminal is not None:
+            if first is not None and (first.terminal is not None or first.gpu_ready):
                 plan.activation_limit = max(plan.activation_limit, plan.lead_units)
             self._activate_until(plan, plan.activation_limit, None, submit, available_slots)
         events = tuple(self._events)
@@ -202,7 +203,7 @@ class RollingPrefetchRuntime:
             self._activate_until(plan, plan.activation_limit, consumer_index,
                                  submit, available_slots)
             wait_started_ns = time.monotonic_ns()
-            while current.terminal is None:
+            while current.terminal is None and not current.gpu_ready:
                 failed = next((unit.terminal for unit in plan.units.values()
                                if unit.terminal is not None and
                                unit.terminal.state == AsyncKVTransferState.ERROR), None)
@@ -216,11 +217,11 @@ class RollingPrefetchRuntime:
                         time.sleep(sleep_seconds)
                         continue
                 self._progress(virtual_engine, poll)
-                if current.terminal is None:
+                if current.terminal is None and not current.gpu_ready:
                     time.sleep(sleep_seconds)
 
             wait_ns = time.monotonic_ns() - wait_started_ns
-            if current.terminal.state == AsyncKVTransferState.ERROR:
+            if current.terminal is not None and current.terminal.state == AsyncKVTransferState.ERROR:
                 raise RuntimeError(
                     "prefetch unit failed before consumer "
                     f"{consumer_index}: {current.terminal.error}")
@@ -451,7 +452,7 @@ class RollingPrefetchRuntime:
             if index <= last_unit_index
             and not unit.active and unit.terminal is None)
         for unit in due:
-            if unit.request.block_mapping and available_slots() <= 0:
+            if (unit.request.block_mapping or unit.request.host_block_mapping) and available_slots() <= 0:
                 return
             self._activate(unit, submit, report_activation=True,
                            layer_index=consumer_index,
@@ -476,7 +477,7 @@ class RollingPrefetchRuntime:
         # An empty sparse prediction is a valid control-plane unit.  It still
         # participates in residency/ordering, but must not become an empty
         # GranuleKV request or an accidental dense restore.
-        if unit.request.block_mapping:
+        if unit.request.block_mapping or unit.request.host_block_mapping:
             event = submit(unit.request, unit.mapping)
         else:
             event = AsyncKVTransferEvent(unit.request.request_id,
@@ -492,6 +493,7 @@ class RollingPrefetchRuntime:
                 layer_index=layer_index,
                 lead_units=lead_units,
             ))
+        self._observe_partial(unit, event)
         if event.state != AsyncKVTransferState.PENDING:
             self._finish(unit, event)
             if report_activation:
@@ -506,6 +508,7 @@ class RollingPrefetchRuntime:
                 if not unit.active or unit.terminal is not None:
                     continue
                 event = poll(unit.request)
+                self._observe_partial(unit, event)
                 if unit.terminal is not None:
                     continue
                 if event.state == AsyncKVTransferState.PENDING:
@@ -516,17 +519,26 @@ class RollingPrefetchRuntime:
     def complete_request(self, virtual_engine: int,
                          event: AsyncKVTransferEvent) -> None:
         """Reconcile targeted host polling with parent completion exactly once."""
-        if event.state == AsyncKVTransferState.PENDING:
-            return
         for (engine, _), plan in self._plans.items():
             if engine != virtual_engine:
                 continue
             for unit in plan.units.values():
                 if unit.request.request_id == event.request_id:
+                    self._observe_partial(unit, event)
+                    if event.state == AsyncKVTransferState.PENDING:
+                        return
                     if unit.terminal is None:
                         self._finish(unit, event)
                         self._events.append(event)
                     return
+
+    def _observe_partial(self, unit: _UnitState, event: AsyncKVTransferEvent) -> None:
+        if (unit.request.destination == "mixed" and event.gpu_ready
+                and event.state != AsyncKVTransferState.ERROR and not unit.gpu_ready):
+            unit.gpu_ready = True
+            self.residency.mark_ready(unit.request.request_id)
+            if event.state == AsyncKVTransferState.PENDING:
+                self._events.append(event)
 
     def _finish(self, unit: _UnitState,
                 event: AsyncKVTransferEvent) -> None:
@@ -534,7 +546,8 @@ class RollingPrefetchRuntime:
         unit.terminal = event
         unit.ready_monotonic_ns = time.monotonic_ns()
         if event.state == AsyncKVTransferState.READY:
-            self.residency.mark_ready(unit.request.request_id)
+            if not unit.gpu_ready:
+                self.residency.mark_ready(unit.request.request_id)
         else:
             self.residency.mark_error(unit.request.request_id)
         plan_id, unit_index = self._identity(unit.request)

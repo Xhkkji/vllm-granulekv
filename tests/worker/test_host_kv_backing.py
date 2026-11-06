@@ -282,7 +282,7 @@ def test_late_host_ready_resumes_window_prefetch_once(worker, monkeypatch):
                for layer in range(4, 8) for block in range(3))
 
 
-def test_window_prefetch_expires_before_boundary_poll(worker, monkeypatch):
+def test_window_prefetch_survives_boundary_until_actual_selection(worker, monkeypatch):
     monkeypatch.setattr(module.envs,
                         "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
     worker._host_prefetch_windows[0, "r"] = (4, 8)
@@ -296,11 +296,13 @@ def test_window_prefetch_expires_before_boundary_poll(worker, monkeypatch):
     worker._log_prefetch_runtime_traces = lambda: None
 
     worker._wait_for_hierarchical_layer(0, ("r",), 4)
-    assert copies == [8, 9, 10, 11]
-    assert worker._host_prefetch_windows[0, "r"] == (8, 12)
+    assert copies == list(range(4, 12))
+    assert worker._host_prefetch_windows[0, "r"] == (4, 12)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", False)
+    worker._correct_hierarchical_layer(0, ("r",), 4, None)
     worker._mark_host_ready(0, ("old", "r", (0,), (4, 8)))
-    assert copies == [8, 9, 10, 11]
-    worker._wait_for_hierarchical_layer(0, ("r",), 24)
+    assert copies == list(range(4, 12)) + [5, 6, 7]
+    worker._correct_hierarchical_layer(0, ("r",), 11, None)
     assert (0, "r") not in worker._host_prefetch_windows
 
 
@@ -680,7 +682,7 @@ def test_sparse_backup_includes_unused_gpu_only_prediction(worker):
     from vllm.core.custom_schedulers.hierarchical_io import activate_sparse_kv_blocks
     worker._backing_forward[0, "r"] = (tuple(range(3, 103)), 33, 34, True)
     worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args:
-        SimpleNamespace(predicted_prefix_blocks=(0,)))
+        SimpleNamespace(predicted_prefix_blocks=()))
     for block, destination in enumerate((3, 4, 5)):
         worker._mark_gpu_blocks_ready(0, "r", 0, (block,), ((block, destination),))
     worker._host_ready_blocks.add((0, "r", 0, 1))
@@ -690,6 +692,77 @@ def test_sparse_backup_includes_unused_gpu_only_prediction(worker):
     with activate_sparse_kv_blocks((1,)):
         worker._back_up_layer(0, ("r",), 0, Fence())
     assert copies == [[[3, 0], [5, 2]]]
+
+
+def test_mixed_union_capacity_rejected_before_mapping_or_io(worker, monkeypatch):
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 2
+    request = AsyncKVTransferRequest(
+        request_id="mixed", seq_group_id="r", reservation_id="r",
+        operation=AsyncKVTransferOperation.READ,
+        priority=AsyncKVTransferPriority.CRITICAL_READ, destination="mixed",
+        layer_range=(0, 4), block_mapping=((10, -1), (11, -1)),
+        logical_blocks=(LogicalBlockKey(0, 0), LogicalBlockKey(0, 1)),
+        host_block_mapping=((12, 2),))
+    with pytest.raises(ValueError, match="complete prediction union"):
+        worker._submit_gpu_transfer(0, worker.cache_engine[0], request,
+                                    torch.tensor(request.block_mapping))
+    assert not worker._gpu_slot_mappings
+    assert not worker._host_async_kv_transfers
+
+
+@pytest.mark.parametrize("gpu_first", [True, False])
+def test_mixed_target_poll_retains_request_until_both_ready(worker, gpu_first):
+    worker._discarded_host_transfers = set()
+    record = ("mixed", "r", (1,), (0, 4))
+    worker._host_async_kv_transfers[0, "mixed"] = record
+    worker._gpu_pending_transfers[0, "mixed"] = ("r", (0, 4), ((10, 0),), (0,))
+    partial = AsyncKVTransferEvent("mixed", AsyncKVTransferState.PENDING,
+                                   gpu_ready=gpu_first, host_ready=not gpu_first)
+    worker.cache_engine[0].poll_async_kv_transfer = lambda _: partial
+    for _ in range(2):
+        worker._poll_host_transfers(0)
+    assert (0, "mixed") in worker._host_async_kv_transfers
+    assert bool(worker._gpu_resident_blocks) == gpu_first
+    assert worker.host_blocks_ready(0, "r", 0, (1,)) != gpu_first
+    worker.cache_engine[0].poll_async_kv_transfer = lambda _: AsyncKVTransferEvent(
+        "mixed", AsyncKVTransferState.READY, gpu_ready=True, host_ready=True)
+    worker._poll_host_transfers(0)
+    assert not worker._host_async_kv_transfers
+    assert worker._host_stats["cpu_cache_ready_blocks"] == 1
+    assert worker.gpu_blocks_ready(0, "r", 0, (0,)) == (0,)
+
+
+def test_actual_miss_waits_for_mixed_cpu_target(worker):
+    worker._discarded_host_transfers = set()
+    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", (7,), (0, 4))
+    polls = []
+
+    def poll(request_id):
+        polls.append(request_id)
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING,
+                                    gpu_ready=True, host_ready=len(polls) == 3)
+
+    worker.cache_engine[0].poll_async_kv_transfer = poll
+    assert worker.wait_for_host_blocks(0, "r", 2, (7,), 1)
+    assert len(polls) == 3
+    assert (0, "mixed") in worker._host_async_kv_transfers
+    assert worker.host_blocks_ready(0, "r", 2, (7,))
+
+
+def test_aborted_mixed_request_drains_without_republishing_data(worker):
+    worker._discarded_host_transfers = set()
+    worker._host_staging_owner = (0, "r")
+    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", (7,), (0, 4))
+    worker._gpu_pending_transfers[0, "mixed"] = ("r", (0, 4), ((10, 0),), (0,))
+    worker._forget_host_staging(0, ("r",))
+    assert worker._host_staging_owner == (0, "r")
+    worker.cache_engine[0].poll_async_kv_transfer = lambda rid: AsyncKVTransferEvent(
+        rid, AsyncKVTransferState.READY, gpu_ready=True, host_ready=True)
+    worker._poll_host_transfers(0)
+    assert not worker._host_async_kv_transfers
+    assert worker._host_staging_owner is None
+    assert not worker._host_ready_blocks and not worker._gpu_resident_blocks
 
 
 def test_host_capacity_checked_before_region_allocation(monkeypatch):

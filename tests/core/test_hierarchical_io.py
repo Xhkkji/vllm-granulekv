@@ -3,6 +3,7 @@
 """层级 I/O plan 和父事务屏障的纯控制面测试。"""
 
 import pytest
+from dataclasses import replace
 
 from vllm.core.block_reservation import LogicalBlockKey
 from vllm.core.custom_schedulers.async_kv_transfer import (
@@ -404,6 +405,44 @@ def _sparse_prefetch_request() -> AsyncKVTransferRequest:
         consumer_block_indices=(0, 3),
         consumer_blocks_by_layer=((0, ), (3, )),
     )
+
+
+def test_mixed_gpu_ready_unblocks_consumer_without_finishing_cpu():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig(enabled=True))
+    request = replace(_sparse_prefetch_request(), destination="mixed",
+                      host_block_mapping=((11, 1),))
+    pending = AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.PENDING)
+    runtime.submit_or_stage(0, request, (), lambda *args: pending)
+    calls = []
+    mark_ready = runtime.residency.mark_ready
+    runtime.residency.mark_ready = lambda rid: (calls.append(rid), mark_ready(rid))
+    partial = replace(pending, gpu_ready=True)
+    runtime.wait_ready(0, (request.seq_group_id,), 0, lambda *args: pending,
+                       lambda _: partial, available_slots=lambda: 1)
+    unit = runtime._plans[0, request.prefetch_plan_id].units[0, "mixed"]
+    assert unit.gpu_ready and unit.terminal is None and unit.active
+    runtime.complete_request(0, partial)
+    assert calls == [request.request_id]
+    runtime.complete_request(0, replace(partial, state=AsyncKVTransferState.READY,
+                                       host_ready=True))
+    assert unit.terminal.state == AsyncKVTransferState.READY
+    assert calls == [request.request_id]
+
+
+def test_mixed_partial_admission_does_not_allow_parent_release():
+    controller = HierarchicalRestoreController()
+    plan = build_layer_restore_plan(plan_id="mixed", num_layers=6, window_layers=4)
+    controller.register(plan, (("a", 0), ("b", 1)))
+    progress = controller.mark_gpu_ready("a")
+    assert progress.first_unit_became_ready and not progress.all_terminal
+    assert not controller.mark_gpu_ready("a").first_unit_became_ready
+    with pytest.raises(RuntimeError, match="active"):
+        controller.release("mixed")
+    controller.cancel_plan("mixed")
+    controller.mark_ready("b")
+    progress = controller.mark_error("a")
+    assert progress.cancelled and progress.failed and progress.all_terminal
+    assert controller.release("mixed") == plan
 
 
 def _correction_prefetch_request(layer_index: int,

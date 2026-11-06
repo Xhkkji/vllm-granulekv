@@ -35,6 +35,7 @@ class GranuleKVRequestSpec:
     storage_block_ids: tuple[int, ...]
     destination: str = "gpu"
     host_block_ids: tuple[int, ...] = ()
+    host_storage_block_ids: tuple[int, ...] = ()
     layer_range: Optional[Tuple[int, int]] = None
     gpu_region_start: Optional[int] = None
 
@@ -42,7 +43,11 @@ class GranuleKVRequestSpec:
         payload: dict[str, Any] = {
             "storage_block_ids": list(self.storage_block_ids),
         }
-        if self.destination == "host":
+        if self.destination == "mixed":
+            payload.update(destination="mixed", gpu_block_ids=list(self.gpu_block_ids),
+                           host_block_ids=list(self.host_block_ids),
+                           host_storage_block_ids=list(self.host_storage_block_ids))
+        elif self.destination == "host":
             payload["destination"] = "host"
             payload["host_block_ids"] = list(self.host_block_ids)
         else:
@@ -79,6 +84,8 @@ class GranuleKVTransferStatus:
     operation: str
     io_elapsed_ns: int = 0
     error: Optional[str] = None
+    gpu_ready: bool = False
+    host_ready: bool = False
 
     @property
     def ready(self) -> bool:
@@ -342,6 +349,7 @@ class GranuleKVConnector:
         operation: str,
         layer_range: Optional[Tuple[int, int]] = None,
         destination: str = "gpu",
+        host_block_mapping: tuple[tuple[int, int], ...] = (),
     ) -> GranuleKVTransferStatus:
         """Submit one active request through the canonical lifecycle."""
         if not request_id:
@@ -349,17 +357,24 @@ class GranuleKVConnector:
         if operation not in ("read", "write"):
             raise ValueError(f"unsupported GranuleKV operation: {operation}")
         destination = destination.lower()
-        if destination not in ("gpu", "host"):
+        if destination not in ("gpu", "host", "mixed"):
             raise ValueError(f"unsupported GranuleKV destination: {destination}")
-        if destination == "host" and not self.layout.num_host_blocks:
+        if destination in ("host", "mixed") and not self.layout.num_host_blocks:
             raise RuntimeError("GranuleKV host cache is not enabled")
         layer_range = self._validate_layer_range(layer_range)
-        if src_to_dst.numel() == 0:
+        if src_to_dst.numel() == 0 and not host_block_mapping:
             return GranuleKVTransferStatus(
                 request_id, GranuleKVTransferState.READY, operation)
         spec = self._request_spec(
             src_to_dst, operation=operation, layer_range=layer_range,
-            destination=destination)
+            destination="gpu" if destination == "mixed" else destination)
+        if destination == "mixed":
+            from dataclasses import replace
+            if operation != "read" or layer_range is None:
+                raise ValueError("mixed transfer requires a layer-ranged read")
+            spec = replace(spec, destination="mixed",
+                           host_storage_block_ids=tuple(src for src, _ in host_block_mapping),
+                           host_block_ids=tuple(dst for _, dst in host_block_mapping))
 
         pending = self._pending_transfers.get(request_id)
         if pending is not None:
@@ -389,7 +404,8 @@ class GranuleKVConnector:
         return GranuleKVTransferStatus(
             request_id, state, pending.spec.operation,
             io_elapsed_ns=client_status.io_elapsed_ns,
-            error=error)
+            error=error, gpu_ready=client_status.gpu_ready,
+            host_ready=client_status.host_ready)
 
     def complete_request(
             self,

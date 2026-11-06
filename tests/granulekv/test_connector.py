@@ -35,6 +35,8 @@ class _FakeClient:
             state=SimpleNamespace(value=self.status_state.value),
             io_elapsed_ns=17,
             error_code=0,
+            gpu_ready=self.status_state == GranuleKVTransferState.READY,
+            host_ready=self.status_state == GranuleKVTransferState.READY,
         )
 
     def complete(self, handle):
@@ -51,6 +53,23 @@ def _connector():
     connector.client = _FakeClient()
     connector._pending_transfers = {}
     return connector
+
+
+def test_mixed_read_uses_one_handle_and_separate_source_mappings():
+    connector = _connector()
+    connector.layout.num_host_blocks = 16
+    connector.submit_request("mixed", torch.tensor([[9, 2]]), operation="read",
+                             layer_range=(0, 4), destination="mixed",
+                             host_block_mapping=((10, 3), (11, 4)))
+    assert len(connector.client.submitted) == 1
+    payload = connector.client.submitted[0][0]
+    assert payload["destination"] == "mixed"
+    assert payload["storage_block_ids"] == [9]
+    assert payload["gpu_block_ids"] == [2]
+    assert payload["host_storage_block_ids"] == [10, 11]
+    assert payload["host_block_ids"] == [3, 4]
+    connector.complete_request("mixed")
+    assert len(connector.client.completed) == 1
 
 
 def test_request_spec_is_immutable_and_serializes_layer_window():

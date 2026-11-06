@@ -88,6 +88,14 @@ class HierarchicalRestoreController:
     ) -> HierarchicalRestoreProgress:
         state, unit = self._mark_terminal(request_id)
         state.ready_request_ids.add(request_id)
+        return self.mark_gpu_ready(request_id, now_monotonic_ns)
+
+    def mark_gpu_ready(
+        self, request_id: str, now_monotonic_ns: Optional[int] = None,
+    ) -> HierarchicalRestoreProgress:
+        plan_id, unit_index = self._request_to_plan[request_id]
+        state = self._states[plan_id]
+        unit = state.plan.units[unit_index]
         became_ready = False
         if (request_id == state.request_ids[0]
                 and state.first_unit_ready_monotonic_ns is None):

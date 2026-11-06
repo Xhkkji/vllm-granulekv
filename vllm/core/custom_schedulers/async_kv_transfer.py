@@ -75,6 +75,7 @@ class AsyncKVTransferRequest:
     # request，而不是 SSD mapping。Worker 会按当前 decode 长度动态扩展它。
     consumer_local_block_start: Optional[int] = None
     destination: str = "gpu"
+    host_block_mapping: BlockMapping = ()
     # Stable CPU page-index identity.  It is control-plane metadata only and
     # never reaches the GranuleKV/native descriptor.
     sparse_page_index_key: Optional[str] = None
@@ -88,6 +89,14 @@ class AsyncKVTransferRequest:
     activate_on_submit: bool = True
 
     def __post_init__(self) -> None:
+        if self.destination == "mixed":
+            if self.operation != AsyncKVTransferOperation.READ or self.layer_range is None:
+                raise ValueError("mixed transfer requires a layer-ranged read")
+            if set(src for src, _ in self.block_mapping).intersection(
+                    src for src, _ in self.host_block_mapping):
+                raise ValueError("mixed transfer reads the same SSD block twice")
+        elif self.host_block_mapping:
+            raise ValueError("host complement requires a mixed transfer")
         if (self.consumer_num_blocks is not None
                 and self.consumer_num_blocks <= 0):
             raise ValueError("consumer_num_blocks must be positive")
@@ -118,6 +127,8 @@ class AsyncKVTransferEvent:
     request_id: str
     state: AsyncKVTransferState
     error: Optional[str] = None
+    gpu_ready: bool = False
+    host_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,7 @@ class PendingAsyncKVTransfer:
     request: AsyncKVTransferRequest
     state: AsyncKVTransferState = AsyncKVTransferState.QUEUED
     error: Optional[str] = None
+    gpu_ready: bool = False
 
 
 class AsyncKVTransferQueue:
@@ -198,6 +210,7 @@ class AsyncKVTransferQueue:
         correction_block_mapping: Optional[Sequence[Tuple[int, int]]] = None,
         correction_logical_blocks: Optional[Sequence[LogicalBlockKey]] = None,
         destination: str = "gpu",
+        host_block_mapping: Sequence[Tuple[int, int]] = (),
     ) -> AsyncKVTransferRequest:
         """登记 reservation，但暂不占用 Worker/GranuleKV request slot。"""
         if priority is None:
@@ -225,6 +238,7 @@ class AsyncKVTransferQueue:
             consumer_num_blocks=consumer_num_blocks,
             consumer_local_block_start=consumer_local_block_start,
             destination=destination,
+            host_block_mapping=tuple(tuple(pair) for pair in host_block_mapping),
             sparse_page_index_key=sparse_page_index_key,
             correction_block_mapping=(
                 None if correction_block_mapping is None else tuple(
@@ -310,6 +324,7 @@ class AsyncKVTransferQueue:
     def apply_event(self, event: AsyncKVTransferEvent) -> None:
         """应用 active request 的 PENDING/READY/ERROR 事件。"""
         transfer = self._get_transfer(event.request_id)
+        transfer.gpu_ready |= event.gpu_ready
         # rolling activation 发生在 model forward 内，Scheduler 下一次运行时
         # 才收到 Worker 的 PENDING 通知。因此只有带 plan identity 的 QUEUED
         # 请求允许由该事件切到 PENDING；普通 transfer 仍必须由 activate_next。
@@ -328,6 +343,10 @@ class AsyncKVTransferQueue:
             raise ValueError(f"unsupported async KV event: {event.state}")
         transfer.state = event.state
         transfer.error = event.error
+
+    def gpu_ready_requests(self) -> Tuple[AsyncKVTransferRequest, ...]:
+        return tuple(item.request for item in self._transfers.values()
+                     if item.gpu_ready and item.state == AsyncKVTransferState.PENDING)
 
     def pop_ready(self) -> Tuple[AsyncKVTransferRequest, ...]:
         """按入队顺序消费已经成功完成的请求。"""

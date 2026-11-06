@@ -407,23 +407,36 @@ def test_granulekv_sparse_consumer_includes_local_suffix_without_reading_it(
     expected_ranges = [(start, start + 4) for start in range(0, 28, 4)]
     if host_staging:
         assert [(r.layer_range, r.destination) for r in windows] == [
-            (expected_ranges[0], "gpu"),
-            (expected_ranges[0], "host"),
-            *((layer_range, "host") for layer_range in expected_ranges[1:]),
+            (layer_range, "mixed") for layer_range in expected_ranges
         ]
         coverage = [(layer, key.logical_index) for r in windows
                     for layer in range(*r.layer_range) for key in r.logical_blocks]
+        coverage += [(layer, dst) for r in windows for layer in range(*r.layer_range)
+                     for _, dst in r.host_block_mapping]
         assert sorted(coverage) == [(layer, block) for layer in range(28)
                                     for block in range(2)]
-        assert all(pair[1] == key.logical_index for r in windows
-                   if r.destination == "host"
-                   for pair, key in zip(r.block_mapping, r.logical_blocks))
+        assert all(not {src for src, _ in r.block_mapping}.intersection(
+            src for src, _ in r.host_block_mapping) for r in windows)
         assert all(r.consumer_blocks_by_layer == ((1, 2),) * 4
-                   for r in windows if r.destination == "host")
+                   for r in windows)
         assert all(r.consumer_local_block_start == 2
-                   for r in windows if r.destination == "host")
+                   for r in windows)
         assert all(r.sparse_page_index_key is not None
-                   for r in windows if r.destination == "host")
+                   for r in windows)
+        partial = AsyncKVTransferEvent(windows[0].request_id,
+                                      AsyncKVTransferState.PENDING, gpu_ready=True)
+        for _ in range(2):
+            scheduler.apply_async_kv_event(partial)
+            scheduler.complete_ready_async_kv_transfers()
+        assert reuse_seq.status == SequenceStatus.RUNNING
+        assert list(scheduler.running).count(reuse_group) == 1
+        assert scheduler.async_kv_policy.in_flight_count == 7
+        assert scheduler.hierarchical_prefix_loading
+        for request in windows:
+            scheduler.apply_async_kv_event(AsyncKVTransferEvent(
+                request.request_id, AsyncKVTransferState.READY))
+        scheduler.complete_ready_async_kv_transfers()
+        assert not scheduler.hierarchical_prefix_loading
         return
     assert [request.layer_range for request in windows] == expected_ranges
     assert all(len(request.block_mapping) == 1 for request in windows)

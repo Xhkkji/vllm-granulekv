@@ -297,6 +297,7 @@ class CacheEngine:
         src_to_dst: torch.Tensor,
         layer_range: Optional[Tuple[int, int]] = None,
         destination: str = "gpu",
+        host_block_mapping: tuple[tuple[int, int], ...] = (),
     ) -> AsyncKVTransferEvent:
         """把 Scheduler 的异步 read/write 提交给 resident GranuleKV。
 
@@ -334,7 +335,7 @@ class CacheEngine:
                 src_to_dst,
                 operation=operation.value,
                 layer_range=layer_range,
-                destination=destination)
+                destination=destination, host_block_mapping=host_block_mapping)
         except Exception as exc:
             del self._granulekv_async_kv_traces[request_id]
             return AsyncKVTransferEvent(request_id,
@@ -417,7 +418,9 @@ class CacheEngine:
                                         error=status.error)
         if not status.ready:
             return AsyncKVTransferEvent(request_id,
-                                        AsyncKVTransferState.PENDING)
+                                        AsyncKVTransferState.PENDING,
+                                        gpu_ready=status.gpu_ready,
+                                        host_ready=status.host_ready)
         try:
             self.granulekv_connector.complete_request(
                 request_id, ready_status=status)
@@ -427,7 +430,8 @@ class CacheEngine:
                                         AsyncKVTransferState.ERROR,
                                         error=str(exc))
         self._finish_async_kv_transfer_trace(request_id)
-        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY)
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY,
+                                    gpu_ready=True, host_ready=True)
 
     def cancel_async_kv_transfer(self, request_id: str) -> None:
         """Release one timed-out async request through the connector."""
