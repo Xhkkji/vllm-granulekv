@@ -12,6 +12,8 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
     AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.block_reservation import LogicalBlockKey
+from vllm.core.custom_schedulers.hierarchical_io.residency import (
+    SharedHostKVDirectory)
 
 
 class Fence:
@@ -26,6 +28,32 @@ class Fence:
 
     def synchronize(self):
         pytest.fail("backing path must not synchronize on the CPU")
+
+
+class IdentityHostDirectory:
+    def acquire(self, key, owner):
+        return key[1]
+
+    def lookup(self, key):
+        return key[1]
+
+    def ready(self, key, layers):
+        return True
+
+    def begin_load(self, key, layers):
+        pass
+
+    def finish_load(self, key, layers, success):
+        pass
+
+    def begin_use(self, key):
+        pass
+
+    def finish_use(self, key):
+        pass
+
+    def release_owner(self, owner):
+        pass
 
 
 @pytest.fixture
@@ -51,6 +79,12 @@ def worker(monkeypatch):
                  "_host_failed_blocks", "_backing_retired", "_ssd_read_blocks"):
         setattr(result, name, set())
     result._host_stats = defaultdict(int)
+    result._host_kv_directory = IdentityHostDirectory()
+    result._host_request_prefix_keys = {(0, "r"): "prefix"}
+    result._host_request_prefix_limits = {(0, "r"): 1024}
+    result._host_transfer_cache_keys = {}
+    result._pending_gpu_to_host_cache_keys = {}
+    result._host_staging_owner = None
     result._gpu_working_set_bound = 1
     result.cache_config = SimpleNamespace(block_size=16)
     result.model_config = result.parallel_config = None
@@ -198,6 +232,93 @@ def test_backing_feedback_is_consumed_locally_including_empty_layers(worker):
     feedback = SimpleNamespace(num_prefix_blocks=4, block_indices_by_layer=((), (0, 2)))
     assert worker.update_sparse_restore_prediction("r", feedback)
     assert updates == [("r", 4, ((), (0, 2)))]
+
+
+def test_sequential_same_prefix_reuses_cpu_host_slot(worker):
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    request = AsyncKVTransferRequest(
+        request_id="read-1",
+        seq_group_id="first",
+        reservation_id="reservation-1",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((50, 9),),
+        logical_blocks=(LogicalBlockKey(0, 9),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(2, 4),
+        sparse_page_index_key="same-exact-prefix",
+        destination="mixed",
+    )
+    worker._host_request_prefix_keys[0, "first"] = "same-exact-prefix"
+    worker._host_request_prefix_limits[0, "first"] = 16
+    mapped, logical = worker._prepare_host_read(
+        0, request, ((50, 9),), (2, 4))
+    assert logical == (9, )
+    slot = mapped[0][1]
+    cache_key = ("same-exact-prefix", 9)
+    worker._host_kv_directory.finish_load(cache_key, (2, 3), True)
+    worker._host_kv_directory.release_owner((0, "first"))
+
+    second = AsyncKVTransferRequest(
+        request_id="read-2",
+        seq_group_id="second",
+        reservation_id="reservation-2",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((70, 9),),
+        logical_blocks=(LogicalBlockKey(1, 9),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(2, 4),
+        sparse_page_index_key="same-exact-prefix",
+        destination="mixed",
+    )
+    worker._host_request_prefix_keys[0, "second"] = "same-exact-prefix"
+    worker._host_request_prefix_limits[0, "second"] = 16
+    mapped, logical = worker._prepare_host_read(
+        0, second, ((70, 9),), (2, 4))
+    assert mapped == ()
+    assert logical == ()
+    assert worker._host_kv_directory.lookup(cache_key) == slot
+    assert all((0, "second", layer, 9) in worker._host_ready_blocks
+               for layer in (2, 3))
+
+
+def test_mixed_request_rewrites_host_mapping_and_skips_cached_read(
+        worker, monkeypatch):
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    submitted = []
+
+    def submit(request_id, operation, mapping, **kwargs):
+        submitted.append((mapping.tolist(), kwargs["host_block_mapping"]))
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY,
+                                    host_ready=True)
+
+    engine = SimpleNamespace(num_attention_layers=4,
+                              submit_async_kv_transfer=submit)
+    worker.cache_engine = [engine]
+    worker._host_request_prefix_keys.clear()
+    worker._host_request_prefix_limits.clear()
+    monkeypatch.setattr(module, "uses_host_kv_writeback", lambda: False)
+    first = AsyncKVTransferRequest(
+        request_id="mixed-1", seq_group_id="first", reservation_id="r1",
+        operation=AsyncKVTransferOperation.READ, block_mapping=(),
+        logical_blocks=(), priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="prefix-x",
+        consumer_num_blocks=8, destination="mixed",
+        host_block_mapping=((31, 5),))
+    worker._submit_gpu_transfer(
+        0, engine, first, torch.empty((0, 2), dtype=torch.int64))
+    assert submitted[0] == ([], ((31, 0), ))
+
+    second = AsyncKVTransferRequest(
+        request_id="mixed-2", seq_group_id="second", reservation_id="r2",
+        operation=AsyncKVTransferOperation.READ, block_mapping=(),
+        logical_blocks=(), priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="prefix-x",
+        consumer_num_blocks=8, destination="mixed",
+        host_block_mapping=((90, 5),))
+    worker._submit_gpu_transfer(
+        0, engine, second, torch.empty((0, 2), dtype=torch.int64))
+    assert submitted[1] == ([], ())
+    assert worker._host_stats["cpu_direct_read_blocks"] == 1
 
 
 def test_layer_release_only_records_backup_fence(worker, monkeypatch):
@@ -395,6 +516,26 @@ def test_prefetch_finish_retains_dma_and_counts_consumption_once(worker, consume
     assert not worker._backing_retired
     assert worker._host_stats["host_gpu_prefetch_blocks"] == 1
     assert worker._host_stats["host_gpu_prefetch_hits"] == int(consume)
+
+
+def test_consumed_prefetch_releases_shared_host_inflight_reference(worker):
+    worker._host_kv_directory = SharedHostKVDirectory(1)
+    key = ("prefix", 0)
+    worker._host_kv_directory.acquire(key, (0, "r"))
+    worker._host_kv_directory.begin_load(key, (0,))
+    worker._host_kv_directory.finish_load(key, (0,), success=True)
+    worker._host_staging_owner = (0, "r")
+    event = Fence()
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda *args: event)
+    worker._host_request_prefix_keys[0, "r"] = "prefix"
+    worker.copy_host_blocks_to_gpu_async(
+        0, "r", 0, ((0, 3),), reason="prefetch")
+    worker._consume_host_copies(0, "r", 0, (0,))
+    event.ready = True
+    worker._poll_host_cache_uses(0)
+    worker._host_kv_directory.release_owner((0, "r"))
+    assert worker._host_kv_directory.acquire(("other", 1), (0, "next")) == 0
 
 
 def test_discarded_host_read_does_not_release_inflight_prefetch_source(worker):

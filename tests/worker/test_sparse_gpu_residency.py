@@ -8,6 +8,8 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferRequest, AsyncKVTransferState)
 from vllm.core.block_reservation import LogicalBlockKey
 from vllm.worker.worker import Worker
+from vllm.core.custom_schedulers.hierarchical_io.residency import (
+    SharedHostKVDirectory)
 import vllm.worker.worker as worker_module
 import torch
 
@@ -28,6 +30,9 @@ def _worker():
     worker._gpu_region_release_events = {}
     worker._gpu_transfer_regions = {}
     worker._host_prefetch_windows = {}
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    worker._host_request_prefix_keys = {}
+    worker._host_request_prefix_limits = {}
     worker._ssd_read_blocks = set()
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(

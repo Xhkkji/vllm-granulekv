@@ -11,12 +11,119 @@ Worker-local runtime 中，不改变 vLLM 原生 block table。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferRequest, AsyncKVTransferState)
+
+
+HostKVBlockKey = Tuple[str, int]
+
+
+@dataclass
+class _HostKVBlock:
+    slot: int
+    owners: Set[Tuple[int, str]]
+    loading_layers: Set[int]
+    ready_layers: Set[int]
+    in_flight: int = 0
+    last_access: int = 0
+
+
+class SharedHostKVDirectory:
+    """Bounded LRU mapping from (exact prefix hash, block) to pinned host slot."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("host KV capacity must be positive")
+        self.capacity = capacity
+        self._entries: Dict[HostKVBlockKey, _HostKVBlock] = {}
+        self._slots: Dict[int, HostKVBlockKey] = {}
+        self._clock = 0
+
+    def acquire(self, key: HostKVBlockKey,
+                owner: Tuple[int, str]) -> int:
+        entry = self._entries.get(key)
+        if entry is None:
+            slot = self._allocate_slot()
+            entry = _HostKVBlock(slot, set(), set(), set())
+            self._entries[key] = entry
+            self._slots[slot] = key
+        entry.owners.add(owner)
+        self._touch(entry)
+        return entry.slot
+
+    def lookup(self, key: HostKVBlockKey) -> Optional[int]:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._touch(entry)
+        return entry.slot
+
+    def ready(self, key: HostKVBlockKey, layers: Sequence[int]) -> bool:
+        entry = self._entries.get(key)
+        if entry is None:
+            return False
+        self._touch(entry)
+        return set(layers).issubset(entry.ready_layers)
+
+    def begin_load(self, key: HostKVBlockKey,
+                   layers: Sequence[int]) -> None:
+        entry = self._entries[key]
+        entry.loading_layers.update(layers)
+        entry.in_flight += 1
+
+    def finish_load(self, key: HostKVBlockKey, layers: Sequence[int],
+                    success: bool) -> None:
+        entry = self._entries[key]
+        entry.loading_layers.difference_update(layers)
+        if success:
+            entry.ready_layers.update(layers)
+        else:
+            entry.ready_layers.difference_update(layers)
+        entry.in_flight -= 1
+        if entry.in_flight < 0:
+            raise RuntimeError("host KV in-flight reference underflow")
+        self._touch(entry)
+
+    def begin_use(self, key: HostKVBlockKey) -> None:
+        entry = self._entries[key]
+        entry.in_flight += 1
+        self._touch(entry)
+
+    def finish_use(self, key: HostKVBlockKey) -> None:
+        entry = self._entries[key]
+        entry.in_flight -= 1
+        if entry.in_flight < 0:
+            raise RuntimeError("host KV in-flight reference underflow")
+        self._touch(entry)
+
+    def release_owner(self, owner: Tuple[int, str]) -> None:
+        for entry in self._entries.values():
+            entry.owners.discard(owner)
+
+    def _allocate_slot(self) -> int:
+        if len(self._slots) < self.capacity:
+            for slot in range(self.capacity):
+                if slot not in self._slots:
+                    return slot
+        candidates = ((entry.last_access, key, entry)
+                      for key, entry in self._entries.items()
+                      if not entry.owners and entry.in_flight == 0
+                      and not entry.loading_layers)
+        victim = min(candidates, default=None)
+        if victim is None:
+            raise RuntimeError("host KV cache has no evictable slot")
+        _, key, entry = victim
+        del self._entries[key]
+        del self._slots[entry.slot]
+        return entry.slot
+
+    def _touch(self, entry: _HostKVBlock) -> None:
+        self._clock += 1
+        entry.last_access = self._clock
 
 
 @dataclass

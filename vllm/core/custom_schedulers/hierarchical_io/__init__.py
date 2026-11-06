@@ -18,7 +18,7 @@ from .plan import (HierarchicalIOConfig, PrefetchBlockSelectorConfig,
                             SparseKVAccessPlan, build_layer_restore_plan,
                    get_layer_working_set_regions,
                    select_prefetch_unit_blocks)
-from .residency import PrefetchResidencyDirectory
+from .residency import PrefetchResidencyDirectory, SharedHostKVDirectory
 from .runtime import (PrefetchRuntimeTrace, RollingPrefetchRuntime,
                       SparseKVCorrectionResult)
 from .sparse_policy import (SparseKVActualSelection, SparseKVPlanFeedback,
@@ -49,6 +49,7 @@ __all__ = [
     "SparseKVAccessPlan",
     "SparseKVCorrectionResult",
     "SparseKVLayerSelection",
+    "SharedHostKVDirectory",
     "PrefetchRuntimeTrace",
     "activate_layer_barrier",
     "activate_sparse_kv_blocks",

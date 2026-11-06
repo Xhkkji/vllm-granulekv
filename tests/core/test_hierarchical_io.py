@@ -13,7 +13,7 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
     HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
-    SparseKVLayerSelection,
+    SparseKVLayerSelection, SharedHostKVDirectory,
     activate_layer_barrier, activate_sparse_kv_blocks,
     build_layer_restore_plan, correct_local_layer,
     get_active_layer_sequence_lengths,
@@ -35,6 +35,33 @@ def test_layer_restore_plan_is_contiguous_and_default_disabled():
     ]
     assert [unit.index for unit in plan.units] == [0, 1, 2]
     assert all(unit.block_indices is None for unit in plan.units)
+
+
+def test_shared_host_directory_lru_respects_owners_and_inflight_io():
+    directory = SharedHostKVDirectory(1)
+    first = ("prefix-a", 4)
+    owner = (0, "request-a")
+    slot = directory.acquire(first, owner)
+    directory.begin_load(first, (0, 1))
+    with pytest.raises(RuntimeError, match="no evictable slot"):
+        directory.acquire(("prefix-b", 4), (0, "request-b"))
+    directory.finish_load(first, (0, 1), success=True)
+    directory.release_owner(owner)
+    assert directory.lookup(first) == slot
+    assert directory.acquire(("prefix-b", 4), (0, "request-b")) == slot
+    assert directory.lookup(first) is None
+
+
+def test_shared_host_directory_tracks_layer_readiness():
+    directory = SharedHostKVDirectory(2)
+    key = ("same-exact-prefix", 7)
+    directory.acquire(key, (0, "first"))
+    directory.begin_load(key, (2, 3))
+    directory.finish_load(key, (2, 3), success=True)
+    directory.release_owner((0, "first"))
+    assert directory.ready(key, (2, 3))
+    assert not directory.ready(key, (1, 2, 3))
+    assert directory.lookup(("different-prefix", 7)) is None
 
 
 def test_exact_restore_is_opt_in_in_hierarchical_config():
