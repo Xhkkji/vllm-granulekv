@@ -45,6 +45,54 @@ def test_host_window_selection_precedes_single_query_metadata(monkeypatch, with_
     assert seen == [converted]
 
 
+def test_dynamic_restore_accepts_independent_decode_requests(monkeypatch):
+    from types import SimpleNamespace
+    import vllm.attention.layer as module
+    from vllm.core.custom_schedulers.hierarchical_io import (
+        SparseKVBatchLayerSelection, activate_layer_barrier,
+        activate_sparse_kv_blocks, get_active_sparse_kv_selections)
+
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE",
+                        True)
+    metadata = SimpleNamespace(num_prefill_tokens=0, num_decode_tokens=2,
+                               num_prefills=0)
+    queries = []
+    observed = []
+    monkeypatch.setattr(module, "get_sparse_kv_policy", lambda: object())
+    monkeypatch.setattr(
+        module, "observe_sparse_query",
+        lambda layer, query, request_id: observed.append(
+            (layer, query.clone(), request_id)))
+
+    def correct(_engine, _request_ids, _layer, query):
+        queries.append(query.clone())
+        return SparseKVBatchLayerSelection({
+            "request-a": (0, 2),
+            "request-b": (1, 3),
+        })
+
+    with activate_layer_barrier(
+            lambda *_args: (),
+            virtual_engine=0,
+            request_ids=("request-a", "request-b"),
+            correction_callback=correct):
+        with activate_sparse_kv_blocks((0,)):
+            query = torch.ones(2, 1, 2)
+            module._correct_decode_sparse_blocks(
+                "model.layers.3.self_attn.attn", metadata, query, 1, 2)
+            module._observe_decode_query(
+                "model.layers.3.self_attn.attn", metadata, query, 1, 2)
+            assert get_active_sparse_kv_selections() == {
+                "request-a": (0, 2),
+                "request-b": (1, 3),
+            }
+
+    assert queries[0].shape == (2, 1, 2)
+    assert [(layer, request_id) for layer, _, request_id in observed] == [
+        (3, "request-a"), (3, "request-b")
+    ]
+
+
 def test_compact_block_table_accepts_gpu_selection():
     try:
         table = torch.tensor([[11, 22, 33, 44]],

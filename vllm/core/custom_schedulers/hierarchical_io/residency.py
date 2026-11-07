@@ -288,14 +288,12 @@ class PrefetchResidencyDirectory:
         layer_index: int,
         sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
         block_size: Optional[int] = None,
-    ) -> Optional[Tuple[int, ...]]:
-        """确认当前 layer 的 KV 已驻留，并返回 sparse consumer block 集合。
-
-        batch 中多个请求若给出不同 sparse 集合，当前 v0 attention metadata
-        还无法分别表达，直接拒绝而不是静默扩大成 dense 访问。
-        """
+    ) -> Optional[Tuple[int, ...] | Mapping[str, Optional[Tuple[int, ...]]]]:
+        """确认当前 layer 的 KV 已驻留并返回按请求隔离的选择。"""
         request_id_set = frozenset(request_ids)
         selected: Optional[Tuple[int, ...]] = None
+        selected_by_request: Dict[str, Optional[Tuple[int, ...]]] = {
+            str(request_id): None for request_id in request_ids}
         for unit in self._units.values():
             request = unit.request
             if (request.seq_group_id not in request_id_set
@@ -353,11 +351,12 @@ class PrefetchResidencyDirectory:
                     f"missing_blocks={tuple(sorted(missing))}")
             current = (None if layer_selected is None else
                        tuple(sorted(layer_selected)))
-            if selected is not None and current != selected:
-                raise RuntimeError(
-                    "one batch has incompatible sparse KV access plans")
-            selected = current
-        return selected
+            selected_by_request[request.seq_group_id] = current
+            if len(request_ids) == 1:
+                selected = current
+        if len(request_ids) == 1:
+            return selected
+        return selected_by_request
 
     def evict_unit(self, request_id: str) -> Tuple[int, ...]:
         """标记一个已消费 sparse unit 为不可见，返回 logical block 下标。

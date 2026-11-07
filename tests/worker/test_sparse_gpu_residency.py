@@ -33,6 +33,11 @@ def _worker():
     worker._host_kv_directory = SharedHostKVDirectory(2)
     worker._host_request_prefix_keys = {}
     worker._host_request_prefix_limits = {}
+    worker._host_transfer_cache_keys = {}
+    worker._host_transfer_pending_cache_keys = {}
+    worker._host_transfer_wait_keys = {}
+    worker._host_transfer_waiters = {}
+    worker._host_completed_transfer_events = {}
     worker._ssd_read_blocks = set()
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(

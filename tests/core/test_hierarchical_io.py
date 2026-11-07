@@ -13,11 +13,12 @@ from vllm.core.custom_schedulers.hierarchical_io import (
     HierarchicalIOConfig, HierarchicalLayerBarrierConfig,
     HierarchicalRestoreController, PrefetchBlockSelectorConfig, PrefetchUnit,
     RollingPrefetchConfig, RollingPrefetchRuntime, SparseKVAccessPlan,
-    SparseKVLayerSelection, SharedHostKVDirectory,
+    SparseKVBatchLayerSelection, SparseKVLayerSelection, SharedHostKVDirectory,
     activate_layer_barrier, activate_sparse_kv_blocks,
     build_layer_restore_plan, correct_local_layer,
     get_active_layer_sequence_lengths,
     get_active_sparse_kv_blocks, get_active_sparse_kv_device_selection,
+    get_active_sparse_kv_selections,
     get_layer_working_set_regions, release_local_layer,
     select_prefetch_unit_blocks,
     wait_for_local_layer)
@@ -383,6 +384,17 @@ def test_layer_barrier_exposes_and_clears_device_selection():
             assert correct_local_layer(3, object()) == (1, 3)
             assert get_active_sparse_kv_device_selection() is device_selection
     assert get_active_sparse_kv_device_selection() is None
+
+
+def test_layer_barrier_keeps_per_request_sparse_selections_isolated():
+    batch = SparseKVBatchLayerSelection({
+        "request-a": (1, 4),
+        "request-b": (2, 7),
+    })
+    with activate_sparse_kv_blocks(batch):
+        assert get_active_sparse_kv_blocks() is None
+        assert get_active_sparse_kv_selections() == batch.by_request
+    assert get_active_sparse_kv_selections() is None
 
 
 def test_layer_physical_mapping_is_scoped_and_replaced():

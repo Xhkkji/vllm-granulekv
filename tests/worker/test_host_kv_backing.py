@@ -83,6 +83,11 @@ def worker(monkeypatch):
     result._host_request_prefix_keys = {(0, "r"): "prefix"}
     result._host_request_prefix_limits = {(0, "r"): 1024}
     result._host_transfer_cache_keys = {}
+    result._host_transfer_pending_cache_keys = {}
+    result._host_transfer_wait_keys = {}
+    result._host_transfer_waiters = {}
+    result._host_completed_transfer_events = {}
+    result._discarded_host_transfers = set()
     result._pending_gpu_to_host_cache_keys = {}
     result._host_staging_owner = None
     result._gpu_working_set_bound = 1
@@ -279,6 +284,201 @@ def test_sequential_same_prefix_reuses_cpu_host_slot(worker):
     assert worker._host_kv_directory.lookup(cache_key) == slot
     assert all((0, "second", layer, 9) in worker._host_ready_blocks
                for layer in (2, 3))
+    assert all((0, "second", layer, 9) in worker._host_staged_blocks
+               for layer in (2, 3))
+
+
+def test_loading_same_prefix_is_coalesced_into_one_ssd_read(worker, monkeypatch):
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    submitted = []
+    ready = {"value": False}
+
+    def submit(request_id, operation, mapping, **kwargs):
+        submitted.append((request_id, mapping.tolist()))
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
+
+    def poll(request_id):
+        return AsyncKVTransferEvent(
+            request_id,
+            AsyncKVTransferState.READY if ready["value"] else
+            AsyncKVTransferState.PENDING,
+            host_ready=ready["value"])
+
+    engine = SimpleNamespace(
+        num_attention_layers=4,
+        submit_async_kv_transfer=submit,
+        poll_async_kv_transfer=poll,
+    )
+    worker.cache_engine = [engine]
+    monkeypatch.setattr(module, "uses_host_kv_writeback", lambda: False)
+
+    def request(request_id, seq_group_id, source):
+        return AsyncKVTransferRequest(
+            request_id=request_id,
+            seq_group_id=seq_group_id,
+            reservation_id=seq_group_id,
+            operation=AsyncKVTransferOperation.READ,
+            block_mapping=((source, 9),),
+            logical_blocks=(LogicalBlockKey(0, 9),),
+            priority=AsyncKVTransferPriority.CRITICAL_READ,
+            layer_range=(0, 2),
+            sparse_page_index_key="shared-prefix",
+            destination="host")
+
+    first = worker._submit_gpu_transfer(
+        0, engine, request("host-1", "request-1", 50),
+        torch.tensor([[50, 9]], dtype=torch.int64))
+    second = worker._submit_gpu_transfer(
+        0, engine, request("host-2", "request-2", 70),
+        torch.tensor([[70, 9]], dtype=torch.int64))
+    assert first.state == AsyncKVTransferState.PENDING
+    assert second.state == AsyncKVTransferState.PENDING
+    assert submitted == [("host-1", [[50, 0]])]
+
+    ready["value"] = True
+    worker._poll_host_transfers(0)
+    assert not worker._host_async_kv_transfers
+    assert all((0, request_id, layer, 9) in worker._host_ready_blocks
+               for request_id in ("request-1", "request-2")
+               for layer in (0, 1))
+
+
+def test_loading_failure_propagates_to_waiter_and_cleans_state(worker, monkeypatch):
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    source_key = ("failed-prefix", 9)
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "failed-prefix",
+        (0, "request-2"): "failed-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 16,
+        (0, "request-2"): 16,
+    })
+
+    def submit(request_id, operation, mapping, **kwargs):
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
+
+    def poll(request_id):
+        if request_id == "host-1":
+            return AsyncKVTransferEvent(
+                request_id, AsyncKVTransferState.ERROR,
+                error="source read failed")
+        pytest.fail("waiter must not submit a second SSD read")
+
+    engine = SimpleNamespace(
+        num_attention_layers=2,
+        granulekv_connector=SimpleNamespace(
+            layout=SimpleNamespace(num_gpu_regions=2)),
+        submit_async_kv_transfer=submit,
+        poll_async_kv_transfer=poll,
+    )
+    worker.cache_engine = [engine]
+    monkeypatch.setattr(module, "uses_host_kv_writeback", lambda: False)
+
+    def request(request_id, seq_group_id, source):
+        return AsyncKVTransferRequest(
+            request_id=request_id,
+            seq_group_id=seq_group_id,
+            reservation_id=seq_group_id,
+            operation=AsyncKVTransferOperation.READ,
+            block_mapping=((source, 9),),
+            logical_blocks=(LogicalBlockKey(0, 9),),
+            priority=AsyncKVTransferPriority.CRITICAL_READ,
+            layer_range=(0, 2),
+            sparse_page_index_key="failed-prefix",
+            destination="host")
+
+    worker._submit_gpu_transfer(
+        0, engine, request("host-1", "request-1", 50),
+        torch.tensor([[50, 9]], dtype=torch.int64))
+    waiter = worker._submit_gpu_transfer(
+        0, engine, request("host-2", "request-2", 70),
+        torch.tensor([[70, 9]], dtype=torch.int64))
+    assert waiter.state == AsyncKVTransferState.PENDING
+
+    events = worker._poll_host_transfers(0)
+    assert [event.state for event in events] == [
+        AsyncKVTransferState.ERROR, AsyncKVTransferState.ERROR]
+    assert not worker._host_async_kv_transfers
+    assert not worker._host_transfer_wait_keys
+    assert not worker._host_transfer_waiters
+    assert all((0, request_id, layer, 9) in worker._host_failed_blocks
+               for request_id in ("request-1", "request-2")
+               for layer in (0, 1))
+    assert not worker._host_kv_directory.ready(source_key, (0, 1))
+
+
+def test_mixed_gpu_completion_waits_for_shared_host_waiter(worker, monkeypatch):
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "shared-prefix",
+        (0, "request-2"): "shared-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 16,
+        (0, "request-2"): 16,
+    })
+    submitted = []
+    source_ready = {"value": False}
+
+    def submit(request_id, operation, mapping, **kwargs):
+        submitted.append((request_id, kwargs["destination"]))
+        if kwargs["destination"] == "host":
+            return AsyncKVTransferEvent(request_id, AsyncKVTransferState.PENDING)
+        return AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY)
+
+    def poll(request_id):
+        return AsyncKVTransferEvent(
+            request_id,
+            AsyncKVTransferState.READY if source_ready["value"] else
+            AsyncKVTransferState.PENDING,
+            host_ready=source_ready["value"])
+
+    engine = SimpleNamespace(
+        num_attention_layers=2,
+        granulekv_connector=SimpleNamespace(
+            layout=SimpleNamespace(num_gpu_regions=2)),
+        submit_async_kv_transfer=submit,
+        poll_async_kv_transfer=poll,
+    )
+    worker.cache_engine = [engine]
+    monkeypatch.setattr(module, "uses_host_kv_writeback", lambda: False)
+
+    source = AsyncKVTransferRequest(
+        request_id="host-1", seq_group_id="request-1",
+        reservation_id="reservation-1",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((50, 9),),
+        logical_blocks=(LogicalBlockKey(0, 9),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="shared-prefix",
+        destination="host")
+    worker._submit_gpu_transfer(
+        0, engine, source, torch.tensor([[50, 9]], dtype=torch.int64))
+
+    mixed = AsyncKVTransferRequest(
+        request_id="mixed-2", seq_group_id="request-2",
+        reservation_id="reservation-2",
+        operation=AsyncKVTransferOperation.READ,
+        block_mapping=((60, 8),),
+        logical_blocks=(LogicalBlockKey(0, 8),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="shared-prefix",
+        destination="mixed", host_block_mapping=((70, 9),))
+    event = worker._submit_gpu_transfer(
+        0, engine, mixed, torch.tensor([[60, 8]], dtype=torch.int64))
+    assert event.state == AsyncKVTransferState.PENDING
+    assert event.gpu_ready
+    assert (0, "mixed-2") in worker._host_async_kv_transfers
+    assert submitted == [("host-1", "host"), ("mixed-2", "mixed")]
+
+    source_ready["value"] = True
+    events = worker._poll_host_transfers(0)
+    assert [event.state for event in events] == [
+        AsyncKVTransferState.READY, AsyncKVTransferState.READY]
+    assert not worker._host_async_kv_transfers
+    assert all((0, "request-2", layer, 9) in worker._host_ready_blocks
+               for layer in (0, 1))
 
 
 def test_mixed_request_rewrites_host_mapping_and_skips_cached_read(
@@ -938,7 +1138,7 @@ def test_standard_worker_input_initializes_backing_metadata(worker):
                               seq_group_metadata_list=[metadata])
     worker._prepare_host_backing_forward(request)
     assert worker._backing_forward[0, "r"] == ((3, 4), 31, 32, True)
-    assert worker._host_staging_owner == (0, "r")
+    assert worker._host_staging_owner is None
 
 
 @pytest.mark.parametrize("layer_range", [(8, 9), (8, 12), (0, 28)])

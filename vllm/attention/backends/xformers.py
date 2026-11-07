@@ -34,6 +34,7 @@ from vllm.attention.ops.sparse_kv import (
 from vllm.core.custom_schedulers.hierarchical_io import (
     active_sparse_kv_device_selection_required,
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    get_active_sparse_kv_selections,
     get_active_sparse_kv_device_selection,
     get_sparse_kv_policy, register_sparse_page_representatives,
     select_sparse_blocks)
@@ -1274,6 +1275,64 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
             block_size = value_cache.shape[3]
             sequence_length = int(max_seq_len_arg)
+            active_selections = get_active_sparse_kv_selections()
+            if (active_selections is not None
+                    and any(value is not None
+                            for value in active_selections.values())):
+                request_ids = get_active_layer_request_ids()
+                if (len(request_ids) != decode_query.shape[0]
+                        or block_tables_arg is None):
+                    raise RuntimeError(
+                        "sparse request ids do not match decode batch")
+                for index, request_id in enumerate(request_ids):
+                    selection = active_selections[request_id]
+                    row_length = int(seq_lens_arg[index].item())
+                    device_selection = (None if selection is None else
+                                        getattr(selection, "device_selection", None))
+                    if device_selection is not None:
+                        selected = validate_sparse_kv_device_selection(
+                            device_selection)
+                        tail_tokens = row_length - (
+                            (row_length + block_size - 1) // block_size - 1
+                        ) * block_size
+                        selected_seq_len = (
+                            selected.count * block_size -
+                            (block_size - tail_tokens))
+                        output[num_prefill_query_tokens + index:
+                               num_prefill_query_tokens + index + 1] = (
+                            PagedAttention.forward_decode_selected(
+                                decode_query[index:index + 1], key_cache,
+                                value_cache, block_tables_arg[index:index + 1],
+                                seq_lens_arg[index:index + 1],
+                                selected.logical_block_indices,
+                                selected.count, selected_seq_len,
+                                self.kv_cache_dtype, self.num_kv_heads,
+                                self.scale, self.alibi_slopes,
+                                layer._k_scale, layer._v_scale))
+                        record_sparse_kv_attention(
+                            (row_length + block_size - 1) // block_size,
+                            selected.count, selected_seq_len)
+                        continue
+                    blocks = (tuple(range((row_length + block_size - 1) //
+                                          block_size)) if selection is None else
+                              (selection.block_indices
+                               if hasattr(selection, "block_indices") else
+                               tuple(selection)))
+                    row_table, selected_seq_len = build_selected_decode_block_table(
+                        block_tables_arg[index:index + 1], blocks,
+                        row_length, block_size)
+                    output[num_prefill_query_tokens + index:
+                           num_prefill_query_tokens + index + 1] = (
+                        PagedAttention.forward_decode(
+                            decode_query[index:index + 1], key_cache, value_cache,
+                            row_table,
+                            torch.tensor([selected_seq_len],
+                                         dtype=seq_lens_arg.dtype,
+                                         device=seq_lens_arg.device),
+                            selected_seq_len, self.kv_cache_dtype,
+                            self.num_kv_heads, self.scale, self.alibi_slopes,
+                            layer._k_scale, layer._v_scale))
+                return output
             selected_attention = None
             selected_attention_seq_len = None
             active_sparse_blocks = get_active_sparse_kv_blocks()

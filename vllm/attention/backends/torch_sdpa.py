@@ -24,6 +24,7 @@ from vllm.attention.ops.sparse_kv import (
     build_selected_decode_block_table, select_and_compact_decode_blocks)
 from vllm.core.custom_schedulers.hierarchical_io import (
     get_active_layer_request_ids, get_active_sparse_kv_blocks,
+    get_active_sparse_kv_selections,
     get_sparse_kv_policy, register_sparse_page_representatives,
     select_sparse_blocks)
 from vllm.logger import init_logger
@@ -578,6 +579,39 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                 block_tables_arg,
             ) = decode_meta.get_seq_len_block_table_args(attn_type)
 
+            active_selections = get_active_sparse_kv_selections()
+            if (active_selections is not None
+                    and any(value is not None
+                            for value in active_selections.values())):
+                request_ids = get_active_layer_request_ids()
+                if len(request_ids) != query.shape[0] or block_tables_arg is None:
+                    raise RuntimeError(
+                        "sparse request ids do not match decode batch")
+                block_size = value_cache.shape[3]
+                for index, request_id in enumerate(request_ids):
+                    selection = active_selections[request_id]
+                    sequence_length = int(seq_lens_arg[index].item())
+                    device_selection = (None if selection is None else
+                                        getattr(selection, "device_selection", None))
+                    blocks = (tuple(range((sequence_length + block_size - 1) //
+                                          block_size)) if selection is None else
+                              (device_selection.logical_block_indices
+                               if device_selection is not None else
+                               (selection.block_indices
+                                if hasattr(selection, "block_indices") else
+                                tuple(selection))))
+                    row_table, selected_seq_len = build_selected_decode_block_table(
+                        block_tables_arg[index:index + 1], blocks,
+                        sequence_length, block_size)
+                    PagedAttention.forward_decode(
+                        output[index:index + 1], query[index:index + 1],
+                        key_cache, value_cache, row_table,
+                        torch.tensor([selected_seq_len], dtype=seq_lens_arg.dtype,
+                                     device=seq_lens_arg.device),
+                        selected_seq_len, self.kv_cache_dtype,
+                        self.num_kv_heads, self.scale, self.alibi_slopes,
+                        layer._k_scale, layer._v_scale)
+                return output.view(-1, self.num_heads * self.head_size)
             active_sparse_blocks = get_active_sparse_kv_blocks()
             if (active_sparse_blocks is None
                     and envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE):

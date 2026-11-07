@@ -35,7 +35,16 @@ class SparseKVLayerSelection:
     slot_mapping: Optional[Any] = None
 
 
-LayerCorrectionResult = Optional[Tuple[int, ...] | SparseKVLayerSelection]
+@dataclass(frozen=True)
+class SparseKVBatchLayerSelection:
+    """Independent sparse selections for the requests in one model batch."""
+
+    by_request: Mapping[
+        str, Optional[Tuple[int, ...] | SparseKVLayerSelection]]
+
+
+LayerCorrectionResult = Optional[
+    Tuple[int, ...] | SparseKVLayerSelection | SparseKVBatchLayerSelection]
 LayerCorrectionCallback = Callable[
     [int, Sequence[str], int, Any], LayerCorrectionResult]
 
@@ -73,6 +82,9 @@ _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
     "granulekv_hierarchical_layer_barrier", default=None)
 _ACTIVE_SPARSE_KV_BLOCKS: ContextVar[Optional[Tuple[int, ...]]] = ContextVar(
     "granulekv_sparse_kv_blocks", default=None)
+_ACTIVE_SPARSE_KV_SELECTIONS: ContextVar[
+    Optional[Mapping[str, Optional[Tuple[int, ...] | SparseKVLayerSelection]]]
+] = ContextVar("granulekv_sparse_kv_selections", default=None)
 _ACTIVE_SPARSE_KV_DEVICE_SELECTION: ContextVar[Optional[Any]] = ContextVar(
     "granulekv_sparse_kv_device_selection", default=None)
 _ACTIVE_SPARSE_KV_DEVICE_REQUIRED: ContextVar[bool] = ContextVar(
@@ -146,7 +158,18 @@ def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...
     selected = session.correction_callback(
         session.virtual_engine, session.request_ids, layer_index, query)
     if selected is not None:
-        if isinstance(selected, SparseKVLayerSelection):
+        if isinstance(selected, SparseKVBatchLayerSelection):
+            selections = dict(selected.by_request)
+            _ACTIVE_SPARSE_KV_SELECTIONS.set(selections)
+            value = next(iter(selections.values())) if len(selections) == 1 else None
+            blocks = (None if value is None else
+                      (value.block_indices if isinstance(
+                          value, SparseKVLayerSelection) else tuple(value)))
+            _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
+            _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
+            _ACTIVE_SPARSE_KV_MAPPING.set(None)
+        elif isinstance(selected, SparseKVLayerSelection):
+            _ACTIVE_SPARSE_KV_SELECTIONS.set(None)
             blocks = selected.block_indices
             _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(
                 selected.device_selection)
@@ -156,6 +179,7 @@ def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...
                 None if selected.block_table is None else
                 (selected.block_table, selected.slot_mapping))
         else:
+            _ACTIVE_SPARSE_KV_SELECTIONS.set(None)
             blocks = tuple(selected)
             _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
             _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
@@ -167,7 +191,7 @@ def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...
 
 @contextmanager
 def activate_sparse_kv_blocks(
-    block_indices: Optional[Sequence[int]],
+    block_indices: Optional[Sequence[int] | SparseKVBatchLayerSelection],
 ) -> Iterator[None]:
     """把当前 layer 的 sparse block 集合暴露给 attention backend。
 
@@ -176,14 +200,24 @@ def activate_sparse_kv_blocks(
     consumer 可以调用 ``get_active_sparse_kv_blocks`` 取得同一份 logical
     block 集合，而无需依赖 Qwen2 或 scheduler 类型。
     """
-    selected = (None if block_indices is None else tuple(block_indices))
+    selections = None
+    if isinstance(block_indices, SparseKVBatchLayerSelection):
+        selections = dict(block_indices.by_request)
+        value = next(iter(selections.values())) if len(selections) == 1 else None
+        selected = (None if value is None else
+                    (value.block_indices if isinstance(
+                        value, SparseKVLayerSelection) else tuple(value)))
+    else:
+        selected = (None if block_indices is None else tuple(block_indices))
     token = _ACTIVE_SPARSE_KV_BLOCKS.set(selected)
+    selections_token = _ACTIVE_SPARSE_KV_SELECTIONS.set(selections)
     device_token = _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
     required_token = _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
     mapping_token = _ACTIVE_SPARSE_KV_MAPPING.set(None)
     try:
         yield
     finally:
+        _ACTIVE_SPARSE_KV_SELECTIONS.reset(selections_token)
         _ACTIVE_SPARSE_KV_MAPPING.reset(mapping_token)
         _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.reset(required_token)
         _ACTIVE_SPARSE_KV_DEVICE_SELECTION.reset(device_token)
@@ -193,6 +227,11 @@ def activate_sparse_kv_blocks(
 def get_active_sparse_kv_blocks() -> Optional[Tuple[int, ...]]:
     """返回当前 layer 允许 attention 访问的 logical KV blocks。"""
     return _ACTIVE_SPARSE_KV_BLOCKS.get()
+
+
+def get_active_sparse_kv_selections(
+) -> Optional[Mapping[str, Optional[Tuple[int, ...] | SparseKVLayerSelection]]]:
+    return _ACTIVE_SPARSE_KV_SELECTIONS.get()
 
 
 def get_active_sparse_kv_mapping() -> Optional[Tuple[Any, Any]]:

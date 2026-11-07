@@ -1,0 +1,22 @@
+{
+  "source": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/smoke1k_same_r7/summary.json",
+  "source_sha256": "87919bed4d92ab9eaf8f6cafd006342a67fb43679c7395e64b0bfa498043318e",
+  "scope": "sequential references only; batch attempt failed",
+  "sequential_reference_comparison": {
+    "rtol": 0.02,
+    "atol": 0.02,
+    "kv_comparison": "exact_sha256",
+    "layers_compared": 56,
+    "logits_compared": 2,
+    "attention_max_abs_error": 0.0,
+    "logits_max_abs_error": 0.0
+  },
+  "actual_max_forward_batch": 1,
+  "whole_run_completed_ssd_io": {
+    "write_requests": 1,
+    "write_bytes": 58720256,
+    "read_requests": 23,
+    "read_bytes": 141557760
+  },
+  "performance_valid": false
+}
