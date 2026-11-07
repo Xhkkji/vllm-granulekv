@@ -19,7 +19,7 @@ from vllm.core.custom_schedulers.async_kv_transfer import (
     AsyncKVTransferEvent, AsyncKVTransferOperation, AsyncKVTransferPriority,
     AsyncKVTransferRequest, AsyncKVTransferState)
 
-from .plan import RollingPrefetchConfig
+from .plan import RollingPrefetchConfig, uses_bounded_gpu_slots
 from .residency import (PrefetchResidencyDirectory,
                         SparseKVLayerPredictionState)
 
@@ -346,6 +346,18 @@ class RollingPrefetchRuntime:
         self.residency.mark_blocks_resident(
             state.plan_id, layer_index, logical_blocks)
 
+    def layer_gpu_ready(self, virtual_engine: int, request_id: str, layer_index: int) -> bool:
+        for (engine, _), plan in self._plans.items():
+            if engine != virtual_engine:
+                continue
+            for unit in plan.units.values():
+                request = unit.request
+                if (request.seq_group_id == request_id and request.layer_range is not None
+                        and request.layer_range[0] <= layer_index < request.layer_range[1]):
+                    return unit.gpu_ready or (unit.terminal is not None
+                        and unit.terminal.state == AsyncKVTransferState.READY)
+        return True
+
     def correct_layer(
         self,
         virtual_engine: int,
@@ -363,7 +375,7 @@ class RollingPrefetchRuntime:
         poll_correction_only: bool = False,
     ) -> SparseKVCorrectionResult:
         """Synchronously close one layer gap through the async lifecycle."""
-        if self.config.working_set_enabled:
+        if self.config.working_set_enabled and not uses_bounded_gpu_slots():
             raise RuntimeError(
                 "sparse correction does not support layer working-set mode")
         if timeout_seconds <= 0:

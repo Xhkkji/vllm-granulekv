@@ -143,6 +143,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         )
 
         self.block_tables: Dict[SeqId, BlockTable] = {}
+        self.bounded_working_set_blocks = 0
+        self._bounded_capacities: Dict[SeqId, Tuple[int, int]] = {}
         self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
 
         self._computed_blocks_tracker = ComputedBlocksTracker(
@@ -174,10 +176,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
         if self.bounded_gpu_slots:
-            required = cdiv(seq.get_len() + num_lookahead_slots, self.block_size)
-            if required > envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS:
-                return AllocStatus.NEVER
-            return AllocStatus.LATER if self.block_tables else AllocStatus.OK
+            return self._can_allocate_bounded(
+                self._bounded_host_capacity(seq_group), self.bounded_working_set_blocks)
         num_required_blocks = BlockTable.get_num_required_blocks(
             seq.get_token_ids(),
             block_size=self.block_size,
@@ -207,6 +207,20 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
+
+    def _bounded_host_capacity(self, seq_group: SequenceGroup) -> int:
+        seq = seq_group.get_seqs()[0]
+        return cdiv(seq.get_prompt_len() + seq_group.sampling_params.max_tokens,
+                    self.block_size)
+
+    def _can_allocate_bounded(self, host_blocks: int, gpu_blocks: int) -> AllocStatus:
+        host_capacity = envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS
+        if host_blocks > host_capacity or gpu_blocks > self.num_total_gpu_blocks:
+            return AllocStatus.NEVER
+        if (host_blocks + sum(value[0] for value in self._bounded_capacities.values()) > host_capacity
+                or gpu_blocks + sum(value[1] for value in self._bounded_capacities.values()) > self.num_total_gpu_blocks):
+            return AllocStatus.LATER
+        return AllocStatus.OK
 
     def _allocate_sequence(self, seq: Sequence) -> BlockTable:
         block_table = BlockTable(
@@ -240,6 +254,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
+        if self.bounded_gpu_slots:
+            self._bounded_capacities[seq.seq_id] = (
+                self._bounded_host_capacity(seq_group), self.bounded_working_set_blocks)
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
@@ -347,6 +364,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Free table/blocks
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
+        self._bounded_capacities.pop(seq_id, None)
 
     def free_granulekv_prefix_store(self, seq: Sequence) -> None:
         """释放 prefix populate 后位于 storage 的正式 block table。
@@ -368,6 +386,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 del self._pinned_gpu_blocks[key]
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
+        self._bounded_capacities.pop(seq_id, None)
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
@@ -596,6 +615,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self,
         num_prefix_blocks: int,
         num_gpu_cached_blocks: int,
+        *, seq_group: Optional[SequenceGroup] = None, gpu_blocks: int = 0,
     ) -> AllocStatus:
         """判断当前是否能为 SSD 扩展 prefix 预留 GPU target。
 
@@ -606,9 +626,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         if not 0 <= num_gpu_cached_blocks < num_prefix_blocks:
             return AllocStatus.NEVER
         if self.bounded_gpu_slots:
-            if num_prefix_blocks > envs.VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS:
-                return AllocStatus.NEVER
-            return AllocStatus.LATER if self.block_tables else AllocStatus.OK
+            return self._can_allocate_bounded(
+                num_prefix_blocks if seq_group is None else self._bounded_host_capacity(seq_group),
+                gpu_blocks)
         if (self.num_total_gpu_blocks - num_prefix_blocks
                 < self.watermark_blocks):
             return AllocStatus.NEVER
@@ -623,6 +643,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq_group: SequenceGroup,
         num_prefix_blocks: int,
         num_gpu_cached_blocks: int,
+        gpu_blocks: int = 0,
     ) -> BlockPrefixRestoreReservation:
         """为新请求建立部分 GPU table，并预留 SSD prefix 的直接恢复事务。
 
@@ -687,6 +708,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 logical_only=self.bounded_gpu_slots,
             )
             self.block_tables[seq.seq_id] = block_table
+            if self.bounded_gpu_slots:
+                self._bounded_capacities[seq.seq_id] = (
+                    self._bounded_host_capacity(seq_group), gpu_blocks)
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
 
             # 初始化原生 tracker，使 loading 期间 abort/free 仍满足生命周期。

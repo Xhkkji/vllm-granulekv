@@ -474,6 +474,19 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        from dataclasses import replace
+        from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_mapping
+        mapping = get_active_sparse_kv_mapping()
+        selections = get_active_sparse_kv_selections()
+        if mapping is not None:
+            attn_metadata = replace(attn_metadata, block_tables=mapping[0], slot_mapping=mapping[1])
+        elif selections is not None:
+            slots = [value.slot_mapping for value in selections.values()
+                     if getattr(value, "slot_mapping", None) is not None]
+            if slots:
+                if len(slots) != len(selections):
+                    raise ValueError("incomplete per-request KV write mappings")
+                attn_metadata = replace(attn_metadata, slot_mapping=torch.cat(slots))
         attn_type = self.attn_type
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
@@ -595,13 +608,14 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                                         getattr(selection, "device_selection", None))
                     blocks = (tuple(range((sequence_length + block_size - 1) //
                                           block_size)) if selection is None else
-                              (device_selection.logical_block_indices
+                              (device_selection.logical_block_indices[:device_selection.count]
                                if device_selection is not None else
                                (selection.block_indices
                                 if hasattr(selection, "block_indices") else
                                 tuple(selection))))
                     row_table, selected_seq_len = build_selected_decode_block_table(
-                        block_tables_arg[index:index + 1], blocks,
+                        (selection.block_table if getattr(selection, "block_table", None) is not None
+                         else block_tables_arg[index:index + 1]), blocks,
                         sequence_length, block_size)
                     PagedAttention.forward_decode(
                         output[index:index + 1], query[index:index + 1],

@@ -386,6 +386,17 @@ class LLMEngine:
             for v_id in range(self.parallel_config.pipeline_parallel_size)
         ]
 
+        from vllm.core.custom_schedulers.hierarchical_io.plan import uses_bounded_gpu_slots
+        if uses_bounded_gpu_slots():
+            from vllm.core.custom_schedulers.hierarchical_io import get_sparse_kv_policy
+            bound = get_sparse_kv_policy().working_set_bound(
+                self.model_config.get_num_attention_heads(self.parallel_config),
+                envs.VLLM_GRANULEKV_SPARSE_BLOCK_BUDGET,
+                self.scheduler_config.max_num_batched_tokens,
+                self.cache_config.block_size)
+            for scheduler in self.scheduler:
+                scheduler.block_manager.bounded_working_set_blocks = bound
+
         # Metric Logging.
         if self.log_stats:
             if stat_loggers is not None:

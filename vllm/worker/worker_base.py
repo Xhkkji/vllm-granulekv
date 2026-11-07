@@ -464,11 +464,21 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 seq_offset += len(seq_ids)
                 if lengths:
                     sequence_lengths_by_request[str(request_id)] = max(lengths)
+        query_lengths_by_request = {}
+        seq_offset = 0
+        for request_id, seq_ids in request_ids_to_seq_ids.items():
+            if activate_layer_barrier is not None and len(seq_ids) != 1:
+                raise ValueError("hierarchical KV requires one sequence per request")
+            if model_input.query_lens is not None:
+                query_lengths_by_request[request_id] = sum(
+                    model_input.query_lens[seq_offset:seq_offset + len(seq_ids)])
+            seq_offset += len(seq_ids)
         barrier_context = (
             activate_layer_barrier(
                 worker_input.virtual_engine,
                 request_ids,
                 sequence_lengths_by_request=sequence_lengths_by_request,
+                query_lengths_by_request=query_lengths_by_request,
                 block_size=self.cache_config.block_size)
             if activate_layer_barrier is not None else nullcontext())
         # 普通 Worker 没有这项可选能力，仍是空上下文；GranuleKV Worker 只在实验

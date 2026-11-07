@@ -75,6 +75,7 @@ def test_dynamic_restore_accepts_independent_decode_requests(monkeypatch):
             lambda *_args: (),
             virtual_engine=0,
             request_ids=("request-a", "request-b"),
+            query_lengths_by_request={"request-a": 1, "request-b": 1},
             correction_callback=correct):
         with activate_sparse_kv_blocks((0,)):
             query = torch.ones(2, 1, 2)

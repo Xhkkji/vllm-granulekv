@@ -42,6 +42,8 @@ def _worker():
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(
         layout=SimpleNamespace(num_gpu_regions=28)))]
+    worker._backing_retired = set()
+    worker._pending_gpu_to_host = {}
     return worker
 
 

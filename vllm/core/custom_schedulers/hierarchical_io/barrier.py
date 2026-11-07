@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 
@@ -76,6 +76,7 @@ class _LayerBarrierSession:
     request_ids: tuple[str, ...]
     sequence_lengths_by_request: Optional[Dict[str, int]]
     block_size: Optional[int]
+    query_lengths_by_request: Optional[Mapping[str, int]]
 
 
 _ACTIVE_LAYER_BARRIER: ContextVar[Optional[_LayerBarrierSession]] = ContextVar(
@@ -103,6 +104,7 @@ def activate_layer_barrier(
     correction_callback: Optional[LayerCorrectionCallback] = None,
     sequence_lengths_by_request: Optional[Mapping[str, int]] = None,
     block_size: Optional[int] = None,
+    query_lengths_by_request: Optional[Mapping[str, int]] = None,
 ) -> Iterator[None]:
     """在 model forward 的动态范围内安装 worker-local 回调。
 
@@ -121,7 +123,8 @@ def activate_layer_barrier(
                                  {str(request_id): int(length)
                                   for request_id, length in
                                   sequence_lengths_by_request.items()}),
-                             block_size=block_size))
+                             block_size=block_size,
+                             query_lengths_by_request=query_lengths_by_request))
     try:
         yield
     finally:
@@ -191,7 +194,8 @@ def correct_local_layer(layer_index: int, query: Any) -> Optional[Tuple[int, ...
 
 @contextmanager
 def activate_sparse_kv_blocks(
-    block_indices: Optional[Sequence[int] | SparseKVBatchLayerSelection],
+    block_indices: Optional[Sequence[int] | SparseKVLayerSelection | SparseKVBatchLayerSelection],
+    *, request_id: Optional[str] = None,
 ) -> Iterator[None]:
     """把当前 layer 的 sparse block 集合暴露给 attention backend。
 
@@ -207,16 +211,28 @@ def activate_sparse_kv_blocks(
         selected = (None if value is None else
                     (value.block_indices if isinstance(
                         value, SparseKVLayerSelection) else tuple(value)))
+    elif isinstance(block_indices, SparseKVLayerSelection):
+        selected = block_indices.block_indices
     else:
         selected = (None if block_indices is None else tuple(block_indices))
     token = _ACTIVE_SPARSE_KV_BLOCKS.set(selected)
     selections_token = _ACTIVE_SPARSE_KV_SELECTIONS.set(selections)
-    device_token = _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(None)
-    required_token = _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(False)
-    mapping_token = _ACTIVE_SPARSE_KV_MAPPING.set(None)
+    value = block_indices if isinstance(block_indices, SparseKVLayerSelection) else None
+    device_token = _ACTIVE_SPARSE_KV_DEVICE_SELECTION.set(
+        None if value is None else value.device_selection)
+    required_token = _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.set(
+        False if value is None else value.device_selection_required)
+    mapping_token = _ACTIVE_SPARSE_KV_MAPPING.set(
+        None if value is None or value.block_table is None else
+        (value.block_table, value.slot_mapping))
+    session = _ACTIVE_LAYER_BARRIER.get()
+    session_token = (None if request_id is None or session is None else
+                     _ACTIVE_LAYER_BARRIER.set(replace(session, request_ids=(request_id,))))
     try:
         yield
     finally:
+        if session_token is not None:
+            _ACTIVE_LAYER_BARRIER.reset(session_token)
         _ACTIVE_SPARSE_KV_SELECTIONS.reset(selections_token)
         _ACTIVE_SPARSE_KV_MAPPING.reset(mapping_token)
         _ACTIVE_SPARSE_KV_DEVICE_REQUIRED.reset(required_token)
@@ -260,3 +276,8 @@ def get_active_layer_sequence_lengths() -> Optional[Dict[str, int]]:
     if session is None or session.sequence_lengths_by_request is None:
         return None
     return dict(session.sequence_lengths_by_request)
+
+
+def get_active_layer_query_lengths() -> Mapping[str, int]:
+    session = _ACTIVE_LAYER_BARRIER.get()
+    return {} if session is None or session.query_lengths_by_request is None else session.query_lengths_by_request

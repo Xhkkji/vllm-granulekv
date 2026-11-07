@@ -56,7 +56,7 @@ def test_bounded_history_admission_checks_host_not_gpu_capacity(monkeypatch):
     monkeypatch.setattr(module, "uses_bounded_gpu_slots", lambda: True)
     monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 128)
     manager = SelfAttnBlockSpaceManager(16, 4, 128, enable_caching=True)
-    fitting = create_seq_group(seq_prompt_len=2048, seq_output_lens=[0])
+    fitting = create_seq_group(seq_prompt_len=2032, seq_output_lens=[0])
     excessive = create_seq_group(seq_prompt_len=2049, seq_output_lens=[0])
     assert manager.can_allocate(fitting) == AllocStatus.OK
     assert manager.can_allocate(excessive) == AllocStatus.NEVER
@@ -545,3 +545,21 @@ def test_sliding_window(block_size, prompt_len, num_slots_to_append,
             check_used(0, sliding_blocks + 1)
         else:
             check_used(sliding_blocks, sliding_blocks + 1)
+
+
+def test_bounded_batch_admission_accounts_for_loading_and_output(monkeypatch):
+    import vllm.core.block_manager as module
+    monkeypatch.setattr(module, "uses_bounded_gpu_slots", lambda: True)
+    monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS", 64)
+    manager = SelfAttnBlockSpaceManager(16, 10, 128, enable_caching=True)
+    manager.bounded_working_set_blocks = 4
+    first = create_seq_group(seq_prompt_len=256, seq_output_lens=[0], request_id="a", seq_id_start=1)
+    second = create_seq_group(seq_prompt_len=256, seq_output_lens=[0], request_id="b", seq_id_start=2)
+    manager.allocate(first)
+    assert manager.can_allocate(second) == AllocStatus.OK
+    manager.allocate(second)
+    assert manager._can_allocate_bounded(1, 3) == AllocStatus.LATER
+    assert manager._can_allocate_bounded(31, 0) == AllocStatus.LATER
+    manager.free(first.get_seqs()[0])
+    assert manager._can_allocate_bounded(17, 4) == AllocStatus.OK
+    assert manager._can_allocate_bounded(65, 0) == AllocStatus.NEVER

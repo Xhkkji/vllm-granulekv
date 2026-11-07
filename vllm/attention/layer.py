@@ -65,47 +65,30 @@ def _observe_decode_query(layer_name: str, attn_metadata: Any,
                 and active_selections is None
                 and not envs.VLLM_GRANULEKV_SPARSE_RESIDENT_ENABLE)):
         return
-    if attn_metadata.num_prefill_tokens != 0:
-        if not (envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE
-                and attn_metadata.num_prefills == 1
-                and attn_metadata.num_decode_tokens == 0):
-            return
-    elif attn_metadata.num_decode_tokens <= 0:
-        return
     layer_index = _layer_index_from_name(layer_name)
     if layer_index is None:
         return
     request_ids = get_active_layer_request_ids()
     if query.ndim == 2:
         query = query.view(-1, num_heads, head_size)
-    if attn_metadata.num_prefill_tokens:
-        query = query[-1:]
-    if query.ndim != 3 or query.shape[0] < 1:
-        raise RuntimeError("sparse policy query observation requires query tokens")
-    if len(request_ids) <= 1:
-        if query.shape[0] != 1:
-            raise RuntimeError(
-                "sparse policy query observation requires one decode token")
-        observe_sparse_query(layer_index, query,
-                             request_id=request_ids[0] if request_ids else "default")
+    from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_layer_query_lengths
+    lengths = get_active_layer_query_lengths()
+    if not request_ids:
         return
-    if query.shape[0] != len(request_ids):
-        raise RuntimeError("sparse query batch does not match request ids")
-    for index, request_id in enumerate(request_ids):
-        observe_sparse_query(layer_index, query[index:index + 1],
+    offset = 0
+    for request_id in request_ids:
+        length = lengths[request_id] if lengths else query.shape[0]
+        offset += length
+        observe_sparse_query(layer_index, query[offset - 1:offset],
                              request_id=request_id)
+    if offset != query.shape[0]:
+        raise ValueError("query lengths do not cover the request batch")
 
 
 def _correct_decode_sparse_blocks(layer_name: str, attn_metadata: Any,
                                   query: torch.Tensor, num_heads: int,
                                   head_size: int) -> None:
     if not envs.VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE:
-        return
-    if attn_metadata.num_prefill_tokens != 0:
-        if not (attn_metadata.num_prefills == 1
-                and attn_metadata.num_decode_tokens == 0):
-            return
-    elif attn_metadata.num_decode_tokens <= 0:
         return
     layer_index = _layer_index_from_name(layer_name)
     if layer_index is None:
@@ -114,9 +97,6 @@ def _correct_decode_sparse_blocks(layer_name: str, attn_metadata: Any,
         query = query.view(-1, num_heads, head_size)
     if query.ndim != 3 or query.shape[0] < 1:
         raise RuntimeError("sparse correction requires query tokens")
-    request_ids = get_active_layer_request_ids()
-    if len(request_ids) > 1 and query.shape[0] != len(request_ids):
-        raise RuntimeError("sparse correction query batch does not match request ids")
     correct_local_layer(layer_index, query)
 
 

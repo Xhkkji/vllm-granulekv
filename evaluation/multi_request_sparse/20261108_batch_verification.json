@@ -1,0 +1,447 @@
+{
+  "date": "2026-11-08",
+  "status": "implementation_present_strict_correctness_not_passed",
+  "checkpoints": {
+    "vllm": "7758098a7ad81feccc525d43564f1c359dec6283",
+    "GranuleKV": "59223407b40c60bf59f68150ce7e7846812fa8a6",
+    "branch": "origin/xhk/bam-GranuleKV-GPU_CPU",
+    "both_pushes_verified_before_edits": true
+  },
+  "tests": {
+    "vllm": "298 passed, 2 Swig warnings in 32.75s",
+    "GranuleKV": "10 passed in 1.36s",
+    "vllm_suites": [
+      "tests/core/test_async_kv_scheduler.py",
+      "tests/core/test_hierarchical_io.py",
+      "tests/core/test_sparse_kv_attention.py",
+      "tests/worker/test_host_kv_backing.py",
+      "tests/worker/test_sparse_gpu_residency.py",
+      "tests/core/test_tutti_figure13.py",
+      "tests/core/block/test_block_manager.py"
+    ],
+    "GranuleKV_suites": [
+      "vllm_evaluation/mds_poc/phase4/test_mixed_request.py",
+      "vllm_evaluation/mds_poc/phase4/test_protocol.py"
+    ],
+    "syntax_and_diff_checks": "passed"
+  },
+  "cases": [
+    {
+      "name": "gate_v2_same",
+      "summary": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_same/summary.json",
+      "summary_sha256": "a7bde5b1cd8f7133ebe2f73183160fbde8319797b8dcc8c5b33177443421d4ed",
+      "source_diff": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_same/source.diff",
+      "script_snapshot": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_same/benchmark.py",
+      "config": {
+        "model": "/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct",
+        "prefix_tokens": 1024,
+        "suffix_tokens": 0,
+        "output_tokens": 2,
+        "case": "same",
+        "output": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_same/summary.json",
+        "performance": false
+      },
+      "engine_config": {
+        "max_model_len": 1042,
+        "max_num_seqs": 2,
+        "max_num_batched_tokens": 2048,
+        "num_gpu_blocks_override": 2135,
+        "swap_space_gib": 32,
+        "gpu_memory_utilization": 0.85,
+        "seed": 1234,
+        "dtype": "half",
+        "scheduler": "vllm.core.async_kv_scheduler.AsyncKVScheduler"
+      },
+      "max_forward_batch": 2,
+      "forward_trace": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_same/forwards.jsonl",
+      "token_ids": {
+        "batch-1": [
+          576,
+          9342
+        ],
+        "batch-0": [
+          576,
+          9342
+        ]
+      },
+      "tokens_match_references": true,
+      "different_request_selections_across_56_layer_steps": 0,
+      "immutable_kv": [
+        {
+          "immutable_blocks": 63,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 0
+        },
+        {
+          "immutable_blocks": 63,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 0
+        }
+      ],
+      "comparisons": [
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.021484375,
+          "logits_max_abs_error": 0.03125,
+          "passed": false,
+          "failures": [
+            "logits numerical mismatch at step/layer (0, 27)"
+          ],
+          "kv_max_abs_error": 0.03125,
+          "live_key_outside_tolerance": 0,
+          "live_value_outside_tolerance": 0,
+          "attention_output_outside_tolerance": 0,
+          "logits_outside_tolerance": 2
+        },
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.021484375,
+          "logits_max_abs_error": 0.03125,
+          "passed": false,
+          "failures": [
+            "logits numerical mismatch at step/layer (0, 27)"
+          ],
+          "kv_max_abs_error": 0.03125,
+          "live_key_outside_tolerance": 0,
+          "live_value_outside_tolerance": 0,
+          "attention_output_outside_tolerance": 0,
+          "logits_outside_tolerance": 2
+        }
+      ],
+      "status": "failed",
+      "performance_valid": false
+    },
+    {
+      "name": "gate_v2_different",
+      "summary": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_different/summary.json",
+      "summary_sha256": "7ce799d05fee162159048327a109a8d6b847195bb1e01ed868fbd6a6c94dfbf9",
+      "source_diff": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_different/source.diff",
+      "script_snapshot": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_different/benchmark.py",
+      "config": {
+        "model": "/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct",
+        "prefix_tokens": 1024,
+        "suffix_tokens": 0,
+        "output_tokens": 2,
+        "case": "different",
+        "output": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_different/summary.json",
+        "performance": false
+      },
+      "engine_config": {
+        "max_model_len": 1042,
+        "max_num_seqs": 2,
+        "max_num_batched_tokens": 2048,
+        "num_gpu_blocks_override": 2135,
+        "swap_space_gib": 32,
+        "gpu_memory_utilization": 0.85,
+        "seed": 1234,
+        "dtype": "half",
+        "scheduler": "vllm.core.async_kv_scheduler.AsyncKVScheduler"
+      },
+      "max_forward_batch": 2,
+      "forward_trace": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_different/forwards.jsonl",
+      "token_ids": {
+        "batch-1": [
+          13,
+          220
+        ],
+        "batch-0": [
+          576,
+          9342
+        ]
+      },
+      "tokens_match_references": true,
+      "different_request_selections_across_56_layer_steps": 34,
+      "immutable_kv": [
+        {
+          "immutable_blocks": 63,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 0
+        },
+        {
+          "immutable_blocks": 63,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 0
+        }
+      ],
+      "comparisons": [
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.021484375,
+          "logits_max_abs_error": 0.03125,
+          "passed": false,
+          "failures": [
+            "logits numerical mismatch at step/layer (0, 27)"
+          ],
+          "kv_max_abs_error": 0.03125,
+          "live_key_outside_tolerance": 0,
+          "live_value_outside_tolerance": 0,
+          "attention_output_outside_tolerance": 0,
+          "logits_outside_tolerance": 2
+        },
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.021484375,
+          "logits_max_abs_error": 0.03125,
+          "passed": false,
+          "failures": [
+            "attention_blocks mismatch at step/layer (0, 22)",
+            "attention_blocks mismatch at step/layer (1, 27)"
+          ],
+          "kv_max_abs_error": 0.125,
+          "live_key_outside_tolerance": 0,
+          "live_value_outside_tolerance": 0,
+          "attention_output_outside_tolerance": 0,
+          "logits_outside_tolerance": 0
+        }
+      ],
+      "status": "failed",
+      "performance_valid": false
+    },
+    {
+      "name": "gate_v2_suffix32",
+      "summary": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_suffix32/summary.json",
+      "summary_sha256": "9be7127bcae8aede75d8835559a178aab465002bfd5d89859602fba607a0d4eb",
+      "source_diff": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_suffix32/source.diff",
+      "script_snapshot": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_suffix32/benchmark.py",
+      "config": {
+        "model": "/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct",
+        "prefix_tokens": 1024,
+        "suffix_tokens": 32,
+        "output_tokens": 2,
+        "case": "same",
+        "output": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_suffix32/summary.json",
+        "performance": false
+      },
+      "engine_config": {
+        "max_model_len": 1074,
+        "max_num_seqs": 2,
+        "max_num_batched_tokens": 2048,
+        "num_gpu_blocks_override": 2135,
+        "swap_space_gib": 32,
+        "gpu_memory_utilization": 0.85,
+        "seed": 1234,
+        "dtype": "half",
+        "scheduler": "vllm.core.async_kv_scheduler.AsyncKVScheduler"
+      },
+      "max_forward_batch": 2,
+      "forward_trace": "/home/xhk/llm-inference/GranuleKV/vllm_evaluation/tutti_layerwise/result/20261108_multi_request/gate_v2_suffix32/forwards.jsonl",
+      "token_ids": {
+        "batch-1": [
+          419,
+          1467
+        ],
+        "batch-0": [
+          8116,
+          5612
+        ]
+      },
+      "tokens_match_references": true,
+      "different_request_selections_across_56_layer_steps": 31,
+      "immutable_kv": [
+        {
+          "immutable_blocks": 64,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 0
+        },
+        {
+          "immutable_blocks": 64,
+          "different_fingerprints_on_common_selection": 0,
+          "missing_reference_blocks_due_to_selection_difference": 1
+        }
+      ],
+      "comparisons": [
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.3056640625,
+          "logits_max_abs_error": 0.09375,
+          "passed": false,
+          "failures": [
+            "live_value numerical mismatch at step/layer (0, 11)",
+            "live_key numerical mismatch at step/layer (0, 12)",
+            "live_value numerical mismatch at step/layer (0, 12)",
+            "attention_output numerical mismatch at step/layer (0, 12)",
+            "live_key numerical mismatch at step/layer (0, 13)",
+            "live_value numerical mismatch at step/layer (0, 13)",
+            "attention_output numerical mismatch at step/layer (0, 13)",
+            "live_key numerical mismatch at step/layer (0, 14)",
+            "live_value numerical mismatch at step/layer (0, 14)",
+            "attention_output numerical mismatch at step/layer (0, 14)",
+            "live_key numerical mismatch at step/layer (0, 15)",
+            "live_value numerical mismatch at step/layer (0, 15)",
+            "attention_output numerical mismatch at step/layer (0, 15)",
+            "live_key numerical mismatch at step/layer (0, 16)",
+            "live_value numerical mismatch at step/layer (0, 16)",
+            "attention_output numerical mismatch at step/layer (0, 16)",
+            "live_key numerical mismatch at step/layer (0, 17)",
+            "live_value numerical mismatch at step/layer (0, 17)",
+            "attention_output numerical mismatch at step/layer (0, 17)",
+            "live_key numerical mismatch at step/layer (0, 18)",
+            "live_value numerical mismatch at step/layer (0, 18)",
+            "attention_output numerical mismatch at step/layer (0, 18)",
+            "live_key numerical mismatch at step/layer (0, 19)",
+            "live_value numerical mismatch at step/layer (0, 19)",
+            "attention_output numerical mismatch at step/layer (0, 19)",
+            "live_key numerical mismatch at step/layer (0, 20)",
+            "live_value numerical mismatch at step/layer (0, 20)",
+            "attention_output numerical mismatch at step/layer (0, 20)",
+            "live_key numerical mismatch at step/layer (0, 21)",
+            "live_value numerical mismatch at step/layer (0, 21)",
+            "attention_output numerical mismatch at step/layer (0, 21)",
+            "live_key numerical mismatch at step/layer (0, 22)",
+            "live_value numerical mismatch at step/layer (0, 22)",
+            "attention_output numerical mismatch at step/layer (0, 22)",
+            "live_key numerical mismatch at step/layer (0, 23)",
+            "live_value numerical mismatch at step/layer (0, 23)",
+            "attention_output numerical mismatch at step/layer (0, 23)",
+            "live_key numerical mismatch at step/layer (0, 24)",
+            "live_value numerical mismatch at step/layer (0, 24)",
+            "attention_output numerical mismatch at step/layer (0, 24)",
+            "live_key numerical mismatch at step/layer (0, 25)",
+            "live_value numerical mismatch at step/layer (0, 25)",
+            "attention_output numerical mismatch at step/layer (0, 25)",
+            "live_key numerical mismatch at step/layer (0, 26)",
+            "live_value numerical mismatch at step/layer (0, 26)",
+            "attention_output numerical mismatch at step/layer (0, 26)",
+            "live_key numerical mismatch at step/layer (0, 27)",
+            "live_value numerical mismatch at step/layer (0, 27)",
+            "attention_output numerical mismatch at step/layer (0, 27)",
+            "logits numerical mismatch at step/layer (0, 27)",
+            "live_value numerical mismatch at step/layer (1, 11)",
+            "live_key numerical mismatch at step/layer (1, 12)",
+            "live_value numerical mismatch at step/layer (1, 12)",
+            "live_key numerical mismatch at step/layer (1, 13)",
+            "live_value numerical mismatch at step/layer (1, 13)",
+            "live_key numerical mismatch at step/layer (1, 14)",
+            "live_value numerical mismatch at step/layer (1, 14)",
+            "live_key numerical mismatch at step/layer (1, 15)",
+            "live_value numerical mismatch at step/layer (1, 15)",
+            "live_key numerical mismatch at step/layer (1, 16)",
+            "live_value numerical mismatch at step/layer (1, 16)",
+            "attention_output numerical mismatch at step/layer (1, 16)",
+            "live_key numerical mismatch at step/layer (1, 17)",
+            "live_value numerical mismatch at step/layer (1, 17)",
+            "live_key numerical mismatch at step/layer (1, 18)",
+            "live_value numerical mismatch at step/layer (1, 18)",
+            "attention_output numerical mismatch at step/layer (1, 18)",
+            "live_key numerical mismatch at step/layer (1, 19)",
+            "live_value numerical mismatch at step/layer (1, 19)",
+            "attention_output numerical mismatch at step/layer (1, 19)",
+            "live_key numerical mismatch at step/layer (1, 20)",
+            "live_value numerical mismatch at step/layer (1, 20)",
+            "attention_output numerical mismatch at step/layer (1, 20)",
+            "live_key numerical mismatch at step/layer (1, 21)",
+            "live_value numerical mismatch at step/layer (1, 21)",
+            "live_key numerical mismatch at step/layer (1, 22)",
+            "live_value numerical mismatch at step/layer (1, 22)",
+            "live_key numerical mismatch at step/layer (1, 23)",
+            "live_value numerical mismatch at step/layer (1, 23)",
+            "live_key numerical mismatch at step/layer (1, 24)",
+            "live_value numerical mismatch at step/layer (1, 24)",
+            "attention_blocks mismatch at step/layer (1, 25)",
+            "live_key numerical mismatch at step/layer (1, 25)",
+            "live_value numerical mismatch at step/layer (1, 25)",
+            "live_key numerical mismatch at step/layer (1, 26)",
+            "live_value numerical mismatch at step/layer (1, 26)",
+            "attention_output numerical mismatch at step/layer (1, 26)",
+            "live_key numerical mismatch at step/layer (1, 27)",
+            "live_value numerical mismatch at step/layer (1, 27)",
+            "attention_output numerical mismatch at step/layer (1, 27)",
+            "logits numerical mismatch at step/layer (1, 27)"
+          ],
+          "kv_max_abs_error": 0.59228515625,
+          "live_key_outside_tolerance": 5324,
+          "live_value_outside_tolerance": 7642,
+          "attention_output_outside_tolerance": 5733,
+          "logits_outside_tolerance": 4446
+        },
+        {
+          "rtol": 0.02,
+          "atol": 0.02,
+          "kv_comparison": "immutable exact SHA256; recomputed/new KV FP16 tolerance",
+          "layers_compared": 56,
+          "logits_compared": 2,
+          "attention_max_abs_error": 0.1826171875,
+          "logits_max_abs_error": 0.0703125,
+          "passed": false,
+          "failures": [
+            "attention_output numerical mismatch at step/layer (0, 11)",
+            "attention_output numerical mismatch at step/layer (0, 17)",
+            "live_key numerical mismatch at step/layer (0, 19)",
+            "attention_output numerical mismatch at step/layer (0, 19)",
+            "attention_output numerical mismatch at step/layer (0, 20)",
+            "live_value numerical mismatch at step/layer (0, 22)",
+            "live_value numerical mismatch at step/layer (0, 23)",
+            "attention_output numerical mismatch at step/layer (0, 23)",
+            "live_key numerical mismatch at step/layer (0, 24)",
+            "live_value numerical mismatch at step/layer (0, 24)",
+            "live_key numerical mismatch at step/layer (0, 25)",
+            "live_value numerical mismatch at step/layer (0, 25)",
+            "live_key numerical mismatch at step/layer (0, 26)",
+            "live_value numerical mismatch at step/layer (0, 26)",
+            "attention_output numerical mismatch at step/layer (0, 26)",
+            "live_key numerical mismatch at step/layer (0, 27)",
+            "live_value numerical mismatch at step/layer (0, 27)",
+            "attention_output numerical mismatch at step/layer (0, 27)",
+            "logits numerical mismatch at step/layer (0, 27)",
+            "attention_blocks mismatch at step/layer (1, 17)",
+            "immutable KV mismatch at (1, 17), block 39",
+            "live_key numerical mismatch at step/layer (1, 19)",
+            "live_value numerical mismatch at step/layer (1, 22)",
+            "live_value numerical mismatch at step/layer (1, 23)",
+            "live_key numerical mismatch at step/layer (1, 24)",
+            "live_value numerical mismatch at step/layer (1, 24)",
+            "live_key numerical mismatch at step/layer (1, 25)",
+            "live_value numerical mismatch at step/layer (1, 25)",
+            "live_key numerical mismatch at step/layer (1, 26)",
+            "live_value numerical mismatch at step/layer (1, 26)",
+            "live_key numerical mismatch at step/layer (1, 27)",
+            "live_value numerical mismatch at step/layer (1, 27)",
+            "attention_output numerical mismatch at step/layer (1, 27)",
+            "logits numerical mismatch at step/layer (1, 27)"
+          ],
+          "kv_max_abs_error": 0.25,
+          "live_key_outside_tolerance": 28,
+          "live_value_outside_tolerance": 715,
+          "attention_output_outside_tolerance": 232,
+          "logits_outside_tolerance": 281
+        }
+      ],
+      "status": "failed",
+      "performance_valid": false
+    }
+  ],
+  "performance_valid": false,
+  "large_context_tests_run": false,
+  "performance_mode": "implemented in benchmark.py; not exercised because numerical gate fails",
+  "remaining_work": [
+    "Diagnose multi-token prefill numerical and selection divergence against per-request references.",
+    "Resolve strict 0.02 numerical gate without changing scoring, attention kernels or masking failures.",
+    "After correctness passes, verify cold/hot batch and run 32K/128K tests and three performance samples."
+  ],
+  "earlier_evidence_limit": "Pre-fix sparse restore fingerprints included zero history KV: WRITE changed host identity and allocated empty slots. The old sequential-reference agreement is not valid proof of restored prefix integrity.",
+  "implementation_boundaries": [
+    "Every request/window keeps original GPU prediction union and current-window CPU complement.",
+    "No protocol v5, SSD layout, descriptor, scoring or attention kernel changes.",
+    "Fixes remain uncommitted; only pre-edit checkpoints were pushed."
+  ]
+}

@@ -1032,6 +1032,45 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        selections = get_active_sparse_kv_selections()
+        if selections is not None:
+            from dataclasses import replace
+            from vllm.core.custom_schedulers.hierarchical_io.barrier import (
+                activate_sparse_kv_blocks, get_active_layer_query_lengths,
+                get_active_layer_sequence_lengths)
+            query_lengths = get_active_layer_query_lengths()
+            sequence_lengths = get_active_layer_sequence_lengths()
+            result = torch.empty_like(query)
+            offset = 0
+            for index, request_id in enumerate(get_active_layer_request_ids()):
+                length = query_lengths[request_id]
+                seq_len = sequence_lengths[request_id]
+                end = offset + length
+                prefill = index < attn_metadata.num_prefills
+                tensor = lambda values: torch.tensor(values, dtype=torch.int32, device=query.device)
+                row = replace(
+                    attn_metadata, num_prefills=int(prefill),
+                    num_prefill_tokens=length if prefill else 0,
+                    num_decode_tokens=0 if prefill else length,
+                    slot_mapping=attn_metadata.slot_mapping[offset:end],
+                    block_tables=attn_metadata.block_tables[index:index + 1],
+                    seq_lens=[seq_len], seq_lens_tensor=tensor([seq_len]),
+                    query_start_loc=tensor([0, length]),
+                    seq_start_loc=tensor([0, seq_len]),
+                    context_lens_tensor=tensor([seq_len - length]),
+                    max_query_len=length, max_decode_query_len=1,
+                    max_prefill_seq_len=seq_len if prefill else 0,
+                    max_decode_seq_len=0 if prefill else seq_len,
+                    use_cuda_graph=False, _cached_prefill_metadata=None,
+                    _cached_decode_metadata=None)
+                with activate_sparse_kv_blocks(selections[request_id], request_id=request_id):
+                    result[offset:end] = self.forward(
+                        layer, query[offset:end],
+                        None if key is None else key[offset:end],
+                        None if value is None else value[offset:end],
+                        kv_cache, row.single_token_sparse_prefill())
+                offset = end
+            return result
         from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_mapping
         physical_mapping = get_active_sparse_kv_mapping()
         if physical_mapping is not None:
@@ -1275,64 +1314,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
             block_size = value_cache.shape[3]
             sequence_length = int(max_seq_len_arg)
-            active_selections = get_active_sparse_kv_selections()
-            if (active_selections is not None
-                    and any(value is not None
-                            for value in active_selections.values())):
-                request_ids = get_active_layer_request_ids()
-                if (len(request_ids) != decode_query.shape[0]
-                        or block_tables_arg is None):
-                    raise RuntimeError(
-                        "sparse request ids do not match decode batch")
-                for index, request_id in enumerate(request_ids):
-                    selection = active_selections[request_id]
-                    row_length = int(seq_lens_arg[index].item())
-                    device_selection = (None if selection is None else
-                                        getattr(selection, "device_selection", None))
-                    if device_selection is not None:
-                        selected = validate_sparse_kv_device_selection(
-                            device_selection)
-                        tail_tokens = row_length - (
-                            (row_length + block_size - 1) // block_size - 1
-                        ) * block_size
-                        selected_seq_len = (
-                            selected.count * block_size -
-                            (block_size - tail_tokens))
-                        output[num_prefill_query_tokens + index:
-                               num_prefill_query_tokens + index + 1] = (
-                            PagedAttention.forward_decode_selected(
-                                decode_query[index:index + 1], key_cache,
-                                value_cache, block_tables_arg[index:index + 1],
-                                seq_lens_arg[index:index + 1],
-                                selected.logical_block_indices,
-                                selected.count, selected_seq_len,
-                                self.kv_cache_dtype, self.num_kv_heads,
-                                self.scale, self.alibi_slopes,
-                                layer._k_scale, layer._v_scale))
-                        record_sparse_kv_attention(
-                            (row_length + block_size - 1) // block_size,
-                            selected.count, selected_seq_len)
-                        continue
-                    blocks = (tuple(range((row_length + block_size - 1) //
-                                          block_size)) if selection is None else
-                              (selection.block_indices
-                               if hasattr(selection, "block_indices") else
-                               tuple(selection)))
-                    row_table, selected_seq_len = build_selected_decode_block_table(
-                        block_tables_arg[index:index + 1], blocks,
-                        row_length, block_size)
-                    output[num_prefill_query_tokens + index:
-                           num_prefill_query_tokens + index + 1] = (
-                        PagedAttention.forward_decode(
-                            decode_query[index:index + 1], key_cache, value_cache,
-                            row_table,
-                            torch.tensor([selected_seq_len],
-                                         dtype=seq_lens_arg.dtype,
-                                         device=seq_lens_arg.device),
-                            selected_seq_len, self.kv_cache_dtype,
-                            self.num_kv_heads, self.scale, self.alibi_slopes,
-                            layer._k_scale, layer._v_scale))
-                return output
             selected_attention = None
             selected_attention_seq_len = None
             active_sparse_blocks = get_active_sparse_kv_blocks()

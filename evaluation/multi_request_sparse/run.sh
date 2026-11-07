@@ -57,6 +57,11 @@ for ((i=0; i<300; i++)); do
 done
 [[ -f ${RUN_DIR}/control/control.slot ]] || { echo 'Daemon startup timed out'; exit 1; }
 cd "${VLLM_ROOT}"
-"${PYTHON}" evaluation/multi_request_sparse/benchmark.py \
+cp evaluation/multi_request_sparse/benchmark.py "${RUN_DIR}/benchmark.py"
+cp evaluation/multi_request_sparse/validation.py "${RUN_DIR}/validation.py"
+git diff --binary > "${RUN_DIR}/source.diff"
+git rev-parse HEAD > "${RUN_DIR}/vllm_commit.txt"
+git -C "${GKV_ROOT}" rev-parse HEAD > "${RUN_DIR}/granulekv_commit.txt"
+"${PYTHON}" "${RUN_DIR}/benchmark.py" \
     --prefix-tokens "${PREFIX}" --suffix-tokens "${SUFFIX}" --case "${CASE}" \
-    --output "${RUN_DIR}/summary.json" 2>&1 | tee "${RUN_DIR}/console.log"
+    --output "${RUN_DIR}/summary.json" "${@:5}" 2>&1 | tee "${RUN_DIR}/console.log"

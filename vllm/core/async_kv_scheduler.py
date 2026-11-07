@@ -385,8 +385,21 @@ class AsyncKVScheduler(Scheduler):
                 # 当前最高优先级请求应先走原生 HBM-hit/recompute admission，
                 # 不能让后面的 SSD restore 提前占用它需要的 sequence/HBM slot。
                 break
+            page_index_key = _prefix_page_index_key(
+                seq_group, self.cache_config.block_size, storage_prefix_blocks)
+            access_plan = self._peek_sparse_restore_plan(page_index_key, storage_prefix_blocks)
+            gpu_blocks = 0
+            bounded = getattr(self.block_manager, "bounded_gpu_slots", False)
+            if bounded:
+                window = self.hierarchical_io_config.window_layers
+                predictions = (storage_prefix_blocks if access_plan is None else max(
+                    len({block for selection in access_plan.block_indices_by_layer[start:start + window]
+                         for block in (range(storage_prefix_blocks) if selection is None else selection)})
+                    for start in range(0, access_plan.num_layers, window)))
+                gpu_blocks = predictions + self.block_manager.bounded_working_set_blocks
             alloc_status = self.block_manager.can_reserve_granulekv_prefix_restore(
-                storage_prefix_blocks, gpu_prefix_blocks)
+                storage_prefix_blocks, gpu_prefix_blocks,
+                **({"seq_group": seq_group, "gpu_blocks": gpu_blocks} if bounded else {}))
             if alloc_status == AllocStatus.LATER:
                 self._prefix_restore_admission_blocked = True
                 break
@@ -398,6 +411,7 @@ class AsyncKVScheduler(Scheduler):
                     seq_group,
                     num_prefix_blocks=storage_prefix_blocks,
                     num_gpu_cached_blocks=gpu_prefix_blocks,
+                    **({"gpu_blocks": gpu_blocks} if bounded else {}),
                 )
             except BlockAllocator.NoFreeBlocksError:
                 # allocator 的可用块数量包含可驱逐 cache；逐块预留仍可能在
@@ -422,8 +436,6 @@ class AsyncKVScheduler(Scheduler):
                     page_index_key, reservation.num_prefix_blocks)
                 self._enqueue_hierarchical_prefix_restore(
                     seq_group, reservation, access_plan=access_plan)
-                if access_plan is not None and page_index_key is not None:
-                    self._sparse_restore_plans.pop(page_index_key, None)
             else:
                 request = self._enqueue_async_kv_transfer(
                     seq_group,

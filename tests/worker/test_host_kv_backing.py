@@ -677,11 +677,16 @@ def test_bounded_finish_then_slot_reuse_preserves_old_dma_fence(worker, monkeypa
     worker._pending_gpu_to_host[key] = fence
     worker._forget_host_staging(0, ("old",))
     worker._forget_host_staging(0, ("old",))
-    assert not worker._gpu_slot_mappings
+    assert worker._gpu_slot_mappings[key] == 0
+    with pytest.raises(RuntimeError, match="safely reusable"):
+        worker._reserve_gpu_slots(0, "new", 0, (9,))
+    fence.ready = True
+    worker._poll_gpu_to_host_backing(0)
+    worker._forget_host_staging(0, ("old",))
     worker._reserve_gpu_slots(0, "new", 0, (9,))
     assert worker._gpu_slot_mappings[0, "new", 0, 9] == 0
     assert worker._take_gpu_region_release_event(0, 0, 0) is fence
-    assert key in worker._pending_gpu_to_host
+    assert key not in worker._pending_gpu_to_host
 
 
 def test_abort_before_first_forward_has_no_cached_metadata(worker):
@@ -875,6 +880,7 @@ def test_sparse_prefill_restores_only_partial_tail_before_query(
 def test_backing_restore_reuses_owner_and_does_not_repeat_pending_copy(worker):
     copied = []
     worker.wait_for_host_blocks = lambda *args: True
+    worker.host_blocks_staged = lambda ve, rid, layer, blocks: tuple(blocks)
     worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
         lambda layer, mapping, fences: copied.append(mapping.tolist()) or Fence())
     table = (3, 4, 5)
@@ -902,7 +908,8 @@ def test_correction_restores_only_selected_history_not_whole_suffix(worker, monk
                             resident_prefix_blocks=(0, 1),
                             predicted_prefix_blocks=(0, 1),
                             correction_mapping_by_logical=((-1, 8), (-1, 9)))
-    worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args: state)
+    worker._prefetch_runtime = SimpleNamespace(
+        prediction_state=lambda *args: state, layer_gpu_ready=lambda *args: True)
     table = tuple(range(8, 15))
     worker._backing_forward[0, "r"] = (table, 81, 100, True)
     selected = SparseKVActualSelection(
@@ -926,6 +933,7 @@ def test_independent_layers_keep_same_destination_without_reloading(worker):
     worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
     copied = []
     worker.wait_for_host_blocks = lambda *args: True
+    worker.host_blocks_staged = lambda ve, rid, layer, blocks: tuple(blocks)
     worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
         lambda layer, mapping, fences: copied.append((layer, mapping.tolist())) or Fence())
     for layer in (0, 8, 16, 24):
@@ -965,7 +973,8 @@ def test_prefetch_only_ready_missing_complete_prefix_and_pending_dedup(worker):
     worker.cache_engine[0].granulekv_connector.layout.num_gpu_regions = 28
     worker._backing_forward[0, "r"] = (tuple(range(10, 16)), 65, 66, False)
     state = SimpleNamespace(seq_group_id="r", predicted_prefix_blocks=(0, 1, 2, 3, 4))
-    worker._prefetch_runtime = SimpleNamespace(prediction_state=lambda *args: state)
+    worker._prefetch_runtime = SimpleNamespace(
+        prediction_state=lambda *args: state, layer_gpu_ready=lambda *args: True)
     worker._poll_host_transfers = lambda *args: None
     worker._host_ready_blocks.update((0, "r", 1, block) for block in (0, 1, 2, 4))
     worker._mark_gpu_blocks_ready(0, "r", 1, (0,), ((0, 10),))
@@ -1215,3 +1224,130 @@ def test_rewind_remains_explicitly_rejected(worker):
         worker._prepare_host_backing_forward(SimpleNamespace(
             virtual_engine=0, finished_requests_ids=[],
             seq_group_metadata_list=[metadata]))
+
+
+@pytest.mark.parametrize("other_window", [False, True])
+def test_shared_read_window_identity_and_targeted_wait(worker, other_window):
+    from dataclasses import replace
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    submitted = []
+    ready = set()
+    engine = worker.cache_engine[0]
+    engine.submit_async_kv_transfer = lambda rid, *args, **kwargs: (
+        submitted.append(rid) or AsyncKVTransferEvent(rid, AsyncKVTransferState.PENDING))
+    engine.poll_async_kv_transfer = lambda rid: AsyncKVTransferEvent(
+        rid, AsyncKVTransferState.READY if rid in ready else AsyncKVTransferState.PENDING)
+    source = AsyncKVTransferRequest(
+        request_id="producer", seq_group_id="a", reservation_id="reservation",
+        operation=AsyncKVTransferOperation.READ, block_mapping=((50, 0),),
+        logical_blocks=(LogicalBlockKey(0, 0),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 4), destination="host", sparse_page_index_key="shared",
+        consumer_local_block_start=4)
+    waiter = replace(source, request_id="waiter", seq_group_id="b",
+                     layer_range=(4, 8) if other_window else (0, 4))
+    for request in (source, waiter):
+        worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    assert submitted == (["producer", "waiter"] if other_window else ["producer"])
+    ready.add("producer")
+    if other_window:
+        worker._poll_host_transfers(0)
+        assert not worker.host_blocks_ready(0, "b", 4, (0,))
+        ready.add("waiter")
+    assert worker.wait_for_host_blocks(0, "b", 4 if other_window else 0, (0,), 0.1)
+
+
+def test_shared_host_completion_does_not_complete_native_gpu(worker):
+    from dataclasses import replace
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    ready = {"producer"}
+    polled = []
+    engine = worker.cache_engine[0]
+    engine.submit_async_kv_transfer = lambda rid, *args, **kwargs: AsyncKVTransferEvent(
+        rid, AsyncKVTransferState.PENDING)
+    def poll(rid):
+        polled.append(rid)
+        return AsyncKVTransferEvent(rid, AsyncKVTransferState.READY if rid in ready else AsyncKVTransferState.PENDING)
+    engine.poll_async_kv_transfer = poll
+    source = AsyncKVTransferRequest(
+        request_id="producer", seq_group_id="a", reservation_id="reservation",
+        operation=AsyncKVTransferOperation.READ, block_mapping=((50, 0),),
+        logical_blocks=(LogicalBlockKey(0, 0),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 4), destination="host", sparse_page_index_key="shared",
+        consumer_local_block_start=4)
+    mixed = replace(source, request_id="mixed", seq_group_id="b", destination="mixed",
+                    block_mapping=((51, 1),), logical_blocks=(LogicalBlockKey(1, 1),),
+                    host_block_mapping=((50, 0),))
+    for request in (source, mixed):
+        worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    worker._forget_host_staging(0, ("a",))
+    assert (0, "producer") in worker._host_async_kv_transfers
+    events = worker._poll_host_transfers(0, {"mixed"})
+    assert next(e for e in events if e.request_id == "mixed").state == AsyncKVTransferState.PENDING
+    assert "mixed" in polled
+    ready.add("mixed")
+    event = worker._poll_gpu_transfer(0, engine, "mixed")
+    assert event.state == AsyncKVTransferState.READY
+    assert worker.host_blocks_ready(0, "b", 0, (0,))
+    assert not worker._host_async_kv_transfers
+
+
+def test_prefix_store_keeps_populated_host_identity(worker):
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    worker._host_request_prefix_keys.clear()
+    worker._host_request_prefix_limits.clear()
+    old_key = worker._host_cache_key(0, "r", 0)
+    slot = worker._host_kv_directory.acquire(old_key, (0, "r"))
+    worker._host_kv_directory.begin_load(old_key, (0,))
+    worker._host_kv_directory.finish_load(old_key, (0,), success=True)
+    worker._host_ready_blocks.add((0, "r", 0, 0))
+    engine = worker.cache_engine[0]
+    copied = []
+    engine.submit_async_kv_transfer = lambda rid, op, mapping, **kwargs: (
+        copied.append(mapping.tolist()) or AsyncKVTransferEvent(rid, AsyncKVTransferState.PENDING))
+    request = AsyncKVTransferRequest(
+        request_id="write", seq_group_id="r", reservation_id="reservation",
+        operation=AsyncKVTransferOperation.WRITE, priority=AsyncKVTransferPriority.DEFERRED_WRITE,
+        logical_blocks=(LogicalBlockKey(0, 0),), block_mapping=((0, 90),),
+        layer_range=(0, 1), destination="host", sparse_page_index_key="published-prefix",
+        consumer_num_blocks=1)
+    worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    assert copied == [[[slot, 90]]]
+    assert worker._host_cache_key(0, "r", 0) == old_key
+    assert worker._host_kv_directory.lookup(("published-prefix", 0)) is None
+
+
+def test_batch_correction_slices_different_query_lengths(worker):
+    from vllm.core.custom_schedulers.hierarchical_io.barrier import activate_layer_barrier
+    seen = []
+    worker._correct_hierarchical_layer_one = lambda ve, ids, layer, query: (
+        seen.append((ids, query.clone())) or (layer,))
+    query = torch.arange(12).reshape(6, 1, 2)
+    with activate_layer_barrier(lambda *args: None, virtual_engine=0,
+                                request_ids=("a", "b"),
+                                query_lengths_by_request={"a": 5, "b": 1}):
+        result = worker._correct_hierarchical_layer(0, ("a", "b"), 2, query)
+    assert list(result.by_request) == ["a", "b"]
+    assert torch.equal(seen[0][1], query[:5])
+    assert torch.equal(seen[1][1], query[5:])
+
+
+def test_mixed_window_reserves_common_slots_across_layer_occupancy(worker, monkeypatch):
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    engine = worker.cache_engine[0]
+    engine.num_gpu_blocks = 8
+    worker._gpu_slot_mappings.update({(0, "previous", 0, 7): 0,
+                                     (0, "previous", 1, 8): 1})
+    submitted = []
+    engine.submit_async_kv_transfer = lambda rid, op, mapping, **kwargs: (
+        submitted.append(mapping.tolist()) or AsyncKVTransferEvent(rid, AsyncKVTransferState.PENDING))
+    request = AsyncKVTransferRequest(
+        request_id="mixed", seq_group_id="next", reservation_id="reservation",
+        operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+        logical_blocks=(LogicalBlockKey(1, 4),), block_mapping=((50, -1),),
+        layer_range=(0, 2), destination="mixed")
+    worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    assert submitted == [[[50, 2]]]
+    assert worker._gpu_slot_mappings[0, "next", 0, 4] == 2
+    assert worker._gpu_slot_mappings[0, "next", 1, 4] == 2
