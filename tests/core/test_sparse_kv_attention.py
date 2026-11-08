@@ -45,6 +45,47 @@ def test_host_window_selection_precedes_single_query_metadata(monkeypatch, with_
     assert seen == [converted]
 
 
+def test_xformers_sparse_request_metadata_is_prepared_once_per_forward(monkeypatch):
+    from types import SimpleNamespace
+    from vllm.attention.backends import utils as backend_utils
+    from vllm.attention.backends.xformers import XFormersMetadataBuilder
+    from vllm.core.custom_schedulers.hierarchical_io import plan
+
+    def base_metadata(seq_lens, query_lens):
+        return SimpleNamespace(
+            num_prefills=1,
+            slot_mapping=torch.arange(sum(seq_lens)),
+            block_tables=torch.arange(len(seq_lens) * 4).view(len(seq_lens), 4),
+            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int32),
+            context_lens_tensor=torch.tensor(
+                [seq_len - query_len for seq_len, query_len in
+                 zip(seq_lens, query_lens)], dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(plan, "uses_bounded_gpu_slots", lambda: True)
+    monkeypatch.setattr(backend_utils.CommonMetadataBuilder, "build",
+                        lambda self, seq_lens, query_lens, *_:
+                        base_metadata(seq_lens, query_lens))
+    builder = object.__new__(XFormersMetadataBuilder)
+    first = builder.build([12, 8], [4, 1], -1, 2)
+    rows = first._sparse_request_metadata
+    assert [(row.token_start, row.token_end, row.seq_len, row.is_prefill)
+            for row in rows] == [(0, 4, 12, True), (4, 5, 8, False)]
+    assert rows[0].context_lens_tensor.tolist() == [8]
+    assert rows[1].context_lens_tensor.tolist() == [7]
+    assert rows[0].query_start_loc.tolist() == [0, 4]
+    assert rows[1].query_start_loc.tolist() == [0, 1]
+    assert rows[0].seq_start_loc.tolist() == [0, 12]
+    assert rows[1].seq_start_loc.tolist() == [0, 8]
+    assert rows[0].query_start_loc.data_ptr() != rows[1].query_start_loc.data_ptr()
+
+    second = builder.build([9, 15], [2, 3], -1, 2)
+    assert second._sparse_request_metadata[0].token_end == 2
+    assert second._sparse_request_metadata[1].token_start == 2
+    assert second._sparse_request_metadata[0].query_start_loc.data_ptr() != (
+        rows[0].query_start_loc.data_ptr())
+
+
 def test_dynamic_restore_accepts_independent_decode_requests(monkeypatch):
     from types import SimpleNamespace
     import vllm.attention.layer as module

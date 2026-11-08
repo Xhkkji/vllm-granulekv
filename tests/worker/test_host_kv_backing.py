@@ -56,6 +56,15 @@ class IdentityHostDirectory:
         pass
 
 
+def _set_gpu_slot(worker, key, destination):
+    worker._gpu_slot_mappings.setdefault(key[:3], {})[key[3]] = destination
+    worker._gpu_reserved_slots.setdefault((key[0], key[2]), set()).add(destination)
+
+
+def _get_gpu_slot(worker, key):
+    return worker._gpu_slot_mappings.get(key[:3], {}).get(key[3])
+
+
 @pytest.fixture
 def worker(monkeypatch):
     monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_HOST_BACKING_ENABLE", True)
@@ -72,6 +81,7 @@ def worker(monkeypatch):
                  "_host_async_kv_transfers", "_gpu_transfer_regions",
                  "_gpu_pending_transfers", "_pending_h2d_transfers"):
         setattr(result, name, {})
+    result._gpu_reserved_slots = {}
     result._pending_host_writes = {}
     result._prefetch_runtime = module.RollingPrefetchRuntime(
         module.RollingPrefetchConfig())
@@ -107,18 +117,21 @@ def test_bounded_slots_preserve_hits_and_reuse_safe_oldest(worker, monkeypatch):
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
     worker.cache_engine[0].num_gpu_blocks = 2
     assert worker._reserve_gpu_slots(0, "r", 0, (10, 11)) == (10, 11)
+    assert worker._gpu_reserved_slots[0, 0] == {0, 1}
     assert worker._layer_block_table(0, "r", 0, 12)[10:] == (0, 1)
     worker._gpu_required_blocks[0, "r", 0] = {11}
     old = (0, "r", 0, 10)
     worker._host_ready_blocks.add(old)
     worker._gpu_region_release_events[0, 0, 0] = ("r", Fence())
     worker._reserve_gpu_slots(0, "r", 0, (11, 12))
-    assert old not in worker._gpu_slot_mappings
-    assert worker._gpu_slot_mappings[0, "r", 0, 11] == 1
-    assert worker._gpu_slot_mappings[0, "r", 0, 12] == 0
+    assert _get_gpu_slot(worker, old) is None
+    assert _get_gpu_slot(worker, (0, "r", 0, 11)) == 1
+    assert _get_gpu_slot(worker, (0, "r", 0, 12)) == 0
+    assert worker._gpu_reserved_slots[0, 0] == {0, 1}
     assert worker._host_stats["gpu_slot_evictions"] == 1
     assert worker._reserve_gpu_slots(0, "r", 1, (10, 11)) == (10, 11)
-    assert worker._gpu_slot_mappings[0, "r", 1, 10] == 0
+    assert _get_gpu_slot(worker, (0, "r", 1, 10)) == 0
+    assert worker._gpu_reserved_slots[0, 1] == {0, 1}
 
 
 def test_bounded_slots_reject_dirty_overwrite_and_overbudget(worker, monkeypatch):
@@ -128,7 +141,7 @@ def test_bounded_slots_reject_dirty_overwrite_and_overbudget(worker, monkeypatch
     worker._gpu_required_blocks[0, "r", 0] = set()
     with pytest.raises(RuntimeError, match="safely reusable"):
         worker._reserve_gpu_slots(0, "r", 0, (8,))
-    assert worker._gpu_slot_mappings == {(0, "r", 0, 7): 0}
+    assert worker._gpu_slot_mappings == {(0, "r", 0): {7: 0}}
     assert worker._reserve_gpu_slots(0, "r", 0, (9,), prediction=True) == ()
     with pytest.raises(ValueError, match="exceeds GPU slot budget"):
         worker._reserve_gpu_slots(0, "r", 0, (7, 8))
@@ -141,6 +154,7 @@ def test_bounded_all_blocks_rejects_before_reserving_any_slot(worker, monkeypatc
         worker._reserve_gpu_slots(0, "r", 0, tuple(range(2048)))
     assert not worker._gpu_slot_mappings
     assert not worker._gpu_required_blocks
+    assert not worker._gpu_reserved_slots.get((0, 0))
     assert worker._host_stats["gpu_slot_capacity_rejections"] == 1
 
 
@@ -156,10 +170,11 @@ def test_bounded_slots_preserve_pending_until_ready(worker, monkeypatch):
     worker._gpu_region_release_events[0, 0, 0] = ("r", event)
     with pytest.raises(RuntimeError, match="safely reusable"):
         worker._reserve_gpu_slots(0, "r", 0, (8,))
-    assert worker._gpu_slot_mappings[key] == 0
+    assert _get_gpu_slot(worker, key) == 0
     event.ready = True
     worker._reserve_gpu_slots(0, "r", 0, (8,))
-    assert worker._gpu_slot_mappings == {(0, "r", 0, 8): 0}
+    assert worker._gpu_slot_mappings == {(0, "r", 0): {8: 0}}
+    assert worker._gpu_reserved_slots[0, 0] == {0}
     assert key not in worker._pending_h2d_transfers
 
 
@@ -173,9 +188,17 @@ def test_bounded_prediction_reserves_actual_working_set_headroom(worker, monkeyp
     assert worker._reserve_gpu_slots(0, "r", 0, (7, 8, 9)) == (7, 8, 9)
 
 
+def test_gpu_slot_rebinding_updates_occupied_index(worker):
+    prefix = (0, "r", 0)
+    worker._bind_gpu_slot(prefix, 7, 0)
+    worker._bind_gpu_slot(prefix, 7, 2)
+    assert worker._gpu_slot_mappings[prefix] == {7: 2}
+    assert worker._gpu_reserved_slots[0, 0] == {2}
+
+
 def test_bounded_late_ssd_completion_does_not_publish_reassigned_slot(worker, monkeypatch):
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
-    worker._gpu_slot_mappings[0, "r", 0, 8] = 0
+    _set_gpu_slot(worker, (0, "r", 0, 8), 0)
     worker._gpu_pending_transfers[0, "old-read"] = ("r", (0, 1), ((5, 0),), (7,))
     worker._observe_gpu_transfer(0, AsyncKVTransferEvent(
         "old-read", AsyncKVTransferState.READY))
@@ -185,7 +208,7 @@ def test_bounded_late_ssd_completion_does_not_publish_reassigned_slot(worker, mo
 
 def test_bounded_h2d_rejects_unreserved_target(worker, monkeypatch):
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
-    worker._gpu_slot_mappings[0, "r", 0, 7] = 1
+    _set_gpu_slot(worker, (0, "r", 0, 7), 1)
     with pytest.raises(RuntimeError, match="unreserved GPU slot"):
         worker.copy_host_blocks_to_gpu_async(0, "r", 0, ((7, 0),))
     assert not worker._pending_h2d_transfers
@@ -193,7 +216,7 @@ def test_bounded_h2d_rejects_unreserved_target(worker, monkeypatch):
 
 def test_bounded_owner_publication_rejects_reassigned_slot(worker, monkeypatch):
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
-    worker._gpu_slot_mappings[0, "r", 0, 8] = 0
+    _set_gpu_slot(worker, (0, "r", 0, 8), 0)
     with pytest.raises(RuntimeError, match="unreserved slot"):
         worker._mark_gpu_blocks_ready(0, "r", 0, (7,), ((7, 0),))
     assert not worker._gpu_resident_blocks
@@ -208,7 +231,7 @@ def test_empty_transfer_rpc_cleans_finished_bounded_request(worker, monkeypatch)
     worker._discarded_host_transfers = set()
     worker._host_staging_owner = None
     worker._seq_group_metadata_cache = {"r": object()}
-    worker._gpu_slot_mappings[0, "r", 0, 7] = 0
+    _set_gpu_slot(worker, (0, "r", 0, 7), 0)
     worker._gpu_required_blocks[0, "r", 0] = {7}
     assert worker.submit_async_kv_transfers(0, (), ("r",)) == []
     assert not worker._gpu_slot_mappings
@@ -645,7 +668,7 @@ def test_finish_invalidates_owners_but_keeps_pending_backup_fence(
     fence = Fence()
     worker._discarded_host_transfers = set()
     worker._host_staging_owner = (0, "r")
-    worker._gpu_resident_blocks[key] = 3
+    worker._gpu_resident_blocks.setdefault(key[:3], {})[key[3]] = 3
     worker._gpu_destination_owners[0, 0, 3] = key
     worker._gpu_region_release_events[0, 0, 3] = ("r", fence)
     worker._host_prefetch_windows[0, "r"] = (4, 8)
@@ -672,19 +695,20 @@ def test_bounded_finish_then_slot_reuse_preserves_old_dma_fence(worker, monkeypa
     worker._host_staging_owner = (0, "old")
     fence = Fence()
     key = (0, "old", 0, 7)
-    worker._gpu_slot_mappings[key] = 0
+    _set_gpu_slot(worker, key, 0)
     worker._gpu_region_release_events[0, 0, 0] = ("old", fence)
     worker._pending_gpu_to_host[key] = fence
     worker._forget_host_staging(0, ("old",))
     worker._forget_host_staging(0, ("old",))
-    assert worker._gpu_slot_mappings[key] == 0
+    assert _get_gpu_slot(worker, key) == 0
     with pytest.raises(RuntimeError, match="safely reusable"):
         worker._reserve_gpu_slots(0, "new", 0, (9,))
     fence.ready = True
     worker._poll_gpu_to_host_backing(0)
     worker._forget_host_staging(0, ("old",))
     worker._reserve_gpu_slots(0, "new", 0, (9,))
-    assert worker._gpu_slot_mappings[0, "new", 0, 9] == 0
+    assert worker._gpu_reserved_slots[0, 0] == {0}
+    assert _get_gpu_slot(worker, (0, "new", 0, 9)) == 0
     assert worker._take_gpu_region_release_event(0, 0, 0) is fence
     assert key not in worker._pending_gpu_to_host
 
@@ -837,7 +861,7 @@ def test_back_up_only_gpu_only_and_dirty_tail(worker):
     worker._backing_forward[0, "r"] = ((3, 4, 5), 33, 34, False)
     for block, destination in enumerate((3, 4, 5)):
         key = (0, "r", 0, block)
-        worker._gpu_resident_blocks[key] = destination
+        worker._gpu_resident_blocks.setdefault(key[:3], {})[key[3]] = destination
         worker._gpu_destination_owners[0, 0, destination] = key
     worker._host_ready_blocks.update(((0, "r", 0, 1), (0, "r", 0, 2)))
     copies = []
@@ -1337,8 +1361,8 @@ def test_mixed_window_reserves_common_slots_across_layer_occupancy(worker, monke
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
     engine = worker.cache_engine[0]
     engine.num_gpu_blocks = 8
-    worker._gpu_slot_mappings.update({(0, "previous", 0, 7): 0,
-                                     (0, "previous", 1, 8): 1})
+    _set_gpu_slot(worker, (0, "previous", 0, 7), 0)
+    _set_gpu_slot(worker, (0, "previous", 1, 8), 1)
     submitted = []
     engine.submit_async_kv_transfer = lambda rid, op, mapping, **kwargs: (
         submitted.append(mapping.tolist()) or AsyncKVTransferEvent(rid, AsyncKVTransferState.PENDING))
@@ -1349,5 +1373,7 @@ def test_mixed_window_reserves_common_slots_across_layer_occupancy(worker, monke
         layer_range=(0, 2), destination="mixed")
     worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
     assert submitted == [[[50, 2]]]
-    assert worker._gpu_slot_mappings[0, "next", 0, 4] == 2
-    assert worker._gpu_slot_mappings[0, "next", 1, 4] == 2
+    assert _get_gpu_slot(worker, (0, "next", 0, 4)) == 2
+    assert _get_gpu_slot(worker, (0, "next", 1, 4)) == 2
+    assert worker._gpu_reserved_slots[0, 0] == {0, 2}
+    assert worker._gpu_reserved_slots[0, 1] == {1, 2}

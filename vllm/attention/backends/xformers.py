@@ -643,6 +643,8 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
     # is [4, 6], it is [0, 4, 10].
     query_start_loc: Optional[torch.Tensor] = None
 
+    _sparse_request_metadata: Optional[Tuple["_SparseRequestMetadata", ...]] = None
+
     # Self-attention prefill/decode metadata cache
     _cached_prefill_metadata: Optional["XFormersMetadata"] = None
     _cached_decode_metadata: Optional["XFormersMetadata"] = None
@@ -899,6 +901,43 @@ class XFormersMetadataBuilder(CommonMetadataBuilder[XFormersMetadata]):
 
     _metadata_cls = XFormersMetadata
 
+    def build(self, seq_lens: List[int], query_lens: List[int],
+              cuda_graph_pad_size: int, batch_size: int) -> XFormersMetadata:
+        metadata = super().build(seq_lens, query_lens, cuda_graph_pad_size,
+                                 batch_size)
+        from vllm.core.custom_schedulers.hierarchical_io.plan import (
+            uses_bounded_gpu_slots)
+        if not uses_bounded_gpu_slots():
+            return metadata
+        rows = []
+        offset = 0
+        for index, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
+            end = offset + query_len
+            rows.append(_SparseRequestMetadata(
+                offset, end, query_len, seq_len, index < metadata.num_prefills,
+                metadata.seq_lens_tensor[index:index + 1],
+                torch.tensor([0, query_len], dtype=torch.int32,
+                             device=metadata.slot_mapping.device),
+                torch.tensor([0, seq_len], dtype=torch.int32,
+                             device=metadata.slot_mapping.device),
+                metadata.context_lens_tensor[index:index + 1]))
+            offset = end
+        metadata._sparse_request_metadata = tuple(rows)
+        return metadata
+
+
+@dataclass(frozen=True)
+class _SparseRequestMetadata:
+    token_start: int
+    token_end: int
+    query_len: int
+    seq_len: int
+    is_prefill: bool
+    seq_lens_tensor: torch.Tensor
+    query_start_loc: torch.Tensor
+    seq_start_loc: torch.Tensor
+    context_lens_tensor: torch.Tensor
+
 
 class XFormersImpl(AttentionImpl[XFormersMetadata]):
     """
@@ -1036,40 +1075,38 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         if selections is not None:
             from dataclasses import replace
             from vllm.core.custom_schedulers.hierarchical_io.barrier import (
-                activate_sparse_kv_blocks, get_active_layer_query_lengths,
-                get_active_layer_sequence_lengths)
-            query_lengths = get_active_layer_query_lengths()
-            sequence_lengths = get_active_layer_sequence_lengths()
+                activate_sparse_kv_blocks)
+            request_metadata = attn_metadata._sparse_request_metadata
+            if request_metadata is None:
+                raise RuntimeError("bounded sparse attention metadata was not prepared")
             result = torch.empty_like(query)
-            offset = 0
             for index, request_id in enumerate(get_active_layer_request_ids()):
-                length = query_lengths[request_id]
-                seq_len = sequence_lengths[request_id]
-                end = offset + length
-                prefill = index < attn_metadata.num_prefills
-                tensor = lambda values: torch.tensor(values, dtype=torch.int32, device=query.device)
+                row_metadata = request_metadata[index]
+                start, end = row_metadata.token_start, row_metadata.token_end
+                length, seq_len = row_metadata.query_len, row_metadata.seq_len
+                prefill = row_metadata.is_prefill
                 row = replace(
                     attn_metadata, num_prefills=int(prefill),
                     num_prefill_tokens=length if prefill else 0,
                     num_decode_tokens=0 if prefill else length,
-                    slot_mapping=attn_metadata.slot_mapping[offset:end],
+                    slot_mapping=attn_metadata.slot_mapping[start:end],
                     block_tables=attn_metadata.block_tables[index:index + 1],
-                    seq_lens=[seq_len], seq_lens_tensor=tensor([seq_len]),
-                    query_start_loc=tensor([0, length]),
-                    seq_start_loc=tensor([0, seq_len]),
-                    context_lens_tensor=tensor([seq_len - length]),
+                    seq_lens=[seq_len],
+                    seq_lens_tensor=row_metadata.seq_lens_tensor,
+                    query_start_loc=row_metadata.query_start_loc,
+                    seq_start_loc=row_metadata.seq_start_loc,
+                    context_lens_tensor=row_metadata.context_lens_tensor,
                     max_query_len=length, max_decode_query_len=1,
                     max_prefill_seq_len=seq_len if prefill else 0,
                     max_decode_seq_len=0 if prefill else seq_len,
                     use_cuda_graph=False, _cached_prefill_metadata=None,
                     _cached_decode_metadata=None)
                 with activate_sparse_kv_blocks(selections[request_id], request_id=request_id):
-                    result[offset:end] = self.forward(
-                        layer, query[offset:end],
-                        None if key is None else key[offset:end],
-                        None if value is None else value[offset:end],
+                    result[start:end] = self.forward(
+                        layer, query[start:end],
+                        None if key is None else key[start:end],
+                        None if value is None else value[start:end],
                         kv_cache, row.single_token_sparse_prefill())
-                offset = end
             return result
         from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_mapping
         physical_mapping = get_active_sparse_kv_mapping()

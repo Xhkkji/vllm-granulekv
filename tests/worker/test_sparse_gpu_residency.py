@@ -25,6 +25,8 @@ class _FakeMapping:
 def _worker():
     worker = object.__new__(Worker)
     worker._gpu_resident_blocks = {}
+    worker._gpu_slot_mappings = {}
+    worker._gpu_reserved_slots = {}
     worker._gpu_destination_owners = {}
     worker._gpu_pending_transfers = {}
     worker._gpu_region_release_events = {}
@@ -40,7 +42,8 @@ def _worker():
     worker._host_completed_transfer_events = {}
     worker._ssd_read_blocks = set()
     worker._host_stats = defaultdict(int)
-    worker.cache_engine = [SimpleNamespace(granulekv_connector=SimpleNamespace(
+    worker.cache_engine = [SimpleNamespace(num_attention_layers=28,
+        granulekv_connector=SimpleNamespace(
         layout=SimpleNamespace(num_gpu_regions=28)))]
     worker._backing_retired = set()
     worker._pending_gpu_to_host = {}
@@ -125,7 +128,7 @@ def test_finish_cleans_owner_and_release_fence_without_waiting():
     worker._host_staging_owner = None
     slot = worker._gpu_slot_key(0, 0, 3)
     owner = (0, "request", 0, 7)
-    worker._gpu_resident_blocks[owner] = 3
+    worker._gpu_resident_blocks.setdefault(owner[:3], {})[owner[3]] = 3
     worker._gpu_destination_owners[slot] = owner
     worker._gpu_transfer_regions[0, "read"] = ("request", (0, 1), ((7, 3),))
     worker._gpu_region_release_events[slot] = ("read", object())

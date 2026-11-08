@@ -131,8 +131,10 @@ class Worker(LocalOrDistributedWorkerBase):
         # The scheduler owns logical history; bounded physical destinations
         # and their transfer/release fences are resolved independently per layer.
         self._gpu_resident_blocks: Dict[
-            Tuple[int, str, int, int], int] = {}
-        self._gpu_slot_mappings: Dict[Tuple[int, str, int, int], int] = {}
+            Tuple[int, str, int], Dict[int, int]] = {}
+        self._gpu_slot_mappings: Dict[
+            Tuple[int, str, int], Dict[int, int]] = {}
+        self._gpu_reserved_slots: Dict[Tuple[int, int], Set[int]] = {}
         self._gpu_required_blocks: Dict[Tuple[int, str, int], Set[int]] = {}
         self._gpu_destination_owners: Dict[
             Tuple[int, int, int], Tuple[int, str, int, int]] = {}
@@ -1013,13 +1015,14 @@ class Worker(LocalOrDistributedWorkerBase):
                     (request_id,), layer_index)
                 # Unused first-window predictions may still lack host backing.
                 predicted = () if state is None else state.predicted_prefix_blocks
-                resident = (key[3] for key in self._gpu_resident_blocks
-                            if key[:3] == (virtual_engine, request_id, layer_index))
+                resident = self._gpu_resident_blocks.get(
+                    (virtual_engine, request_id, layer_index), {})
                 candidate_blocks = sorted(set(consumed).union(dirty, predicted, resident))
             for block in candidate_blocks:
                 destination = table[block]
-                key = (virtual_engine, request_id, layer_index, block)
-                if (self._gpu_resident_blocks.get(key) == destination
+                prefix = (virtual_engine, request_id, layer_index)
+                key = (*prefix, block)
+                if (self._gpu_resident_blocks.get(prefix, {}).get(block) == destination
                         and self._gpu_destination_owners.get(self._gpu_slot_key(
                             virtual_engine, layer_index, destination)) == key):
                     candidates[key] = destination
@@ -1205,24 +1208,26 @@ class Worker(LocalOrDistributedWorkerBase):
             owner[:3] == prefix and pending.prefetched and not pending.event.query()
             for owner, pending in self._pending_h2d_transfers.items()))
                            if prediction else 0)
-        occupied = {slot for owner, slot in self._gpu_slot_mappings.items()
-                    if owner[0] == virtual_engine and owner[2] == layer_index}
+        occupied = self._gpu_reserved_slots.setdefault(
+            (virtual_engine, layer_index), set())
         free_slots = iter(slot for slot in range(capacity) if slot not in occupied)
-        candidates = iter((owner, slot) for owner, slot in
-                          tuple(self._gpu_slot_mappings.items())
-                          if owner[:3] == prefix and owner[3] not in wanted)
+        request_mappings = self._gpu_slot_mappings.setdefault(prefix, {})
+        candidates = iter((block, slot) for block, slot in tuple(request_mappings.items())
+                          if block not in wanted)
         for block in blocks:
-            key = (*prefix, int(block))
+            block = int(block)
+            key = (*prefix, block)
             if prediction:
                 if prediction_room == 0:
                     break
                 prediction_room -= 1
-            if key in self._gpu_slot_mappings:
-                accepted.append(int(block))
+            if block in request_mappings:
+                accepted.append(block)
                 continue
             destination = next(free_slots, None)
             if destination is None and not prediction:
-                for old, slot in candidates:
+                for old_block, slot in candidates:
+                    old = (*prefix, old_block)
                     pending = self._pending_h2d_transfers.get(old)
                     if pending is not None and not pending.event.query():
                         continue
@@ -1237,13 +1242,13 @@ class Worker(LocalOrDistributedWorkerBase):
                     pending = self._pending_h2d_transfers.pop(old, None)
                     if pending is not None and pending.host_key is not None:
                         self._host_kv_directory.finish_use(pending.host_key)
-                    self._gpu_resident_blocks.pop(old, None)
+                    self._pop_gpu_resident(old)
                     self._gpu_destination_owners.pop(
                         self._gpu_slot_key(virtual_engine, layer_index, slot), None)
-                    del self._gpu_slot_mappings[old]
+                    self._unbind_gpu_slot(prefix, old_block)
                     if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off":
                         get_sparse_kv_policy().record_validation_gpu_eviction(
-                            request_id, layer_index, old[3], slot)
+                            request_id, layer_index, old_block, slot)
                     self._host_stats["gpu_slot_evictions"] += 1
                     destination = slot
                     break
@@ -1251,17 +1256,46 @@ class Worker(LocalOrDistributedWorkerBase):
                 if prediction:
                     continue
                 raise RuntimeError("no safely reusable GPU KV slot for actual selection")
-            self._gpu_slot_mappings[key] = destination
-            accepted.append(int(block))
+            self._bind_gpu_slot(prefix, block, destination)
+            accepted.append(block)
         return tuple(accepted)
 
     def _layer_block_table(self, virtual_engine: int, request_id: str,
                             layer_index: int, length: int) -> Tuple[int, ...]:
         if not self._uses_bounded_slots():
             return self._backing_forward[virtual_engine, request_id][0]
-        return tuple(self._gpu_slot_mappings.get(
-            (virtual_engine, request_id, layer_index, block), -1)
-                     for block in range(length))
+        mappings = self._gpu_slot_mappings.get(
+            (virtual_engine, request_id, layer_index), {})
+        return tuple(mappings.get(block, -1) for block in range(length))
+
+    def _bind_gpu_slot(self, prefix: Tuple[int, str, int],
+                       logical_block: int, destination: int) -> None:
+        mappings = self._gpu_slot_mappings.setdefault(prefix, {})
+        occupied = self._gpu_reserved_slots.setdefault((prefix[0], prefix[2]), set())
+        previous = mappings.get(logical_block)
+        if previous is not None and previous != destination:
+            occupied.remove(previous)
+        mappings[logical_block] = destination
+        occupied.add(destination)
+
+    def _unbind_gpu_slot(self, prefix: Tuple[int, str, int],
+                         logical_block: int) -> None:
+        mappings = self._gpu_slot_mappings[prefix]
+        destination = mappings.pop(logical_block)
+        self._gpu_reserved_slots[prefix[0], prefix[2]].remove(destination)
+
+    def _set_gpu_resident(self, owner: Tuple[int, str, int, int],
+                          destination: int) -> None:
+        self._gpu_resident_blocks.setdefault(owner[:3], {})[owner[3]] = destination
+
+    def _pop_gpu_resident(self, owner: Tuple[int, str, int, int]) -> Optional[int]:
+        resident = self._gpu_resident_blocks.get(owner[:3])
+        if resident is None:
+            return None
+        destination = resident.pop(owner[3], None)
+        if not resident:
+            del self._gpu_resident_blocks[owner[:3]]
+        return destination
 
     def _gpu_slot_key(self, virtual_engine: int, layer_index: int,
                       destination_block: int) -> Tuple[int, int, int]:
@@ -1278,7 +1312,7 @@ class Worker(LocalOrDistributedWorkerBase):
                                        destination_block)
         old_key = self._gpu_destination_owners.pop(owner_key, None)
         if old_key is not None:
-            self._gpu_resident_blocks.pop(old_key, None)
+            self._pop_gpu_resident(old_key)
             self._host_stats["gpu_resident_released_blocks"] += 1
 
     def _prepare_gpu_region_reuse(self, virtual_engine: int,
@@ -1428,10 +1462,11 @@ class Worker(LocalOrDistributedWorkerBase):
                 resident_key = (virtual_engine, seq_group_id, layer_index,
                                 int(logical_block))
                 if (self._uses_bounded_slots() and
-                        self._gpu_slot_mappings.get(resident_key) != destination_block):
+                        self._gpu_slot_mappings.get(resident_key[:3], {}).get(
+                            resident_key[3]) != destination_block):
                     continue
                 self._gpu_destination_owners[owner_key] = resident_key
-                self._gpu_resident_blocks[resident_key] = int(destination_block)
+                self._set_gpu_resident(resident_key, int(destination_block))
 
     def _record_ssd_reads(self, virtual_engine: int, seq_group_id: str,
                           layer_range: Tuple[int, int],
@@ -1596,8 +1631,9 @@ class Worker(LocalOrDistributedWorkerBase):
             if layers[1] - layers[0] > 1:
                 # A mixed descriptor uses one destination table across its window.
                 # Earlier requests can occupy different slots in different layers.
-                occupied = {slot for owner, slot in self._gpu_slot_mappings.items()
-                            if owner[0] == virtual_engine and layers[0] <= owner[2] < layers[1]}
+                occupied = set().union(*(
+                    self._gpu_reserved_slots.get((virtual_engine, layer), set())
+                    for layer in range(*layers)))
                 destinations = tuple(slot for slot in range(cache_engine.num_gpu_blocks)
                                      if slot not in occupied)[:len(logical)]
                 if len(destinations) != len(logical):
@@ -1606,12 +1642,13 @@ class Worker(LocalOrDistributedWorkerBase):
                     prefix = (virtual_engine, request.seq_group_id, layer)
                     self._gpu_required_blocks.setdefault(prefix, set()).update(logical)
                     for block, slot in zip(logical, destinations):
-                        self._gpu_slot_mappings[*prefix, block] = slot
+                        self._bind_gpu_slot(prefix, block, slot)
             else:
                 self._reserve_gpu_slots(virtual_engine, request.seq_group_id,
                                         layers[0], logical)
                 destinations = tuple(self._gpu_slot_mappings[
-                    virtual_engine, request.seq_group_id, layers[0], block] for block in logical)
+                    (virtual_engine, request.seq_group_id, layers[0])][block]
+                                     for block in logical)
             pairs = tuple((source, destination) for (source, _), destination in
                           zip(request.block_mapping, destinations))
             request = replace(request, block_mapping=pairs)
@@ -1814,12 +1851,13 @@ class Worker(LocalOrDistributedWorkerBase):
         ready = []
         for block in logical_blocks:
             key = (virtual_engine, seq_group_id, layer_index, int(block))
-            destination = self._gpu_resident_blocks.get(key)
+            destination = self._gpu_resident_blocks.get(
+                key[:3], {}).get(key[3])
             if destination is None:
                 continue
             if self._gpu_destination_owners.get(self._gpu_slot_key(
                     virtual_engine, layer_index, destination)) != key:
-                self._gpu_resident_blocks.pop(key)
+                self._pop_gpu_resident(key)
                 self._host_stats["stale_gpu_owner_hits"] += 1
                 continue
             ready.append(int(block))
@@ -1835,7 +1873,8 @@ class Worker(LocalOrDistributedWorkerBase):
             resident_key = (virtual_engine, seq_group_id, layer_index,
                             int(logical_block))
             if (self._uses_bounded_slots() and
-                    self._gpu_slot_mappings.get(resident_key) != destination_block):
+                    self._gpu_slot_mappings.get(resident_key[:3], {}).get(
+                        resident_key[3]) != destination_block):
                 raise RuntimeError("GPU ownership publication targets an unreserved slot")
             owner_key = self._gpu_slot_key(virtual_engine, layer_index,
                                            destination_block)
@@ -1844,12 +1883,12 @@ class Worker(LocalOrDistributedWorkerBase):
             if uses_host_kv_writeback():
                 old_key = self._gpu_destination_owners.pop(owner_key, None)
                 if old_key is not None:
-                    self._gpu_resident_blocks.pop(old_key, None)
+                    self._pop_gpu_resident(old_key)
             else:
                 self._invalidate_gpu_destination(
                     virtual_engine, layer_index, int(destination_block))
             self._gpu_destination_owners[owner_key] = resident_key
-            self._gpu_resident_blocks[resident_key] = int(destination_block)
+            self._set_gpu_resident(resident_key, int(destination_block))
 
     def host_blocks_staged(self, virtual_engine: int, seq_group_id: str,
                            layer_index: int,
@@ -1947,7 +1986,8 @@ class Worker(LocalOrDistributedWorkerBase):
                  else None)
         for logical, destination in pairs:
             if (self._uses_bounded_slots() and self._gpu_slot_mappings.get(
-                    (virtual_engine, seq_group_id, layer_index, logical)) != destination):
+                    (virtual_engine, seq_group_id, layer_index), {}).get(
+                        logical) != destination):
                 raise RuntimeError("host copy targets an unreserved GPU slot")
             if logical < 0 or (forward is not None and (
                     logical * self.cache_config.block_size >= forward[1]
@@ -1995,7 +2035,7 @@ class Worker(LocalOrDistributedWorkerBase):
             slot = self._gpu_slot_key(virtual_engine, layer_index, destination)
             old = self._gpu_destination_owners.pop(slot, None)
             if old is not None:
-                self._gpu_resident_blocks.pop(old, None)
+                self._pop_gpu_resident(old)
             self._gpu_destination_owners[slot] = key
             self._pending_h2d_transfers[key] = _PendingHostCopy(
                 destination, ready_event, reason == "prefetch",
@@ -2024,7 +2064,8 @@ class Worker(LocalOrDistributedWorkerBase):
             slot = self._gpu_slot_key(virtual_engine, layer_index, pending.destination)
             if self._gpu_destination_owners.get(slot) != key:
                 raise RuntimeError("pending host copy lost its physical owner")
-            if self._gpu_resident_blocks.get(key) == pending.destination:
+            if (self._gpu_resident_blocks.get(key[:3], {}).get(key[3])
+                    == pending.destination):
                 continue
             if id(pending.event) not in waited:
                 torch.cuda.current_stream().wait_event(pending.event)
@@ -2124,15 +2165,21 @@ class Worker(LocalOrDistributedWorkerBase):
         for collection in (self._host_ready_blocks, self._host_staged_blocks, self._host_failed_blocks):
             collection.difference_update(key for key in tuple(collection)
                                          if key[0] == virtual_engine and key[1] in finished)
-        for key in tuple(self._gpu_resident_blocks):
+        for request_id in finished:
+            for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
+                prefix = (virtual_engine, request_id, layer_index)
+                for logical_block, destination in self._gpu_resident_blocks.pop(
+                        prefix, {}).items():
+                    owner = (*prefix, logical_block)
+                    slot = self._gpu_slot_key(virtual_engine, layer_index, destination)
+                    if self._gpu_destination_owners.get(slot) == owner:
+                        self._gpu_destination_owners.pop(slot)
+        for key, pending_copy in tuple(self._pending_h2d_transfers.items()):
             if key[0] == virtual_engine and key[1] in finished:
-                destination = self._gpu_resident_blocks.pop(key)
-                slot = self._gpu_slot_key(virtual_engine, key[2], destination)
+                slot = self._gpu_slot_key(virtual_engine, key[2],
+                                          pending_copy.destination)
                 if self._gpu_destination_owners.get(slot) == key:
                     self._gpu_destination_owners.pop(slot)
-        for slot, owner in tuple(self._gpu_destination_owners.items()):
-            if owner[0] == virtual_engine and owner[1] in finished:
-                self._gpu_destination_owners.pop(slot)
         for request_id in tuple(finished):
             owner = (virtual_engine, request_id)
             pending = (any(key[0] == virtual_engine and record[1] == request_id
@@ -2156,10 +2203,14 @@ class Worker(LocalOrDistributedWorkerBase):
             self._host_request_prefix_limits.pop(
                 (virtual_engine, request_id), None)
         if self._uses_bounded_slots():
-            for collection in (self._gpu_slot_mappings, self._gpu_required_blocks):
-                for key in tuple(collection):
-                    if key[0] == virtual_engine and key[1] in finished:
-                        del collection[key]
+            for request_id in finished:
+                for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
+                    prefix = (virtual_engine, request_id, layer_index)
+                    mappings = self._gpu_slot_mappings.pop(prefix, {})
+                    self._gpu_reserved_slots.get(
+                        (virtual_engine, layer_index), set()).difference_update(
+                            mappings.values())
+                    self._gpu_required_blocks.pop(prefix, None)
         if uses_host_kv_writeback():
             for item in finished:
                 self._backing_forward.pop((virtual_engine, item), None)
@@ -2182,12 +2233,15 @@ class Worker(LocalOrDistributedWorkerBase):
                     pending = self._pending_h2d_transfers.pop(key, None)
                     if pending is not None and pending.host_key is not None:
                         self._host_kv_directory.finish_use(pending.host_key)
-        for key in tuple(self._gpu_resident_blocks):
-            if key[0] == virtual_engine and key[1] in finished:
-                destination = self._gpu_resident_blocks.pop(key)
-                owner_key = self._gpu_slot_key(virtual_engine, key[2], destination)
-                if self._gpu_destination_owners.get(owner_key) == key:
-                    self._gpu_destination_owners.pop(owner_key)
+        for request_id in finished:
+            for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
+                prefix = (virtual_engine, request_id, layer_index)
+                for logical_block, destination in self._gpu_resident_blocks.pop(
+                        prefix, {}).items():
+                    owner = (*prefix, logical_block)
+                    owner_key = self._gpu_slot_key(virtual_engine, layer_index, destination)
+                    if self._gpu_destination_owners.get(owner_key) == owner:
+                        self._gpu_destination_owners.pop(owner_key)
         for key in tuple(self._gpu_pending_transfers):
             if (key[0] == virtual_engine
                     and self._gpu_pending_transfers[key][0] in finished):
