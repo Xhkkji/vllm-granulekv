@@ -79,15 +79,18 @@ def worker(monkeypatch):
                  "_backing_forward", "_deferred_gpu_transfers",
                  "_host_prefetch_windows",
                  "_host_async_kv_transfers", "_gpu_transfer_regions",
-                 "_gpu_pending_transfers", "_pending_h2d_transfers"):
+                 "_gpu_pending_transfers", "_gpu_completed_transfer_events",
+                 "_pending_h2d_transfers"):
         setattr(result, name, {})
     result._gpu_reserved_slots = {}
+    result._async_kv_transfer_ids = set()
     result._pending_host_writes = {}
     result._prefetch_runtime = module.RollingPrefetchRuntime(
         module.RollingPrefetchConfig())
     for name in ("_host_ready_blocks", "_host_staged_blocks",
                  "_host_failed_blocks", "_backing_retired", "_ssd_read_blocks"):
         setattr(result, name, set())
+    result._ssd_read_identity_blocks = {}
     result._host_stats = defaultdict(int)
     result._host_kv_directory = IdentityHostDirectory()
     result._host_request_prefix_keys = {(0, "r"): "prefix"}
@@ -96,6 +99,8 @@ def worker(monkeypatch):
     result._host_transfer_pending_cache_keys = {}
     result._host_transfer_wait_keys = {}
     result._host_transfer_waiters = {}
+    result._host_transfer_gpu_wait_keys = {}
+    result._host_gpu_wait_only = set()
     result._host_completed_transfer_events = {}
     result._discarded_host_transfers = set()
     result._pending_gpu_to_host_cache_keys = {}
@@ -309,6 +314,86 @@ def test_sequential_same_prefix_reuses_cpu_host_slot(worker):
                for layer in (2, 3))
     assert all((0, "second", layer, 9) in worker._host_staged_blocks
                for layer in (2, 3))
+
+
+def test_mixed_host_waits_for_shared_gpu_block_without_ssd_read(
+        worker, monkeypatch):
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    worker.cache_engine[0].num_gpu_blocks = 8
+    worker._gpu_shared_blocks = {}
+    worker._gpu_shared_waits = {}
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "shared-prefix",
+        (0, "request-2"): "shared-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 1,
+        (0, "request-2"): 1,
+    })
+    producer = AsyncKVTransferRequest(
+        request_id="gpu-1", seq_group_id="request-1",
+        reservation_id="reservation-1", operation=AsyncKVTransferOperation.READ,
+        block_mapping=((50, 3),),
+        logical_blocks=(LogicalBlockKey(0, 0),),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="shared-prefix",
+        destination="gpu")
+    worker._prepare_shared_gpu_request(
+        0, producer, torch.tensor([[50, 3]], dtype=torch.int64))
+    worker._publish_shared_gpu_blocks(
+        0, "gpu-1",
+        AsyncKVTransferEvent("gpu-1", AsyncKVTransferState.READY,
+                             gpu_ready=True))
+
+    submitted = []
+    worker.cache_engine[0].submit_async_kv_transfer = (
+        lambda *args, **kwargs: submitted.append(args) or
+        AsyncKVTransferEvent(args[0], AsyncKVTransferState.READY,
+                             host_ready=True))
+    waiter = AsyncKVTransferRequest(
+        request_id="mixed-2", seq_group_id="request-2",
+        reservation_id="reservation-2", operation=AsyncKVTransferOperation.READ,
+        block_mapping=(), logical_blocks=(),
+        priority=AsyncKVTransferPriority.CRITICAL_READ,
+        layer_range=(0, 2), sparse_page_index_key="shared-prefix",
+        consumer_num_blocks=2, destination="mixed",
+        host_block_mapping=((70, 0),))
+    assert set(worker._gpu_shared_blocks) == {
+        (0, "shared-prefix", 0, 0), (0, "shared-prefix", 1, 0)}
+    assert all(entry.state == AsyncKVTransferState.READY
+               for entry in worker._gpu_shared_blocks.values())
+    assert worker._shared_gpu_entry(0, "request-2", 0, 0) is not None
+    event = worker._submit_gpu_transfer(
+        0, worker.cache_engine[0], waiter,
+        torch.empty((0, 2), dtype=torch.int64))
+    assert worker._host_transfer_pending_cache_keys[0, "mixed-2"] == (
+        ("shared-prefix", 0),)
+    assert worker._host_transfer_gpu_wait_keys[0, "mixed-2"] == (
+        ("shared-prefix", 0),)
+    assert event.state == AsyncKVTransferState.PENDING
+    assert submitted == []
+    assert worker._host_transfer_gpu_wait_keys[0, "mixed-2"] == (
+        ("shared-prefix", 0),)
+
+    key = ("shared-prefix", 0)
+    worker._host_kv_directory.begin_load(key, (0, 1))
+    worker._host_kv_directory.finish_load(key, (0, 1), True)
+    assert worker._poll_host_transfers(0)[0].state == AsyncKVTransferState.READY
+
+
+def test_targeted_gpu_poll_removes_completed_native_request(worker):
+    worker._async_kv_transfer_ids.add((0, "io"))
+    polls = []
+    worker.cache_engine[0].poll_async_kv_transfer = (
+        lambda request_id: polls.append(request_id) or AsyncKVTransferEvent(
+            request_id, AsyncKVTransferState.READY, gpu_ready=True))
+    event = worker._poll_gpu_transfer(0, worker.cache_engine[0], "io")
+    assert event.state == AsyncKVTransferState.READY
+    assert (0, "io") not in worker._async_kv_transfer_ids
+    assert worker._poll_gpu_transfer(
+        0, worker.cache_engine[0], "io").state == AsyncKVTransferState.READY
+    assert polls == ["io"]
 
 
 def test_loading_same_prefix_is_coalesced_into_one_ssd_read(worker, monkeypatch):

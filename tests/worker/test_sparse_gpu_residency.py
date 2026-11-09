@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
+from dataclasses import replace
 from types import SimpleNamespace
 
 from vllm.core.custom_schedulers.async_kv_transfer import (
@@ -27,8 +28,13 @@ def _worker():
     worker._gpu_resident_blocks = {}
     worker._gpu_slot_mappings = {}
     worker._gpu_reserved_slots = {}
+    worker._gpu_required_blocks = {}
     worker._gpu_destination_owners = {}
+    worker._gpu_shared_blocks = {}
+    worker._gpu_shared_waits = {}
     worker._gpu_pending_transfers = {}
+    worker._gpu_completed_transfer_events = {}
+    worker._async_kv_transfer_ids = set()
     worker._gpu_region_release_events = {}
     worker._gpu_transfer_regions = {}
     worker._host_prefetch_windows = {}
@@ -41,6 +47,7 @@ def _worker():
     worker._host_transfer_waiters = {}
     worker._host_completed_transfer_events = {}
     worker._ssd_read_blocks = set()
+    worker._ssd_read_identity_blocks = {}
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(num_attention_layers=28,
         granulekv_connector=SimpleNamespace(
@@ -172,6 +179,144 @@ def test_gpu_residency_disabled_keeps_index_empty(monkeypatch):
         0, AsyncKVTransferEvent("read-1", AsyncKVTransferState.READY))
 
     assert worker.gpu_blocks_ready(0, "request-1", 2, (7, )) == ()
+
+
+def test_same_prefix_block_has_one_gpu_producer(monkeypatch):
+    monkeypatch.setattr(
+        worker_module.envs,
+        "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE",
+        True,
+    )
+    worker = _worker()
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "shared-prefix",
+        (0, "request-2"): "shared-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 1,
+        (0, "request-2"): 1,
+    })
+    for request_id, destination in (("request-1", 2), ("request-2", 5)):
+        for layer in range(4):
+            worker._bind_gpu_slot((0, request_id, layer), 0, destination)
+
+    first = replace(_request("read-1", logical_block=0, destination_block=2),
+                    seq_group_id="request-1", layer_range=(0, 4),
+                    sparse_page_index_key="shared-prefix")
+    second = replace(_request("read-2", logical_block=0, destination_block=5),
+                     seq_group_id="request-2", layer_range=(0, 4),
+                     sparse_page_index_key="shared-prefix")
+    first_request, first_mapping = worker._prepare_shared_gpu_request(
+        0, first, torch.tensor(first.block_mapping, dtype=torch.int64))
+    second_request, second_mapping = worker._prepare_shared_gpu_request(
+        0, second, torch.tensor(second.block_mapping, dtype=torch.int64))
+
+    assert first_mapping.tolist() == [[11, 2]]
+    assert first_request.logical_blocks == first.logical_blocks
+    assert second_mapping.numel() == 0
+    assert second_request.logical_blocks == ()
+    assert len(worker._gpu_shared_blocks) == 4
+    assert worker._gpu_shared_waits[0, "read-2"]
+
+    worker._publish_shared_gpu_blocks(
+        0, "read-1", AsyncKVTransferEvent("read-1", AsyncKVTransferState.READY,
+                                           gpu_ready=True))
+    for layer in range(4):
+        assert worker.gpu_blocks_ready(0, "request-2", layer, (0, )) == (0, )
+        assert worker._gpu_resident_blocks[0, "request-2", layer][0] == 2
+    assert worker._poll_shared_gpu_wait(
+        0, worker.cache_engine[0], "read-2", "window").state == (
+            AsyncKVTransferState.READY)
+
+
+def test_suffix_block_does_not_share_across_requests(monkeypatch):
+    worker = _worker()
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "shared-prefix",
+        (0, "request-2"): "shared-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 1,
+        (0, "request-2"): 1,
+    })
+    for request_id, destination in (("request-1", 2), ("request-2", 5)):
+        worker._bind_gpu_slot((0, request_id, 0), 1, destination)
+    first = replace(_request("read-1", logical_block=1, destination_block=2),
+                    seq_group_id="request-1",
+                    sparse_page_index_key="shared-prefix", layer_range=(0, 1))
+    second = replace(_request("read-2", logical_block=1, destination_block=5),
+                     seq_group_id="request-2",
+                     sparse_page_index_key="shared-prefix", layer_range=(0, 1))
+    _, first_mapping = worker._prepare_shared_gpu_request(
+        0, first, torch.tensor(first.block_mapping, dtype=torch.int64))
+    _, second_mapping = worker._prepare_shared_gpu_request(
+        0, second, torch.tensor(second.block_mapping, dtype=torch.int64))
+    assert first_mapping.tolist() == [[11, 2]]
+    assert second_mapping.tolist() == [[11, 5]]
+    assert not worker._gpu_shared_waits
+
+
+def test_ssd_read_stats_deduplicate_same_prefix_identity():
+    worker = _worker()
+    worker._host_request_prefix_keys.update({
+        (0, "request-1"): "shared-prefix",
+        (0, "request-2"): "shared-prefix",
+    })
+    worker._host_request_prefix_limits.update({
+        (0, "request-1"): 2,
+        (0, "request-2"): 2,
+    })
+    worker._record_ssd_reads(0, "request-1", (0, 1), (1, ))
+    worker._record_ssd_reads(0, "request-2", (0, 1), (1, ))
+    assert worker._host_stats["duplicate_ssd_read_blocks"] == 1
+
+
+def test_ready_shared_gpu_block_skips_empty_backend_submit(monkeypatch):
+    monkeypatch.setattr(
+        worker_module.envs,
+        "VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE",
+        True,
+    )
+    worker = _worker()
+    monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 8
+    worker.cache_config = SimpleNamespace(block_size=16)
+    worker.model_config = worker.parallel_config = None
+    monkeypatch.setattr(worker_module.CacheEngine, "get_cache_block_size",
+                        lambda *args: 32768)
+    submitted = []
+    worker.cache_engine[0].submit_async_kv_transfer = (
+        lambda request_id, operation, mapping, **kwargs: (
+            submitted.append((request_id, mapping.tolist())) or
+            AsyncKVTransferEvent(request_id, AsyncKVTransferState.READY,
+                                 gpu_ready=True)))
+
+    first = replace(
+        _request("read-1", logical_block=0, destination_block=-1),
+        seq_group_id="request-1",
+        block_mapping=((11, -1),),
+        layer_range=(0, 4),
+        sparse_page_index_key="shared-prefix",
+    )
+    second = replace(
+        _request("read-2", logical_block=0, destination_block=-1),
+        seq_group_id="request-2",
+        block_mapping=((11, -1),),
+        layer_range=(0, 4),
+        sparse_page_index_key="shared-prefix",
+    )
+    first_event = worker._submit_gpu_transfer(
+        0, worker.cache_engine[0], first,
+        torch.tensor(first.block_mapping, dtype=torch.int64))
+    second_event = worker._submit_gpu_transfer(
+        0, worker.cache_engine[0], second,
+        torch.tensor(second.block_mapping, dtype=torch.int64))
+
+    assert first_event.state == AsyncKVTransferState.READY
+    assert second_event.state == AsyncKVTransferState.READY
+    assert len(submitted) == 1
 
 
 def test_event_fenced_release_waits_before_destination_reuse(monkeypatch):
