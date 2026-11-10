@@ -1743,3 +1743,119 @@ def test_background_host_completion_cleans_ready_gpu_wait_ledger(worker):
     assert worker._poll_host_transfers(0)[0].state == AsyncKVTransferState.READY
     assert not worker._gpu_shared_waits
     assert not worker._host_async_kv_transfers
+
+
+def test_host_read_preserves_order_and_publishes_only_ready_keys(worker, monkeypatch):
+    directory = SharedHostKVDirectory(8)
+    worker._host_kv_directory = directory
+    layers = (2, 4)
+    key = lambda block: ("prefix", block)
+    for block in (5, 1):
+        directory.acquire(key(block), (0, "producer"))
+        directory.begin_load(key(block), range(*layers))
+    directory.finish_load(key(5), range(*layers), True)
+    gpu = SimpleNamespace(state=AsyncKVTransferState.PENDING,
+                          references={"gpu-producer"})
+    monkeypatch.setattr(worker, "_shared_gpu_entry",
+                        lambda ve, req, layer, block: gpu if block == 7 else None)
+    # Insertion order of matching producers is part of the existing contract.
+    for name, keys, window, ve in (
+            ("wrong-layer", (key(1),), (4, 6), 0),
+            ("first", (key(1),), layers, 0),
+            ("unrelated", (key(4),), layers, 0),
+            ("second", (key(1),), layers, 0),
+            ("other-engine", (key(1),), layers, 1)):
+        worker._host_transfer_cache_keys[ve, name] = keys
+        worker._host_async_kv_transfers[ve, name] = (name, "producer", (), window)
+    request = SimpleNamespace(request_id="read", seq_group_id="r")
+    mapped, missing = worker._prepare_host_read(
+        0, request, ((90, 3), (80, 5), (70, 1), (60, 7), (50, 2)), layers)
+    assert missing == (3, 2)
+    assert mapped == ((90, directory.lookup(key(3))),
+                      (50, directory.lookup(key(2))))
+    transfer = (0, "read")
+    assert worker._host_transfer_cache_keys[transfer] == (key(3), key(2))
+    assert worker._host_transfer_pending_cache_keys[transfer] == (
+        key(3), key(1), key(7), key(2))
+    assert worker._host_transfer_wait_keys[transfer] == (key(1), key(7))
+    assert worker._host_transfer_gpu_wait_keys[transfer] == (key(7),)
+    assert worker._host_transfer_waiters[transfer] == ((0, "first"), (0, "second"))
+    assert gpu.references == {"gpu-producer", "r"}
+    assert directory._entries[key(7)].in_flight == 0
+    assert directory._entries[key(7)].loading_layers == set()
+    assert all(directory._entries[key(b)].in_flight == 1 for b in (3, 1, 2))
+    assert all((0, "r") in directory._entries[key(b)].owners for b in (3, 5, 1, 7, 2))
+
+    finished = []
+    original_finish = directory.finish_load
+
+    def finish(cache_key, layer_indices, success):
+        finished.append(cache_key)
+        original_finish(cache_key, layer_indices, success)
+
+    monkeypatch.setattr(directory, "finish_load", finish)
+    worker._mark_host_ready(0, ("read", "r", missing, layers))
+    assert finished == [key(3), key(2)]
+    assert worker._host_transfer_pending_cache_keys[transfer] == (key(1), key(7))
+    assert worker._host_ready_blocks == {
+        (0, "r", layer, b) for layer in range(*layers) for b in (5, 3, 2)}
+    assert all(directory._entries[key(b)].in_flight == 0 for b in (3, 2))
+    assert directory._entries[key(1)].in_flight == 1
+    # Only the real producer completes its DMA; a waiter must not finish it twice.
+    directory.finish_load(key(1), range(*layers), True)
+    directory.begin_load(key(7), range(*layers))
+    directory.finish_load(key(7), range(*layers), True)
+    finished.clear()
+    worker._mark_host_ready(0, ("read", "r", (), layers))
+    assert finished == []
+    assert transfer not in worker._host_transfer_pending_cache_keys
+    assert worker._host_ready_blocks == {
+        (0, "r", layer, b) for layer in range(*layers) for b in (5, 3, 1, 7, 2)}
+    assert all(entry.in_flight == 0 for entry in directory._entries.values())
+
+
+@pytest.mark.parametrize("size", [2048, 8192])
+@pytest.mark.parametrize("state", ["missing", "ready", "loading"])
+def test_host_membership_work_is_linear(worker, monkeypatch, size, state):
+    operations = defaultdict(int)
+
+    class CountedKey(tuple):
+        def __hash__(self):
+            operations["hash"] += 1
+            return tuple.__hash__(self)
+
+        def __eq__(self, other):
+            operations["equal"] += 1
+            return tuple.__eq__(self, other)
+
+    keys = tuple(CountedKey(("prefix", b)) for b in range(size))
+    monkeypatch.setattr(worker, "_host_cache_key", lambda ve, req, b: keys[b])
+    monkeypatch.setattr(worker, "_shared_gpu_entry", lambda *args: None)
+    directory = worker._host_kv_directory
+    monkeypatch.setattr(directory, "ready", lambda key, layers: state == "ready")
+    monkeypatch.setattr(directory, "loading", lambda key, layer: state == "loading")
+    # Worst-case producer matching: no overlap, so linear tuple search would
+    # compare every waiter against every producer key.
+    worker._host_transfer_cache_keys[0, "producer"] = tuple(
+        CountedKey(("other", b)) for b in range(size))
+    worker._host_async_kv_transfers[0, "producer"] = ("producer", "other", (), (0, 1))
+    mapped, missing = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="read", seq_group_id="r"),
+        tuple((b + 100, b) for b in range(size)), (0, 1))
+    assert missing == (tuple(range(size)) if state == "missing" else ())
+    assert mapped == (tuple((b + 100, b) for b in range(size))
+                      if state == "missing" else ())
+    assert worker._host_transfer_waiters[0, "read"] == ()
+    assert sum(operations.values()) <= 8 * size
+
+    # Measure publication independently, including an ordered READY subset.
+    for partial in (False, True):
+        worker._host_transfer_cache_keys.pop((0, "read"), None)
+        worker._host_transfer_pending_cache_keys[0, "read"] = keys
+        monkeypatch.setattr(directory, "ready",
+                            lambda key, layers: not partial or key[1] % 2 == 0)
+        operations.clear()
+        worker._mark_host_ready(0, ("read", "r", (), (0, 1)))
+        expected = tuple(key for key in keys if partial and key[1] % 2)
+        assert worker._host_transfer_pending_cache_keys.get((0, "read"), ()) == expected
+        assert sum(operations.values()) <= 8 * size

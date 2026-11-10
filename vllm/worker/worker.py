@@ -1255,7 +1255,8 @@ class Worker(LocalOrDistributedWorkerBase):
         pending_keys = self._host_transfer_pending_cache_keys.get(transfer_key, ())
         ready_keys = tuple(key for key in pending_keys
                            if self._host_kv_directory.ready(key, range(*layer_range)))
-        remaining = tuple(key for key in pending_keys if key not in ready_keys)
+        ready_key_set = set(ready_keys)
+        remaining = tuple(key for key in pending_keys if key not in ready_key_set)
         if remaining:
             self._host_transfer_pending_cache_keys[transfer_key] = remaining
         else:
@@ -1878,14 +1879,16 @@ class Worker(LocalOrDistributedWorkerBase):
         transfer_key = (virtual_engine, request.request_id)
         self._host_transfer_pending_cache_keys[transfer_key] = tuple(
             pending_cache_keys)
-        wait_keys = tuple(key for key in pending_cache_keys if key not in cache_keys)
+        cache_key_set = set(cache_keys)
+        wait_keys = tuple(key for key in pending_cache_keys if key not in cache_key_set)
+        wait_key_set = set(wait_keys)
         self._host_transfer_gpu_wait_keys[transfer_key] = tuple(gpu_wait_keys)
         self._host_transfer_wait_keys[transfer_key] = wait_keys
         self._host_transfer_waiters[transfer_key] = tuple(
             source for source, keys in self._host_transfer_cache_keys.items()
             if source[0] == virtual_engine and source in self._host_async_kv_transfers
             and self._host_async_kv_transfers[source][3] == layers
-            and any(key in keys for key in wait_keys))
+            and not wait_key_set.isdisjoint(keys))
         return tuple(missing_pairs), tuple(missing_logical)
 
     def _submit_gpu_transfer(self, virtual_engine: int,
