@@ -73,6 +73,8 @@ def cache_tokens(key_cache, value_cache, table, blocks, sequence_length):
 def check_cache_contents(key_cache, value_cache, table, blocks, length, logical_kv):
     k, v, positions = cache_tokens(key_cache, value_cache, table, blocks, length)
     expected_k, expected_v = (x[positions.cpu()] for x in logical_kv)
+    if not all(torch.isfinite(x).all() for x in (k, v, expected_k, expected_v)):
+        raise ValueError('non-finite KV in cache or independently captured model inputs')
     if not torch.equal(k.cpu(), expected_k) or not torch.equal(v.cpu(), expected_v):
         raise ValueError('mapped KV bytes differ from independent logical source')
 
@@ -165,7 +167,20 @@ class BatchReference:
         if len(model_input.input_tokens) != len(positions):
             raise ValueError('input tokens do not cover query positions')
         sampling_indices = model_input.sampling_metadata.selected_token_indices.detach().clone()
-        if sampling_indices.cpu().tolist() != [intervals[r].stop - 1 for r in ids]:
+        groups = model_input.sampling_metadata.seq_groups
+        if len(groups) != len(ids):
+            raise ValueError('sampling groups do not cover requests')
+        expected_rows = []
+        for rid, group in zip(ids, groups):
+            if list(group.seq_ids) != list(model_input.request_ids_to_seq_ids[rid]):
+                raise ValueError('sampling groups do not match request order')
+            if group.prompt_logprob_indices:
+                raise ValueError('gate does not request prompt logprobs')
+            if group.do_sample:
+                if list(group.sample_indices) != [len(expected_rows)]:
+                    raise ValueError('sampling rows do not match request query ends')
+                expected_rows.append(intervals[rid].stop - 1)
+        if sampling_indices.cpu().tolist() != expected_rows:
             raise ValueError('sampling rows do not match request query ends')
         frame = {'ids': ids, 'query_lens': list(model_input.query_lens),
                  'seq_lens': list(model_input.seq_lens), 'positions': positions,
@@ -266,7 +281,23 @@ class BatchReference:
             self.actual_live[rid, index] = logical
             output = original(layer, query, key, value, cache, metadata, *args, **kwargs)
             kc, vc = PagedAttention.split_kv_cache(cache, layer.num_kv_heads, layer.head_size)
-            check_cache_contents(kc, vc, table, blocks, end, logical)
+            try:
+                check_cache_contents(kc, vc, table, blocks, end, logical)
+            except ValueError:
+                actual_k, actual_v, token_positions = cache_tokens(kc, vc, table, blocks, end)
+                expected_k, expected_v = (x[token_positions.cpu()] for x in logical)
+                mismatch = (actual_k.cpu() != expected_k).flatten(1).any(1) | (actual_v.cpu() != expected_v).flatten(1).any(1)
+                bad_tokens = token_positions.cpu()[mismatch].tolist()
+                failure = {'forward': frame['index'], 'request_id': rid, 'layer': index,
+                           'bad_logical_blocks': sorted({t // BLOCK_SIZE for t in bad_tokens}),
+                           'first_bad_tokens': bad_tokens[:32], 'bad_token_count': len(bad_tokens)}
+                self.report['passed'] = False
+                self.report['failures'].append(failure)
+                torch.save({'failure': failure, 'actual': (actual_k.cpu(), actual_v.cpu()),
+                            'expected': (expected_k, expected_v), 'positions': token_positions.cpu(),
+                            'table': table.cpu(), 'slots': slots.cpu()},
+                           self.directory / 'first_kv_mismatch.pt')
+                raise ValueError(f'mapped KV bytes differ: {failure}')
             self.report['logical_kv_checks'] += 1
             expected = logical_attention(query.reshape(n, layer.num_heads, layer.head_size),
                                          logical, blocks, positions, layer.impl.scale)

@@ -40,6 +40,9 @@ class IdentityHostDirectory:
     def ready(self, key, layers):
         return True
 
+    def loading(self, key, layer):
+        return False
+
     def begin_load(self, key, layers):
         pass
 
@@ -82,6 +85,9 @@ def worker(monkeypatch):
                  "_gpu_pending_transfers", "_gpu_completed_transfer_events",
                  "_pending_h2d_transfers"):
         setattr(result, name, {})
+    result._gpu_shared_blocks = {}
+    result._gpu_shared_waits = {}
+    result._gpu_transfer_children = {}
     result._gpu_reserved_slots = {}
     result._async_kv_transfer_ids = set()
     result._pending_host_writes = {}
@@ -110,7 +116,7 @@ def worker(monkeypatch):
     result.model_config = result.parallel_config = None
     result.cache_engine = [SimpleNamespace(
         num_attention_layers=28,
-        granulekv_connector=SimpleNamespace(layout=SimpleNamespace(num_gpu_regions=8)))]
+        granulekv_connector=SimpleNamespace(available_request_slots=4, layout=SimpleNamespace(num_gpu_regions=8)))]
     monkeypatch.setattr(CacheEngine, "get_cache_block_size", lambda *args: 28 * 32768)
     monkeypatch.setattr(torch.cuda, "Event", Fence)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(
@@ -625,7 +631,7 @@ def test_mixed_request_rewrites_host_mapping_and_skips_cached_read(
         host_block_mapping=((90, 5),))
     worker._submit_gpu_transfer(
         0, engine, second, torch.empty((0, 2), dtype=torch.int64))
-    assert submitted[1] == ([], ())
+    assert len(submitted) == 1
     assert worker._host_stats["cpu_direct_read_blocks"] == 1
 
 
@@ -949,6 +955,13 @@ def test_back_up_only_gpu_only_and_dirty_tail(worker):
         worker._gpu_resident_blocks.setdefault(key[:3], {})[key[3]] = destination
         worker._gpu_destination_owners[0, 0, destination] = key
     worker._host_ready_blocks.update(((0, "r", 0, 1), (0, "r", 0, 2)))
+    worker._host_kv_directory = SharedHostKVDirectory(3)
+    for block in range(3):
+        key = worker._host_cache_key(0, "r", block)
+        worker._host_kv_directory.acquire(key, (0, "r"))
+        if block:
+            worker._host_kv_directory.begin_load(key, (0,))
+            worker._host_kv_directory.finish_load(key, (0,), True)
     copies = []
     ready = Fence()
     worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
@@ -1145,6 +1158,13 @@ def test_sparse_backup_includes_unused_gpu_only_prediction(worker):
     for block, destination in enumerate((3, 4, 5)):
         worker._mark_gpu_blocks_ready(0, "r", 0, (block,), ((block, destination),))
     worker._host_ready_blocks.add((0, "r", 0, 1))
+    worker._host_kv_directory = SharedHostKVDirectory(3)
+    for block in range(3):
+        key = worker._host_cache_key(0, "r", block)
+        worker._host_kv_directory.acquire(key, (0, "r"))
+        if block == 1:
+            worker._host_kv_directory.begin_load(key, (0,))
+            worker._host_kv_directory.finish_load(key, (0,), True)
     copies = []
     worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
         lambda layer, mapping, fences: copies.append(mapping.tolist()) or Fence())
@@ -1444,6 +1464,7 @@ def test_batch_correction_slices_different_query_lengths(worker):
 
 def test_mixed_window_reserves_common_slots_across_layer_occupancy(worker, monkeypatch):
     monkeypatch.setattr(worker, "_uses_bounded_slots", lambda: True)
+    worker._host_kv_directory = SharedHostKVDirectory(8)
     engine = worker.cache_engine[0]
     engine.num_gpu_blocks = 8
     _set_gpu_slot(worker, (0, "previous", 0, 7), 0)
@@ -1462,3 +1483,263 @@ def test_mixed_window_reserves_common_slots_across_layer_occupancy(worker, monke
     assert _get_gpu_slot(worker, (0, "next", 1, 4)) == 2
     assert worker._gpu_reserved_slots[0, 0] == {0, 2}
     assert worker._gpu_reserved_slots[0, 1] == {1, 2}
+
+
+@pytest.mark.parametrize('completed', [False, True])
+def test_shared_h2d_binds_one_slot_and_one_source_use(worker, monkeypatch, completed):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 4
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    host_key = ('same-prefix', 0)
+    worker._host_kv_directory.acquire(host_key, (0, 'a'))
+    worker._host_kv_directory.begin_load(host_key, (0,))
+    worker._host_kv_directory.finish_load(host_key, (0,), True)
+    copies = []
+    event = Fence(completed)
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = (
+        lambda layer, mapping, fences: copies.append(mapping.tolist()) or event)
+    for request_id in ('a', 'b'):
+        worker._host_request_prefix_keys[0, request_id] = 'same-prefix'
+        worker._host_request_prefix_limits[0, request_id] = 1
+        worker._backing_forward[0, request_id] = ((0, 1), 16, 17, False)
+        worker._reserve_gpu_slots(0, request_id, 0, (0,))
+        table = worker._layer_block_table(0, request_id, 0, 2)
+        worker.copy_host_blocks_to_gpu_async(0, request_id, 0, ((0, table[0]),))
+        if completed:
+            worker._consume_host_copies(0, request_id, 0, (0,))
+    assert copies == [[[0, 0]]]
+    assert worker._gpu_slot_mappings[0, 'a', 0] == {0: 0}
+    assert worker._gpu_slot_mappings[0, 'b', 0] == {0: 0}
+    assert worker._gpu_reserved_slots[0, 0] == {0}
+    assert worker._host_kv_directory._entries[host_key].in_flight == 1
+    worker._forget_host_staging(0, ('a',))
+    event.ready = True
+    worker._consume_host_copies(0, 'b', 0, (0,))
+    worker._poll_host_cache_uses(0)
+    assert worker._host_kv_directory._entries[host_key].in_flight == 0
+    assert worker.gpu_blocks_ready(0, 'b', 0, (0,)) == (0,)
+    assert worker._gpu_reserved_slots[0, 0] == {0}
+    worker._forget_host_staging(0, ('a', 'b'))
+    assert not worker._gpu_reserved_slots[0, 0]
+
+
+@pytest.mark.parametrize('unrelated', [0, 10000])
+def test_backup_uses_canonical_lookup_without_request_record_scan(worker, monkeypatch, unrelated):
+    class NoIteration(set):
+        def __iter__(self):
+            pytest.fail('backup must not scan global ready records')
+    worker._host_kv_directory = SharedHostKVDirectory(3)
+    for block in range(3):
+        key = worker._host_cache_key(0, 'r', block)
+        worker._host_kv_directory.acquire(key, (0, 'r'))
+    key = worker._host_cache_key(0, 'r', 0)
+    worker._host_kv_directory.begin_load(key, (0,))
+    worker._host_kv_directory.finish_load(key, (0,), True)
+    key = worker._host_cache_key(0, 'r', 1)
+    worker._host_kv_directory.begin_load(key, (0,))
+    worker._host_ready_blocks = NoIteration((0, 'other', 19, i) for i in range(unrelated))
+    worker._backing_forward[0, 'r'] = ((0, 1, 2), 32, 33, False)
+    for block in range(3):
+        worker._mark_gpu_blocks_ready(0, 'r', 0, (block,), ((block, block),))
+    queried = []
+    ready = worker._host_kv_directory.ready
+    monkeypatch.setattr(worker._host_kv_directory, 'ready',
+                        lambda key, layers: queried.append(key) or ready(key, layers))
+    copies = []
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, fences: copies.append(mapping.tolist()) or Fence())
+    worker._back_up_layer(0, ('r',), 0, Fence())
+    assert queried == [('prefix', 0), ('prefix', 1)]
+    assert copies == [[[2, 2]]]
+
+
+@pytest.mark.parametrize('loading', [False, True])
+def test_prediction_uses_cpu_producer_without_second_ssd_read(worker, monkeypatch, loading):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    engine = worker.cache_engine[0]
+    engine.num_gpu_blocks = 8
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    key = ('same', 0)
+    worker._host_kv_directory.acquire(key, (0, 'cpu'))
+    worker._host_kv_directory.begin_load(key, (0, 1, 2, 3))
+    if not loading:
+        worker._host_kv_directory.finish_load(key, (0, 1, 2, 3), True)
+    else:
+        worker._host_async_kv_transfers[0, 'cpu-read'] = ('cpu-read', 'cpu', (0,), (0, 4))
+        worker._host_transfer_cache_keys[0, 'cpu-read'] = (key,)
+    cpu_ready = [False]
+    engine.poll_async_kv_transfer = lambda rid: AsyncKVTransferEvent(
+        rid, AsyncKVTransferState.READY if cpu_ready[0] else AsyncKVTransferState.PENDING,
+        host_ready=cpu_ready[0])
+    submitted, copies = [], []
+    engine.submit_async_kv_transfer = lambda *args, **kwargs: submitted.append(args)
+    event = Fence()
+    engine.copy_host_blocks_to_gpu_async = lambda layer, mapping, fences: (
+        copies.append((layer, mapping.tolist())) or event)
+    for rid in ('a', 'b'):
+        request = AsyncKVTransferRequest(
+            request_id=rid + '-read', seq_group_id=rid, reservation_id=rid,
+            operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+            block_mapping=((10, -1),), logical_blocks=(LogicalBlockKey(0, 0),),
+            layer_range=(0, 4), sparse_page_index_key='same', consumer_num_blocks=2,
+            destination='mixed')
+        outcome = worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+        assert outcome.state == AsyncKVTransferState.PENDING
+        assert not outcome.gpu_ready
+    assert not submitted
+    if loading:
+        assert not copies
+        cpu_ready[0] = True
+    worker._poll_gpu_transfer(0, engine, 'b-read')
+    assert [layer for layer, _ in copies] == [0, 1, 2, 3]
+    assert all(mapping == [[0, 0]] for _, mapping in copies)
+    event.ready = True
+    outcome = worker._poll_gpu_transfer(0, engine, 'b-read')
+    assert outcome.state == AsyncKVTransferState.READY
+    assert outcome.gpu_ready
+    for layer in range(4):
+        assert worker._layer_block_table(0, 'a', layer, 1) == (0,)
+        assert worker._layer_block_table(0, 'b', layer, 1) == (0,)
+    worker._poll_host_cache_uses(0)
+    assert worker._host_kv_directory._entries[key].in_flight == 0
+
+
+def test_partial_layer_cpu_hit_only_submits_remaining_ssd_range(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    engine = worker.cache_engine[0]
+    engine.num_gpu_blocks = 8
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    key = ('same', 0)
+    worker._host_kv_directory.acquire(key, (0, 'old'))
+    worker._host_kv_directory.begin_load(key, (0, 1))
+    worker._host_kv_directory.finish_load(key, (0, 1), True)
+    copies, reads = [], []
+    engine.copy_host_blocks_to_gpu_async = lambda layer, mapping, fences: (
+        copies.append(layer) or Fence(True))
+    engine.submit_async_kv_transfer = lambda rid, op, mapping, **kwargs: (
+        reads.append((kwargs['layer_range'], mapping.tolist())) or
+        AsyncKVTransferEvent(rid, AsyncKVTransferState.READY, gpu_ready=True))
+    request = AsyncKVTransferRequest(
+        request_id='read', seq_group_id='r', reservation_id='r',
+        operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+        block_mapping=((10, -1),), logical_blocks=(LogicalBlockKey(0, 0),),
+        layer_range=(0, 4), sparse_page_index_key='same', consumer_num_blocks=2)
+    result = worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    assert result.state == AsyncKVTransferState.READY
+    assert copies == [0, 1]
+    assert reads == [((2, 4), [[10, 0]])]
+    assert worker._host_stats['gpu_direct_read_bytes'] == 2 * 32768
+
+
+def test_cpu_waiter_progresses_gpu_backing_without_model_forward(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    engine = worker.cache_engine[0]
+    engine.num_gpu_blocks = 8
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    for rid in ('producer', 'consumer'):
+        worker._host_request_prefix_keys[0, rid] = 'same'
+        worker._host_request_prefix_limits[0, rid] = 1
+    identity = (0, 'same', 0, 0)
+    worker._gpu_shared_blocks[identity] = module._SharedGPUBlock(
+        0, 'gpu-read', 'producer', references={'producer'})
+    engine.poll_async_kv_transfer = lambda rid: AsyncKVTransferEvent(
+        rid, AsyncKVTransferState.READY, gpu_ready=True)
+    copies = []
+    ready = Fence()
+    engine.copy_gpu_blocks_to_host_async = lambda layer, mapping, fences: (
+        copies.append(mapping.tolist()) or ready)
+    request = AsyncKVTransferRequest(
+        request_id='cpu-read', seq_group_id='consumer', reservation_id='r',
+        operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+        block_mapping=(), logical_blocks=(), host_block_mapping=((10, 0),),
+        layer_range=(0, 1), sparse_page_index_key='same', consumer_num_blocks=2, destination='mixed')
+    worker._submit_gpu_transfer(0, engine, request, torch.empty((0, 2), dtype=torch.int64))
+    assert not worker._host_kv_directory.loading(('same', 0), 0)
+    worker._poll_host_transfers(0)
+    assert copies == [[[0, 0]]]
+    assert worker._host_kv_directory.loading(('same', 0), 0)
+    worker._poll_host_transfers(0)
+    assert len(copies) == 1
+    ready.ready = True
+    assert worker._poll_host_transfers(0)[0].state == AsyncKVTransferState.READY
+    assert worker._host_kv_directory.ready(('same', 0), (0,))
+
+
+def test_deferred_gpu_producer_does_not_wait_on_itself(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker._host_kv_directory = SharedHostKVDirectory(2)
+    request = AsyncKVTransferRequest(
+        request_id='gpu-read', seq_group_id='r', reservation_id='r',
+        operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+        block_mapping=((10, 0),), logical_blocks=(LogicalBlockKey(0, 0),), layer_range=(0, 4))
+    for _ in range(2):
+        prepared, mapping = worker._prepare_shared_gpu_request(0, request, torch.tensor(request.block_mapping))
+        assert prepared.block_mapping == ((10, 0),)
+        assert not worker._gpu_shared_waits
+
+
+def test_shared_replica_invalidated_when_aliased_region_is_written(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker._gpu_shared_blocks[0, 'prefix', 0, 0] = module._SharedGPUBlock(
+        0, 'old', 'r', state=AsyncKVTransferState.READY, references={'r'})
+    worker._bind_gpu_slot((0, 'r', 0), 0, 0)
+    worker._gpu_destination_owners[0, 0, 0] = (0, 'r', 0, 0)
+    worker._set_gpu_resident((0, 'r', 0, 0), 0)
+    worker._bind_gpu_slot((0, 'r', 8), 1, 0)
+    worker._mark_gpu_blocks_ready(0, 'r', 8, (1,), ((1, 0),))
+    assert worker._shared_gpu_entry(0, 'r', 0, 0) is None
+    assert worker.gpu_blocks_ready(0, 'r', 0, (0,)) == ()
+    assert worker.gpu_blocks_ready(0, 'r', 8, (1,)) == (1,)
+
+
+def test_shared_h2d_event_failure_is_visible_to_all_waiters(worker):
+    class FailedEvent:
+        def query(self):
+            raise RuntimeError('copy failed')
+    identity = (0, 'prefix', 0, 0)
+    entry = module._SharedGPUBlock(0, '', 'r', references={'r', 'other'}, h2d_event=FailedEvent())
+    worker._gpu_shared_blocks[identity] = entry
+    for rid in ('first-wait', 'second-wait'):
+        worker._gpu_shared_waits[0, rid] = (identity,)
+        result = worker._poll_shared_gpu_wait(0, worker.cache_engine[0], rid, 'window')
+        assert result.state == AsyncKVTransferState.ERROR
+    assert entry.state == AsyncKVTransferState.ERROR
+    assert entry.references == {'r', 'other'}
+
+
+def test_split_window_defers_remaining_fragments_until_native_slot_frees(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    engine = worker.cache_engine[0]
+    engine.num_gpu_blocks = 8
+    engine.granulekv_connector.available_request_slots = 0
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    submitted = []
+    engine.submit_async_kv_transfer = lambda rid, op, mapping, **kwargs: (
+        submitted.append(rid) or AsyncKVTransferEvent(rid, AsyncKVTransferState.READY, gpu_ready=True))
+    request = AsyncKVTransferRequest(
+        request_id='remaining', seq_group_id='r', reservation_id='r',
+        operation=AsyncKVTransferOperation.READ, priority=AsyncKVTransferPriority.CRITICAL_READ,
+        block_mapping=((10, -1),), logical_blocks=(LogicalBlockKey(0, 0),), layer_range=(0, 1))
+    event = worker._submit_gpu_transfer(0, engine, request, torch.tensor(request.block_mapping))
+    assert event.state == AsyncKVTransferState.PENDING
+    assert not submitted
+    assert not worker._gpu_pending_transfers
+    engine.granulekv_connector.available_request_slots = 1
+    event = worker._poll_gpu_transfer(0, engine, 'remaining')
+    assert event.state == AsyncKVTransferState.READY
+    assert submitted == ['remaining']
+    assert not worker._deferred_gpu_transfers
+    assert not worker._gpu_shared_waits
+
+
+def test_background_host_completion_cleans_ready_gpu_wait_ledger(worker):
+    identity = (0, 'prefix', 0, 0)
+    worker._gpu_shared_blocks[identity] = module._SharedGPUBlock(
+        0, 'producer', 'r', state=AsyncKVTransferState.READY, references={'r'})
+    worker._gpu_shared_waits[0, 'waiter'] = (identity,)
+    worker._host_async_kv_transfers[0, 'waiter'] = ('waiter', 'r', (), (0, 1))
+    worker._host_completed_transfer_events[0, 'waiter'] = AsyncKVTransferEvent(
+        'waiter', AsyncKVTransferState.READY, gpu_ready=True, host_ready=True)
+    assert worker._poll_host_transfers(0)[0].state == AsyncKVTransferState.READY
+    assert not worker._gpu_shared_waits
+    assert not worker._host_async_kv_transfers

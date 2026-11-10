@@ -62,6 +62,8 @@ cp evaluation/multi_request_sparse/validation.py "${RUN_DIR}/validation.py"
 git diff --binary > "${RUN_DIR}/source.diff"
 git rev-parse HEAD > "${RUN_DIR}/vllm_commit.txt"
 git -C "${GKV_ROOT}" rev-parse HEAD > "${RUN_DIR}/granulekv_commit.txt"
+git -C "${GKV_ROOT}" diff --binary > "${RUN_DIR}/granulekv_source.diff"
+sha256sum "${GKV_ROOT}/gids_module/build/granulekv_native/granulekv_native.so" > "${RUN_DIR}/granulekv_native.sha256"
 "${PYTHON}" "${RUN_DIR}/benchmark.py" \
     --prefix-tokens "${PREFIX}" --suffix-tokens "${SUFFIX}" --case "${CASE}" \
     --output "${RUN_DIR}/summary.json" "${@:5}" 2>&1 | tee "${RUN_DIR}/console.log"

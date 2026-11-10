@@ -69,6 +69,10 @@ class SharedHostKVDirectory:
         self._touch(entry)
         return set(layers).issubset(entry.ready_layers)
 
+    def loading(self, key: HostKVBlockKey, layer: int) -> bool:
+        entry = self._entries.get(key)
+        return entry is not None and layer in entry.loading_layers
+
     def begin_load(self, key: HostKVBlockKey,
                    layers: Sequence[int]) -> None:
         entry = self._entries[key]

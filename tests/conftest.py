@@ -145,6 +145,19 @@ def cleanup_VLLM_USE_V1(monkeypatch):
         monkeypatch.delenv("VLLM_USE_V1")
 
 
+@pytest.fixture(autouse=True)
+def restore_granulekv_env_attributes(monkeypatch):
+    # setattr on envs' dynamic __getattr__ materializes the old value during
+    # monkeypatch undo. Remove those attributes so later setenv tests see it.
+    import vllm.envs as envs
+    before = {name for name in vars(envs) if name.startswith("VLLM_GRANULEKV_")}
+    yield
+    monkeypatch.undo()
+    for name in tuple(vars(envs)):
+        if name.startswith("VLLM_GRANULEKV_") and name not in before:
+            delattr(envs, name)
+
+
 @pytest.fixture(params=[True, False])
 def run_with_both_engines(request, monkeypatch):
     # Automatically runs tests twice, once with V1 and once without

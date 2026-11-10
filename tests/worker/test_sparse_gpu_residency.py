@@ -32,6 +32,7 @@ def _worker():
     worker._gpu_destination_owners = {}
     worker._gpu_shared_blocks = {}
     worker._gpu_shared_waits = {}
+    worker._gpu_transfer_children = {}
     worker._gpu_pending_transfers = {}
     worker._gpu_completed_transfer_events = {}
     worker._async_kv_transfer_ids = set()
@@ -50,7 +51,7 @@ def _worker():
     worker._ssd_read_identity_blocks = {}
     worker._host_stats = defaultdict(int)
     worker.cache_engine = [SimpleNamespace(num_attention_layers=28,
-        granulekv_connector=SimpleNamespace(
+        granulekv_connector=SimpleNamespace(available_request_slots=4,
         layout=SimpleNamespace(num_gpu_regions=28)))]
     worker._backing_retired = set()
     worker._pending_gpu_to_host = {}
@@ -228,6 +229,7 @@ def test_same_prefix_block_has_one_gpu_producer(monkeypatch):
     assert worker._poll_shared_gpu_wait(
         0, worker.cache_engine[0], "read-2", "window").state == (
             AsyncKVTransferState.READY)
+    assert not worker._gpu_shared_waits
 
 
 def test_suffix_block_does_not_share_across_requests(monkeypatch):

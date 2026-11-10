@@ -118,7 +118,7 @@ def main():
     save()
     reference = None
     try:
-        from transformers import AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
         from vllm import LLM, SamplingParams
         from vllm.utils import Device
         from evaluation.paper_reproduction.quest.scripts.vllm_sparse_e2e import (
@@ -162,7 +162,15 @@ def main():
         suffixes = [prompt(text, args.suffix_tokens) for text in (
             ' Summarize the preceding document. ', ' Explain the main subject of this text. ')]
         max_len = args.prefix_tokens + args.suffix_tokens + args.output_tokens + 16
+        model_config = AutoConfig.from_pretrained(args.model)
+        # max_model_len alone does not grow Qwen2's RoPE lookup table. Include
+        # decode positions without changing the base frequencies/scaling.
+        rope_positions = max(max_len, model_config.max_position_embeddings)
+        hf_overrides = {'max_position_embeddings': rope_positions}
         result['engine_config'] = {
+            'hf_overrides': hf_overrides,
+            'rope_theta': model_config.rope_theta,
+            'rope_scaling': getattr(model_config, 'rope_scaling', None),
             'max_model_len': max_len, 'max_num_seqs': 2,
             'max_num_batched_tokens': 2048, 'num_gpu_blocks_override': 2135,
             'swap_space_gib': 32, 'gpu_memory_utilization': 0.85,
@@ -170,6 +178,7 @@ def main():
             'scheduler': 'vllm.core.async_kv_scheduler.AsyncKVScheduler'}
         save()
         llm = LLM(model=args.model, dtype='half', max_model_len=max_len,
+                  hf_overrides=hf_overrides,
                   gpu_memory_utilization=0.85, swap_space=32,
                   enable_prefix_caching=True, enable_chunked_prefill=True,
                   scheduler_cls='vllm.core.async_kv_scheduler.AsyncKVScheduler',
@@ -387,7 +396,7 @@ def main():
             raise RuntimeError('same-batch correctness comparison failed; see comparisons')
         reference.close()
         result['status'] = 'numerical_check_passed'
-        result['validation_scope'] = '1K same-batch independent logical KV reference; per-request mapping; FP32 local attention; selection/KV/attention/logits/tokens'
+        result['validation_scope'] = f'{args.prefix_tokens}-token same-batch independent logical KV reference; per-request mapping; FP32 local attention; selection/KV/attention/logits/tokens'
         result['reference_kind'] = 'same_batch_independent_cache'
         result['performance_valid'] = False
         result['performance_exclusion'] = 'numerical recording and forward tracing enabled'
@@ -420,7 +429,8 @@ def main():
             def assert_drained():
                 pending = {name: list(map(str, getattr(worker, name))) for name in (
                     '_host_async_kv_transfers', '_pending_gpu_to_host',
-                    '_pending_host_writes', '_deferred_gpu_transfers')}
+                    '_pending_host_writes', '_deferred_gpu_transfers',
+                    '_gpu_transfer_children', '_gpu_shared_waits')}
                 pending['native'] = list(cache_engine.granulekv_connector._pending_transfers)
                 pending['host_references'] = {str(k): {
                     'owners': sorted(e.owners), 'in_flight': e.in_flight,

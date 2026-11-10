@@ -70,6 +70,8 @@ class _SharedGPUBlock:
     producer_seq_group_id: str
     state: AsyncKVTransferState = AsyncKVTransferState.PENDING
     references: Set[str] = field(default_factory=set)
+    h2d_event: Optional[object] = None
+    host_key: Optional[HostKVBlockKey] = None
 
 
 class Worker(LocalOrDistributedWorkerBase):
@@ -152,6 +154,7 @@ class Worker(LocalOrDistributedWorkerBase):
             Tuple[int, int, int], Tuple[int, str, int, int]] = {}
         self._gpu_shared_blocks: Dict[
             Tuple[int, str, int, int], _SharedGPUBlock] = {}
+        self._gpu_transfer_children: Dict[Tuple[int, str], Tuple[str, ...]] = {}
         self._gpu_shared_waits: Dict[
             Tuple[int, str], Tuple[Tuple[int, str, int, int], ...]] = {}
         self._gpu_pending_transfers: Dict[
@@ -910,6 +913,57 @@ class Worker(LocalOrDistributedWorkerBase):
         self._log_prefetch_runtime_traces()
         return events
 
+    def _progress_gpu_host_backing(self, virtual_engine: int, transfer_key,
+                                    record) -> None:
+        request_id, seq_group_id, _, layers = record
+        by_layer = {}
+        for host_key in self._host_transfer_gpu_wait_keys.get(transfer_key, ()):
+            for layer in range(*layers):
+                if (self._host_kv_directory.ready(host_key, (layer,))
+                        or self._host_kv_directory.loading(host_key, layer)):
+                    continue
+                entry = self._shared_gpu_entry(virtual_engine, seq_group_id, layer, host_key[1])
+                if entry is None or entry.state == AsyncKVTransferState.ERROR:
+                    self._host_failed_blocks.add((virtual_engine, request_id, layer, host_key[1]))
+                    continue
+                if entry.state == AsyncKVTransferState.PENDING:
+                    if entry.h2d_event is not None:
+                        if not entry.h2d_event.query():
+                            continue
+                        entry.state = AsyncKVTransferState.READY
+                    else:
+                        event = self.cache_engine[virtual_engine].poll_async_kv_transfer(entry.producer_request_id)
+                        self._observe_gpu_transfer(virtual_engine, event)
+                        if entry.state != AsyncKVTransferState.READY:
+                            if entry.state == AsyncKVTransferState.ERROR:
+                                self._host_failed_blocks.add((virtual_engine, request_id, layer, host_key[1]))
+                            continue
+                by_layer.setdefault(layer, []).append((host_key, entry.destination))
+        for layer, copies in by_layer.items():
+            mapping, fences = [], []
+            for host_key, destination in copies:
+                slot = self._host_kv_directory.acquire(host_key, (virtual_engine, seq_group_id))
+                mapping.append((destination, slot))
+                fence = self._gpu_region_release_events.get(self._gpu_slot_key(virtual_engine, layer, destination))
+                if fence is not None:
+                    fences.append(fence[1])
+            ready = self.cache_engine[virtual_engine].copy_gpu_blocks_to_host_async(
+                layer, torch.tensor(mapping, dtype=torch.int64, device="cpu"), tuple(fences))
+            for host_key, destination in copies:
+                self._host_kv_directory.begin_load(host_key, (layer,))
+                key = (virtual_engine, seq_group_id, layer, host_key[1])
+                self._pending_gpu_to_host[key] = ready
+                self._pending_gpu_to_host_cache_keys[key] = host_key
+                self._host_staged_blocks.add(key)
+                self._gpu_region_release_events[self._gpu_slot_key(virtual_engine, layer, destination)] = (seq_group_id, ready)
+            block_bytes = CacheEngine.get_cache_block_size(
+                self.cache_config, self.model_config, self.parallel_config) // self.cache_engine[virtual_engine].num_attention_layers
+            self._host_stats["gpu_to_host_submit_count"] += 1
+            self._host_stats["gpu_to_host_blocks"] += len(copies)
+            self._host_stats["gpu_to_host_bytes"] += len(copies) * block_bytes
+            self._host_stats["gpu_to_cpu_blocks"] += len(copies)
+            self._host_stats["gpu_to_cpu_bytes"] += len(copies) * block_bytes
+
     def _poll_host_transfers(
             self,
             virtual_engine: int,
@@ -933,6 +987,7 @@ class Worker(LocalOrDistributedWorkerBase):
         for key, record in tuple(self._host_async_kv_transfers.items()):
             if key[0] != virtual_engine or (request_ids is not None and key[1] not in request_ids):
                 continue
+            self._progress_gpu_host_backing(virtual_engine, key, record)
             native = self._host_completed_transfer_events.get(key)
             if native is None and key in self._host_gpu_wait_only:
                 native = AsyncKVTransferEvent(key[1],
@@ -975,14 +1030,23 @@ class Worker(LocalOrDistributedWorkerBase):
                     event = AsyncKVTransferEvent(
                         key[1], native.state, gpu_ready=native.gpu_ready,
                         host_ready=native.host_ready and producer_ready)
-            events.append(event)
             self._observe_gpu_transfer(virtual_engine, event)
+            waits = self._gpu_shared_waits.get(key, ())
+            states = [self._gpu_shared_blocks.get(identity) for identity in waits]
+            if any(entry is None or entry.state == AsyncKVTransferState.ERROR for entry in states):
+                event = AsyncKVTransferEvent(key[1], AsyncKVTransferState.ERROR,
+                                            error="shared GPU KV producer failed")
+            elif any(entry.state == AsyncKVTransferState.PENDING for entry in states):
+                event = AsyncKVTransferEvent(key[1], AsyncKVTransferState.PENDING,
+                                            gpu_ready=False, host_ready=event.host_ready)
+            events.append(event)
             self._prefetch_runtime.complete_request(virtual_engine, event)
             if event.state == AsyncKVTransferState.PENDING:
                 continue
             if event.state == AsyncKVTransferState.ERROR:
                 self._host_stats["host_transfer_errors"] += 1
                 self._mark_host_failed(virtual_engine, record)
+            self._gpu_shared_waits.pop(key, None)
             self._host_async_kv_transfers.pop(key)
             self._host_completed_transfer_events.pop(key, None)
             self._host_transfer_wait_keys.pop(key, None)
@@ -1018,14 +1082,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 cache_key = self._pending_gpu_to_host_cache_keys.get(key)
                 if cache_key is not None:
                     self._host_kv_directory.finish_load(
-                        cache_key, (key[2],), success=not retired)
-                    if retired:
-                        for waiter, wait_keys in (
-                                self._host_transfer_gpu_wait_keys.items()):
-                            if waiter[0] == virtual_engine and cache_key in wait_keys:
-                                self._host_failed_blocks.add(
-                                    (virtual_engine, waiter[1], key[2],
-                                     cache_key[1]))
+                        cache_key, (key[2],), success=True)
                 del self._pending_gpu_to_host[key]
                 self._pending_gpu_to_host_cache_keys.pop(key, None)
 
@@ -1082,31 +1139,14 @@ class Worker(LocalOrDistributedWorkerBase):
             if not candidates:
                 continue
             to_copy = {}
-            gpu_wait_keys = set().union(*(
-                keys for transfer_key, keys in
-                self._host_transfer_gpu_wait_keys.items()
-                if transfer_key[0] == virtual_engine))
             for key, destination in candidates.items():
+                if key[3] in dirty:
+                    to_copy[key] = destination
+                    continue
                 host_key = self._host_cache_key(
                     virtual_engine, request_id, key[3])
-                host_ready = any(
-                    self._host_cache_key(virtual_engine, ready_key[1],
-                                         ready_key[3]) == host_key
-                    and ready_key[2] == layer_index
-                    for ready_key in self._host_ready_blocks
-                    if ready_key[0] == virtual_engine)
-                loading = (
-                    host_key not in gpu_wait_keys and any(
-                        cache_key == host_key for cache_key in
-                        self._pending_gpu_to_host_cache_keys.values())
-                    or host_key not in gpu_wait_keys and any(
-                        host_key in cache_keys for cache_keys in
-                        self._host_transfer_cache_keys.values())
-                    or host_key not in gpu_wait_keys and any(
-                        host_key in cache_keys for cache_keys in
-                        self._host_transfer_pending_cache_keys.values()))
-                if (key[3] in dirty or
-                        (not host_ready and not loading)):
+                if (not self._host_kv_directory.ready(host_key, (layer_index,))
+                        and not self._host_kv_directory.loading(host_key, layer_index)):
                     to_copy[key] = destination
             for key, destination in candidates.items():
                 self._gpu_region_release_events[self._gpu_slot_key(
@@ -1298,6 +1338,13 @@ class Worker(LocalOrDistributedWorkerBase):
                 if prediction_room == 0:
                     break
                 prediction_room -= 1
+            shared = self._shared_gpu_entry(virtual_engine, request_id,
+                                            layer_index, block)
+            if shared is not None:
+                self._attach_shared_gpu(virtual_engine, request_id,
+                                        layer_index, block, shared)
+                accepted.append(block)
+                continue
             if block in request_mappings:
                 accepted.append(block)
                 continue
@@ -1305,6 +1352,11 @@ class Worker(LocalOrDistributedWorkerBase):
             if destination is None and not prediction:
                 for old_block, slot in candidates:
                     old = (*prefix, old_block)
+                    shared = self._shared_gpu_entry(
+                        virtual_engine, request_id, layer_index, old_block, slot)
+                    if shared is not None and (shared.references - {request_id}
+                            or shared.state == AsyncKVTransferState.PENDING):
+                        continue
                     pending = self._pending_h2d_transfers.get(old)
                     if pending is not None and not pending.event.query():
                         continue
@@ -1351,7 +1403,7 @@ class Worker(LocalOrDistributedWorkerBase):
         occupied = self._gpu_reserved_slots.setdefault((prefix[0], prefix[2]), set())
         previous = mappings.get(logical_block)
         if previous is not None and previous != destination:
-            occupied.remove(previous)
+            self._unbind_gpu_slot(prefix, logical_block)
         mappings[logical_block] = destination
         occupied.add(destination)
 
@@ -1359,7 +1411,14 @@ class Worker(LocalOrDistributedWorkerBase):
                          logical_block: int) -> None:
         mappings = self._gpu_slot_mappings[prefix]
         destination = mappings.pop(logical_block)
-        self._gpu_reserved_slots[prefix[0], prefix[2]].remove(destination)
+        shared = self._shared_gpu_entry(*prefix, logical_block, destination)
+        if shared is not None:
+            shared.references.discard(prefix[1])
+            if shared.references or shared.state == AsyncKVTransferState.PENDING:
+                return
+            identity = self._gpu_identity(*prefix, logical_block)
+            self._gpu_shared_blocks.pop(identity)
+        self._gpu_reserved_slots[prefix[0], prefix[2]].discard(destination)
 
     def _set_gpu_resident(self, owner: Tuple[int, str, int, int],
                           destination: int) -> None:
@@ -1380,29 +1439,37 @@ class Worker(LocalOrDistributedWorkerBase):
         region = layer_index % connector.layout.num_gpu_regions
         return virtual_engine, region, int(destination_block)
 
+    def _gpu_identity(self, virtual_engine: int, request_id: str,
+                      layer_index: int, logical_block: int) -> Tuple[int, str, int, int]:
+        owner, block = self._host_cache_key(virtual_engine, request_id, logical_block)
+        return virtual_engine, owner, layer_index, block
+
     def _gpu_shared_identity(self, virtual_engine: int, request: AsyncKVTransferRequest,
                              layer_index: int, logical_block: int) -> Tuple[int, str, int, int]:
-        prefix = self._host_request_prefix_keys.get(
-            (virtual_engine, request.seq_group_id))
-        limit = self._host_request_prefix_limits.get(
-            (virtual_engine, request.seq_group_id), 0)
-        owner = prefix if prefix is not None and logical_block < limit else (
-            f"request:{request.seq_group_id}")
-        return virtual_engine, owner, layer_index, int(logical_block)
+        return self._gpu_identity(virtual_engine, request.seq_group_id,
+                                  layer_index, logical_block)
 
     def _shared_gpu_entry(self, virtual_engine: int, request_id: str,
                           layer_index: int, logical_block: int,
                           destination: Optional[int] = None) -> Optional[_SharedGPUBlock]:
-        prefix = self._host_request_prefix_keys.get((virtual_engine, request_id))
-        limit = self._host_request_prefix_limits.get(
-            (virtual_engine, request_id), 0)
-        owner = prefix if prefix is not None and logical_block < limit else (
-            f"request:{request_id}")
-        entry = getattr(self, "_gpu_shared_blocks", {}).get(
-            (virtual_engine, owner, layer_index, int(logical_block)))
+        identity = self._gpu_identity(virtual_engine, request_id, layer_index, logical_block)
+        entry = self._gpu_shared_blocks.get(identity)
         if entry is None or (destination is not None and entry.destination != destination):
             return None
         return entry
+
+    def _attach_shared_gpu(self, virtual_engine: int, request_id: str,
+                           layer_index: int, block: int, entry: _SharedGPUBlock) -> None:
+        if entry.state == AsyncKVTransferState.ERROR:
+            raise RuntimeError("shared GPU KV producer failed")
+        key = (virtual_engine, request_id, layer_index, block)
+        self._bind_gpu_slot(key[:3], block, entry.destination)
+        entry.references.add(request_id)
+        if entry.h2d_event is not None and key not in self._pending_h2d_transfers:
+            self._pending_h2d_transfers[key] = _PendingHostCopy(
+                entry.destination, entry.h2d_event, False)
+        if entry.state == AsyncKVTransferState.READY:
+            self._set_gpu_resident(key, entry.destination)
 
     def _publish_shared_gpu_blocks(self, virtual_engine: int,
                                    producer_request_id: str,
@@ -1432,64 +1499,102 @@ class Worker(LocalOrDistributedWorkerBase):
         if (not self._uses_bounded_slots() or request.layer_range is None
                 or not request.block_mapping):
             return request, mapping
-        shared = getattr(self, "_gpu_shared_blocks", None)
-        if shared is None:
-            shared = self._gpu_shared_blocks = {}
-        waits = []
-        producer_pairs = []
-        producer_logical = []
+        waits, producer_pairs, producer_logical = [], [], []
         layers = tuple(range(*request.layer_range))
         for logical_key, (source, destination) in zip(
                 request.logical_blocks, request.block_mapping):
             logical = int(logical_key.logical_index)
-            identities = tuple(self._gpu_shared_identity(
-                virtual_engine, request, layer, logical) for layer in layers)
-            entries = tuple(shared.get(identity) for identity in identities)
-            reusable = (len(entries) == len(identities) and all(
-                entry is not None for entry in entries)
-                        and len({entry.destination for entry in entries
-                                 if entry is not None}) == 1)
-            if reusable:
-                shared_destination = entries[0].destination
-                for identity, entry in zip(identities, entries):
-                    assert entry is not None
-                    entry.references.add(request.seq_group_id)
+            missing = []
+            host_key = self._host_cache_key(virtual_engine, request.seq_group_id, logical)
+            for layer in layers:
+                identity = self._gpu_shared_identity(virtual_engine, request, layer, logical)
+                entry = self._gpu_shared_blocks.get(identity)
+                if entry is not None and entry.producer_request_id == request.request_id:
+                    missing.append(identity)
+                    continue
+                if entry is None and (self._host_kv_directory.ready(host_key, (layer,))
+                        or self._host_kv_directory.loading(host_key, layer)):
+                    self._host_kv_directory.acquire(host_key, (virtual_engine, request.seq_group_id))
+                    entry = _SharedGPUBlock(destination, "", request.seq_group_id,
+                                            host_key=host_key)
+                    self._gpu_shared_blocks[identity] = entry
+                if entry is not None:
+                    self._attach_shared_gpu(virtual_engine, request.seq_group_id,
+                                            layer, logical, entry)
                     if entry.state == AsyncKVTransferState.PENDING:
                         waits.append(identity)
-                    elif entry.state == AsyncKVTransferState.READY:
-                        _, _, layer, block = identity
-                        self._set_gpu_resident(
-                            (virtual_engine, request.seq_group_id, layer, block),
-                            entry.destination)
-                for layer in layers:
-                    self._bind_gpu_slot(
-                        (virtual_engine, request.seq_group_id, layer),
-                        logical, shared_destination)
-                continue
-            producer_pairs.append((int(source), int(destination)))
-            producer_logical.append(logical_key)
-            for identity in identities:
-                if identity in shared:
                     continue
-                shared[identity] = _SharedGPUBlock(
-                    destination=int(destination),
-                    producer_request_id=request.request_id,
-                    producer_seq_group_id=request.seq_group_id,
-                    references={request.seq_group_id},
-                )
+                missing.append(identity)
+            if missing:
+                # Windows are split at source changes before descriptor creation.
+                if len(missing) != len(layers):
+                    raise RuntimeError("SSD descriptor crosses a reused layer")
+                producer_pairs.append((int(source), int(destination)))
+                producer_logical.append(logical_key)
+                for identity in missing:
+                    self._gpu_shared_blocks.setdefault(identity, _SharedGPUBlock(
+                        destination, request.request_id, request.seq_group_id,
+                        references={request.seq_group_id}))
         if waits:
-            wait_map = getattr(self, "_gpu_shared_waits", None)
-            if wait_map is None:
-                wait_map = self._gpu_shared_waits = {}
-            wait_map[virtual_engine, request.request_id] = tuple(dict.fromkeys(waits))
-        elif (virtual_engine, request.request_id) in getattr(self,
-                "_gpu_shared_waits", {}):
-            self._gpu_shared_waits.pop((virtual_engine, request.request_id), None)
-        request = replace(request,
-                          block_mapping=tuple(producer_pairs),
+            self._gpu_shared_waits[virtual_engine, request.request_id] = tuple(dict.fromkeys(waits))
+        request = replace(request, block_mapping=tuple(producer_pairs),
                           logical_blocks=tuple(producer_logical))
-        return request, torch.tensor(
-            producer_pairs, dtype=torch.int64, device="cpu").view(-1, 2)
+        return request, torch.tensor(producer_pairs, dtype=torch.int64, device="cpu").view(-1, 2)
+
+    def _read_layer_source(self, virtual_engine: int, request: AsyncKVTransferRequest,
+                           layer: int, block: int) -> str:
+        entry = self._shared_gpu_entry(virtual_engine, request.seq_group_id, layer, block)
+        if entry is not None:
+            return "gpu"
+        host_key = self._host_cache_key(virtual_engine, request.seq_group_id, block)
+        if self._host_kv_directory.ready(host_key, (layer,)):
+            return "host_ready"
+        if self._host_kv_directory.loading(host_key, layer):
+            return "host_loading"
+        return "ssd"
+
+    def _split_read_layers(self, virtual_engine: int, request: AsyncKVTransferRequest
+                           ) -> Tuple[Tuple[int, int], ...]:
+        blocks = tuple(key.logical_index for key in request.logical_blocks)
+        blocks += tuple(block for _, block in request.host_block_mapping)
+        start, end = request.layer_range
+        ranges = []
+        previous = None
+        for layer in range(start, end):
+            sources = tuple(self._read_layer_source(virtual_engine, request, layer, block)
+                            for block in blocks)
+            if previous is not None and sources != previous:
+                ranges.append((start, layer))
+                start = layer
+            previous = sources
+        ranges.append((start, end))
+        return tuple(ranges)
+
+    @staticmethod
+    def _combine_read_events(request_id: str, events: Sequence[AsyncKVTransferEvent]
+                             ) -> AsyncKVTransferEvent:
+        failure = next((event for event in events
+                        if event.state == AsyncKVTransferState.ERROR), None)
+        if failure is not None:
+            return AsyncKVTransferEvent(request_id, AsyncKVTransferState.ERROR,
+                                        error=failure.error)
+        ready = all(event.state == AsyncKVTransferState.READY for event in events)
+        return AsyncKVTransferEvent(
+            request_id, AsyncKVTransferState.READY if ready else AsyncKVTransferState.PENDING,
+            gpu_ready=all(event.gpu_ready or event.state == AsyncKVTransferState.READY
+                          for event in events),
+            host_ready=all(event.host_ready or event.state == AsyncKVTransferState.READY
+                           for event in events))
+
+    def _retire_gpu_replica(self, owner: Tuple[int, str, int, int],
+                            destination: int) -> None:
+        identity = self._gpu_identity(*owner)
+        entry = self._gpu_shared_blocks.get(identity)
+        if entry is not None and entry.destination == destination:
+            for consumer in entry.references:
+                self._pop_gpu_resident((owner[0], consumer, owner[2], owner[3]))
+            del self._gpu_shared_blocks[identity]
+        self._pop_gpu_resident(owner)
 
     def _invalidate_gpu_destination(self, virtual_engine: int,
                                     layer_index: int,
@@ -1633,17 +1738,18 @@ class Worker(LocalOrDistributedWorkerBase):
                 virtual_engine, request.seq_group_id, layer_range,
                 logical_blocks, transfer_id=request.request_id)
             for layer_index in range(*layer_range):
-                for _, destination_block in pairs:
-                    protected = any(
-                        identity[0] == virtual_engine
-                        and identity[2] == layer_index
-                        and entry.destination == int(destination_block)
-                        and entry.producer_request_id == request.request_id
-                        for identity, entry in getattr(
-                            self, "_gpu_shared_blocks", {}).items())
+                for logical, (_, destination_block) in zip(logical_blocks, pairs):
+                    identity = self._gpu_identity(virtual_engine, request.seq_group_id, layer_index, logical)
+                    entry = self._gpu_shared_blocks.get(identity)
+                    protected = (entry is not None and entry.destination == destination_block
+                                 and entry.producer_request_id == request.request_id)
+                    slot = self._gpu_slot_key(virtual_engine, layer_index, destination_block)
+                    old = self._gpu_destination_owners.get(slot)
+                    if old is not None and self._gpu_identity(*old) != identity:
+                        self._retire_gpu_replica(old, destination_block)
+                        self._gpu_destination_owners.pop(slot, None)
                     if not protected:
-                        self._invalidate_gpu_destination(
-                            virtual_engine, layer_index, int(destination_block))
+                        self._invalidate_gpu_destination(virtual_engine, layer_index, destination_block)
 
     def _observe_gpu_transfer(self, virtual_engine: int,
                               event: AsyncKVTransferEvent) -> None:
@@ -1673,6 +1779,9 @@ class Worker(LocalOrDistributedWorkerBase):
                 if (self._uses_bounded_slots() and
                         self._gpu_slot_mappings.get(resident_key[:3], {}).get(
                             resident_key[3]) != destination_block):
+                    continue
+                shared = self._shared_gpu_entry(*resident_key, int(destination_block))
+                if shared is not None and shared.producer_request_id != event.request_id:
                     continue
                 self._gpu_destination_owners[owner_key] = resident_key
                 self._set_gpu_resident(resident_key, int(destination_block))
@@ -1734,23 +1843,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._host_stats["host_cache_hits"] += 1
                 continue
             pending_cache_keys.append(key)
-            loading = any(
-                key in keys and source[0] == virtual_engine
-                and self._host_async_kv_transfers[source][3][0] < layers[1]
-                and layers[0] < self._host_async_kv_transfers[source][3][1]
-                for source, keys in self._host_transfer_cache_keys.items()
-                if source in self._host_async_kv_transfers)
-            loading = loading or any(
-                key in keys and source[0] == virtual_engine
-                and source in self._host_async_kv_transfers
-                and self._host_async_kv_transfers[source][3][0] < layers[1]
-                and layers[0] < self._host_async_kv_transfers[source][3][1]
-                for source, keys in self._host_transfer_pending_cache_keys.items())
-            loading = loading or any(
-                cache_key == key and pending_key[0] == virtual_engine
-                and pending_key[2] in range(*layers)
-                for pending_key, cache_key in
-                self._pending_gpu_to_host_cache_keys.items())
+            loading = any(self._host_kv_directory.loading(key, layer)
+                          for layer in layer_indices)
             shared_entries = tuple(
                 self._shared_gpu_entry(virtual_engine, request.seq_group_id,
                                        layer, int(logical_block))
@@ -1762,6 +1856,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 raise RuntimeError("shared GPU KV producer failed")
             if (not loading and shared_entries
                     and all(entry is not None for entry in shared_entries)):
+                for entry in shared_entries:
+                    entry.references.add(request.seq_group_id)
                 gpu_wait_keys.append(key)
                 continue
             if not loading:
@@ -1819,6 +1915,23 @@ class Worker(LocalOrDistributedWorkerBase):
                     int(prefix_limit),
                     self._host_request_prefix_limits.get(
                         (virtual_engine, request.seq_group_id), 0))
+        if (self._uses_bounded_slots() and request.operation == AsyncKVTransferOperation.READ
+                and request.layer_range is not None
+                and request.layer_range[1] - request.layer_range[0] > 1):
+            ranges = self._split_read_layers(virtual_engine, request)
+            if len(ranges) > 1:
+                children, events = [], []
+                for start, end in ranges:
+                    child = replace(request, request_id=f"{request.request_id}/layers-{start}-{end}",
+                                    layer_range=(start, end))
+                    children.append(child.request_id)
+                    events.append(self._submit_gpu_transfer(virtual_engine, cache_engine, child, mapping))
+                event = self._combine_read_events(request.request_id, events)
+                if event.state == AsyncKVTransferState.PENDING:
+                    self._gpu_transfer_children[virtual_engine, request.request_id] = tuple(children)
+                else:
+                    self._gpu_completed_transfer_events[virtual_engine, request.request_id] = event
+                return event
         if (request.destination == "host"
                 and request.operation == AsyncKVTransferOperation.READ):
             layers = request.layer_range or (0, cache_engine.num_attention_layers)
@@ -1885,15 +1998,27 @@ class Worker(LocalOrDistributedWorkerBase):
                 occupied = set().union(*(
                     self._gpu_reserved_slots.get((virtual_engine, layer), set())
                     for layer in range(*layers)))
-                destinations = tuple(slot for slot in range(cache_engine.num_gpu_blocks)
-                                     if slot not in occupied)[:len(logical)]
-                if len(destinations) != len(logical):
-                    raise RuntimeError("mixed window lacks safe common GPU slots")
-                for layer in range(*layers):
-                    prefix = (virtual_engine, request.seq_group_id, layer)
-                    self._gpu_required_blocks.setdefault(prefix, set()).update(logical)
-                    for block, slot in zip(logical, destinations):
-                        self._bind_gpu_slot(prefix, block, slot)
+                free = iter(slot for slot in range(cache_engine.num_gpu_blocks)
+                            if slot not in occupied)
+                destinations = []
+                for block in logical:
+                    entries = tuple(self._shared_gpu_entry(virtual_engine, request.seq_group_id,
+                                                           layer, block) for layer in range(*layers))
+                    if all(entry is not None for entry in entries):
+                        destination = entries[0].destination
+                    else:
+                        destination = next(free, None)
+                        if destination is None:
+                            raise RuntimeError("mixed window lacks safe common GPU slots")
+                    destinations.append(destination)
+                    for layer, entry in zip(range(*layers), entries):
+                        prefix = (virtual_engine, request.seq_group_id, layer)
+                        self._gpu_required_blocks.setdefault(prefix, set()).add(block)
+                        if entry is not None:
+                            self._attach_shared_gpu(virtual_engine, request.seq_group_id,
+                                                    layer, block, entry)
+                        else:
+                            self._bind_gpu_slot(prefix, block, destination)
             else:
                 self._reserve_gpu_slots(virtual_engine, request.seq_group_id,
                                         layers[0], logical)
@@ -1968,6 +2093,14 @@ class Worker(LocalOrDistributedWorkerBase):
                             virtual_engine, request.request_id] = (request, mapping)
                         return AsyncKVTransferEvent(
                             request.request_id, AsyncKVTransferState.PENDING)
+        if (self._uses_bounded_slots() and request.operation == AsyncKVTransferOperation.READ
+                and request.destination in ("gpu", "mixed")
+                and (mapping.numel() or any(
+                    self._read_layer_source(virtual_engine, request, layer, block) == "ssd"
+                    for _, block in request.host_block_mapping for layer in range(*request.layer_range)))
+                and cache_engine.granulekv_connector.available_request_slots == 0):
+            self._deferred_gpu_transfers[virtual_engine, request.request_id] = (request, mapping)
+            return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.PENDING)
         if request.destination in ("gpu", "mixed"):
             self._register_gpu_transfer(virtual_engine, request, mapping)
         if (request.destination in ("gpu", "mixed")
@@ -2017,21 +2150,14 @@ class Worker(LocalOrDistributedWorkerBase):
                 return AsyncKVTransferEvent(
                     request.request_id, AsyncKVTransferState.PENDING)
         if not mapping.numel() and not request.host_block_mapping:
-            if (virtual_engine, request.request_id) in getattr(
-                    self, "_gpu_shared_waits", {}):
-                return AsyncKVTransferEvent(
-                    request.request_id, AsyncKVTransferState.PENDING)
-            if request.destination == "gpu":
-                return AsyncKVTransferEvent(
-                    request.request_id, AsyncKVTransferState.READY, gpu_ready=True)
-        event = cache_engine.submit_async_kv_transfer(
-            request.request_id,
-            request.operation,
-            mapping,
-            layer_range=request.layer_range,
-            destination=request.destination,
-            **({"host_block_mapping": request.host_block_mapping}
-               if request.destination == "mixed" else {}))
+            event = AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.READY,
+                                          gpu_ready=True, host_ready=True)
+        else:
+            event = cache_engine.submit_async_kv_transfer(
+                request.request_id, request.operation, mapping,
+                layer_range=request.layer_range, destination=request.destination,
+                **({"host_block_mapping": request.host_block_mapping}
+                   if request.destination == "mixed" else {}))
         self._observe_gpu_transfer(virtual_engine, event)
         if request.destination == "mixed" and event.state != AsyncKVTransferState.PENDING:
             transfer_key = (virtual_engine, request.request_id)
@@ -2056,6 +2182,9 @@ class Worker(LocalOrDistributedWorkerBase):
                 else:
                     self._host_stats["host_transfer_errors"] += 1
                     self._mark_host_failed(virtual_engine, record)
+        shared = self._poll_shared_gpu_wait(virtual_engine, cache_engine, request.request_id, "window")
+        if shared is not None:
+            event = self._combine_read_events(request.request_id, (event, shared))
         if uses_host_kv_writeback():
             self._complete_host_write(virtual_engine, cache_engine, event)
         return event
@@ -2090,6 +2219,15 @@ class Worker(LocalOrDistributedWorkerBase):
                            cache_engine: CacheEngine,
                            request_id: str,
                            poll_kind: str = "ordinary") -> AsyncKVTransferEvent:
+        children = self._gpu_transfer_children.get((virtual_engine, request_id))
+        if children is not None:
+            event = self._combine_read_events(request_id, tuple(
+                self._poll_gpu_transfer(virtual_engine, cache_engine, child, poll_kind)
+                for child in children))
+            if event.state != AsyncKVTransferState.PENDING:
+                self._gpu_transfer_children.pop((virtual_engine, request_id))
+                self._gpu_completed_transfer_events[virtual_engine, request_id] = event
+            return event
         shared_event = self._poll_shared_gpu_wait(
             virtual_engine, cache_engine, request_id, poll_kind)
         if (virtual_engine, request_id) in self._host_async_kv_transfers:
@@ -2154,12 +2292,46 @@ class Worker(LocalOrDistributedWorkerBase):
             (virtual_engine, request_id))
         if identities is None:
             return None
+        waiting_host = [identity for identity in identities
+                        if (entry := self._gpu_shared_blocks.get(identity)) is not None
+                        and entry.state == AsyncKVTransferState.PENDING
+                        and entry.host_key is not None and entry.h2d_event is None]
+        if any(not self._host_kv_directory.ready(self._gpu_shared_blocks[i].host_key, (i[2],))
+               for i in waiting_host):
+            self._poll_host_transfers(virtual_engine)
+        copies = {}
+        for identity in waiting_host:
+            entry = self._gpu_shared_blocks[identity]
+            if entry.h2d_event is not None:
+                continue
+            if self._host_kv_directory.ready(entry.host_key, (identity[2],)):
+                copies.setdefault((entry.producer_seq_group_id, identity[2]), []).append(
+                    (identity[3], entry.destination))
+            elif not self._host_kv_directory.loading(entry.host_key, identity[2]):
+                entry.state = AsyncKVTransferState.ERROR
+        for (producer, layer), pairs in copies.items():
+            self.copy_host_blocks_to_gpu_async(virtual_engine, producer, layer, pairs,
+                                               reason="prefetch")
         for identity in identities:
             entry = self._gpu_shared_blocks.get(identity)
             if entry is None or entry.state == AsyncKVTransferState.ERROR:
-                return AsyncKVTransferEvent(
-                    request_id, AsyncKVTransferState.ERROR,
-                    error="shared GPU KV producer failed")
+                return AsyncKVTransferEvent(request_id, AsyncKVTransferState.ERROR,
+                                            error="shared GPU/CPU KV producer failed")
+            if entry.host_key is not None and entry.h2d_event is None:
+                continue
+            if entry.state == AsyncKVTransferState.PENDING and entry.h2d_event is not None:
+                try:
+                    completed = entry.h2d_event.query()
+                except Exception as exc:
+                    entry.state = AsyncKVTransferState.ERROR
+                    return AsyncKVTransferEvent(request_id, AsyncKVTransferState.ERROR,
+                                                error=f"shared H2D completion failed: {exc}")
+                if completed:
+                    entry.state = AsyncKVTransferState.READY
+                    for consumer in tuple(entry.references):
+                        self._attach_shared_gpu(virtual_engine, consumer,
+                                                identity[2], identity[3], entry)
+                continue
             if entry.state == AsyncKVTransferState.PENDING:
                 event = self._poll_gpu_transfer(
                     virtual_engine, cache_engine,
@@ -2173,6 +2345,7 @@ class Worker(LocalOrDistributedWorkerBase):
                AsyncKVTransferState.PENDING for identity in identities):
             return AsyncKVTransferEvent(
                 request_id, AsyncKVTransferState.PENDING)
+        self._gpu_shared_waits.pop((virtual_engine, request_id))
         return AsyncKVTransferEvent(
             request_id, AsyncKVTransferState.READY, gpu_ready=True)
 
@@ -2196,7 +2369,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 if shared is None or shared.state != AsyncKVTransferState.READY:
                     continue
                 destination = shared.destination
-                self._set_gpu_resident(key, destination)
+                self._attach_shared_gpu(virtual_engine, seq_group_id,
+                                        layer_index, int(block), shared)
             if self._gpu_destination_owners.get(self._gpu_slot_key(
                     virtual_engine, layer_index, destination)) != key:
                 shared = self._shared_gpu_entry(
@@ -2241,8 +2415,8 @@ class Worker(LocalOrDistributedWorkerBase):
             # ownership must not wait again on the CPU.
             if uses_host_kv_writeback():
                 old_key = self._gpu_destination_owners.pop(owner_key, None)
-                if old_key is not None:
-                    self._pop_gpu_resident(old_key)
+                if old_key is not None and self._gpu_identity(*old_key) != self._gpu_identity(*resident_key):
+                    self._retire_gpu_replica(old_key, int(destination_block))
             else:
                 self._invalidate_gpu_destination(
                     virtual_engine, layer_index, int(destination_block))
@@ -2337,6 +2511,20 @@ class Worker(LocalOrDistributedWorkerBase):
         """Submit KV copies; consumers explicitly arm their ready dependency."""
         submit_started = time.perf_counter()
         cache_engine = self.cache_engine[virtual_engine]
+        copies = []
+        for logical, destination in pairs:
+            shared = self._shared_gpu_entry(virtual_engine, seq_group_id,
+                                            layer_index, logical)
+            if (shared is not None and not (
+                    shared.host_key is not None and shared.h2d_event is None
+                    and shared.producer_seq_group_id == seq_group_id)):
+                self._attach_shared_gpu(virtual_engine, seq_group_id,
+                                        layer_index, logical, shared)
+            else:
+                copies.append((logical, destination))
+        pairs = tuple(copies)
+        if not pairs:
+            return None
         logical_blocks = tuple(source for source, _ in pairs)
         forward = self._backing_forward.get((virtual_engine, seq_group_id)) if (
             envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE) else None
@@ -2379,8 +2567,16 @@ class Worker(LocalOrDistributedWorkerBase):
             host_pairs.append((source, destination))
         mapping = torch.tensor(host_pairs, dtype=torch.int64,
                                device="cpu").view(-1, 2)
-        ready_event = cache_engine.copy_host_blocks_to_gpu_async(
-            layer_index, mapping, release_events)
+        try:
+            ready_event = cache_engine.copy_host_blocks_to_gpu_async(
+                layer_index, mapping, release_events)
+        except Exception:
+            for logical, host_key in host_keys.items():
+                self._host_kv_directory.finish_use(host_key)
+                shared = self._shared_gpu_entry(virtual_engine, seq_group_id, layer_index, logical)
+                if shared is not None:
+                    shared.state = AsyncKVTransferState.ERROR
+            raise
         self._host_stats["host_gpu_submit_count"] += 1
         self._host_stats["host_gpu_copy_blocks"] += len(pairs)
         block_bytes = (CacheEngine.get_cache_block_size(
@@ -2393,12 +2589,23 @@ class Worker(LocalOrDistributedWorkerBase):
             key = (virtual_engine, seq_group_id, layer_index, int(logical_block))
             slot = self._gpu_slot_key(virtual_engine, layer_index, destination)
             old = self._gpu_destination_owners.pop(slot, None)
-            if old is not None:
-                self._pop_gpu_resident(old)
+            if old is not None and self._gpu_identity(*old) != self._gpu_identity(*key):
+                self._retire_gpu_replica(old, destination)
             self._gpu_destination_owners[slot] = key
             self._pending_h2d_transfers[key] = _PendingHostCopy(
                 destination, ready_event, reason == "prefetch",
                 host_keys[logical_block])
+            if (self._uses_bounded_slots() and (
+                    self._shared_gpu_entry(virtual_engine, seq_group_id, layer_index, logical_block) is not None
+                    or logical_block < self._host_request_prefix_limits.get((virtual_engine, seq_group_id), 0))):
+                identity = self._gpu_identity(virtual_engine, seq_group_id,
+                                              layer_index, logical_block)
+                entry = self._gpu_shared_blocks.get(identity)
+                if entry is None:
+                    entry = _SharedGPUBlock(destination, "", seq_group_id,
+                                            references={seq_group_id})
+                    self._gpu_shared_blocks[identity] = entry
+                entry.h2d_event = ready_event
         if reason == "prefetch":
             self._host_stats["host_gpu_prefetch_blocks"] += len(logical_blocks)
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
@@ -2421,7 +2628,13 @@ class Worker(LocalOrDistributedWorkerBase):
             if pending is None:
                 continue
             slot = self._gpu_slot_key(virtual_engine, layer_index, pending.destination)
-            if self._gpu_destination_owners.get(slot) != key:
+            shared = self._shared_gpu_entry(virtual_engine, request_id,
+                                            layer_index, block, pending.destination)
+            if shared is not None and shared.state == AsyncKVTransferState.ERROR:
+                raise RuntimeError("shared GPU KV producer failed")
+            if shared is not None and shared.h2d_event is not pending.event:
+                raise RuntimeError("pending host copy belongs to an old GPU generation")
+            if self._gpu_destination_owners.get(slot) != key and shared is None:
                 raise RuntimeError("pending host copy lost its physical owner")
             if (self._gpu_resident_blocks.get(key[:3], {}).get(key[3])
                     == pending.destination):
@@ -2439,6 +2652,10 @@ class Worker(LocalOrDistributedWorkerBase):
                     pending.host_key)
         self._mark_gpu_blocks_ready(virtual_engine, request_id, layer_index,
                                    ready_blocks, mapping)
+        for block in ready_blocks:
+            shared = self._shared_gpu_entry(virtual_engine, request_id, layer_index, block)
+            if shared is not None:
+                shared.state = AsyncKVTransferState.READY
 
     def update_sparse_restore_prediction(self, request_id: str, feedback) -> bool:
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
@@ -2994,6 +3211,7 @@ class Worker(LocalOrDistributedWorkerBase):
         table = self._layer_block_table(virtual_engine, request_id, layer_index, count)
         self._restore_backing_blocks(virtual_engine, request_id, layer_index,
                                      table, actual.history_blocks)
+        table = self._layer_block_table(virtual_engine, request_id, layer_index, count)
         physical = torch.tensor([table], dtype=torch.int32, device=query.device)
         slots = torch.tensor(
             [table[token // size] * size + token % size
@@ -3142,9 +3360,6 @@ class Worker(LocalOrDistributedWorkerBase):
                     virtual_engine, layer_index, table[block])
                 if fence is not None:
                     stream.wait_event(fence)
-                if self._uses_bounded_slots():
-                    self._pending_h2d_transfers.pop(
-                        (virtual_engine, request_id, layer_index, block), None)
 
     def _restore_backing_blocks(self, virtual_engine: int, request_id: str,
                                 layer_index: int, table: Sequence[int],

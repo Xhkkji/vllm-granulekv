@@ -183,8 +183,39 @@ def test_sampling_rows_cannot_be_assigned_to_the_other_request():
                             query_lens=[3, 1], seq_lens=[34, 18], attn_metadata=metadata,
                             input_positions=torch.tensor([31, 32, 33, 17]),
                             input_tokens=torch.tensor([7, 8, 9, 10]),
-                            sampling_metadata=SimpleNamespace(selected_token_indices=torch.tensor([2, 3])))
+                            sampling_metadata=SimpleNamespace(selected_token_indices=torch.tensor([2, 3]),
+                                seq_groups=[SimpleNamespace(seq_ids=[1], prompt_logprob_indices=[], do_sample=True, sample_indices=[0]),
+                                            SimpleNamespace(seq_ids=[0], prompt_logprob_indices=[], do_sample=True, sample_indices=[1])]))
     assert reference.begin_forward(frame)['sampling_indices'] == [2, 3]
     frame.sampling_metadata.selected_token_indices = torch.tensor([3, 2])
     with pytest.raises(ValueError, match='sampling rows'):
         reference.begin_forward(frame)
+
+
+def test_chunked_prefill_only_sampling_requests_have_logits_rows():
+    from types import SimpleNamespace as NS
+    from evaluation.multi_request_sparse.validation import BatchReference
+    reference = BatchReference.__new__(BatchReference)
+    reference.frames, reference.immutable = [], {}
+    groups = [NS(seq_ids=[0], prompt_logprob_indices=[], do_sample=False, sample_indices=[]),
+              NS(seq_ids=[1], prompt_logprob_indices=[], do_sample=True, sample_indices=[0])]
+    frame = NS(request_ids_to_seq_ids={'populate-0': [0], 'decode-1': [1]},
+               query_lens=[3, 1], seq_lens=[34, 18],
+               attn_metadata=NS(num_prefills=1, num_prefill_tokens=3, num_decode_tokens=1),
+               input_positions=torch.tensor([31, 32, 33, 17]), input_tokens=torch.tensor([7, 8, 9, 10]),
+               sampling_metadata=NS(selected_token_indices=torch.tensor([3]), seq_groups=groups))
+    assert reference.begin_forward(frame)['sampling_indices'] == [3]
+    frame.sampling_metadata.selected_token_indices = torch.tensor([2, 3])
+    with pytest.raises(ValueError, match='sampling rows'):
+        reference.begin_forward(frame)
+    groups[1].do_sample = False
+    frame.sampling_metadata.selected_token_indices = torch.tensor([], dtype=torch.int64)
+    assert reference.begin_forward(frame)['sampling_indices'] == []
+
+
+def test_nonfinite_model_kv_is_not_misclassified_as_transfer_corruption():
+    kc, vc, table, logical = packed_fixture()
+    logical[0][32, 0, 0] = float('nan')
+    kc[3, 0, 0, 0, 0] = float('nan')
+    with pytest.raises(ValueError, match='non-finite KV'):
+        check_cache_contents(kc, vc, table, [0, 1, 2], 33, logical)
