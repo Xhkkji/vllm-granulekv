@@ -111,9 +111,8 @@ class SharedHostKVDirectory:
 
     def _allocate_slot(self) -> int:
         if len(self._slots) < self.capacity:
-            for slot in range(self.capacity):
-                if slot not in self._slots:
-                    return slot
+            # Slots stay contiguous until full; eviction reuses its victim slot.
+            return len(self._slots)
         candidates = ((entry.last_access, key, entry)
                       for key, entry in self._entries.items()
                       if not entry.owners and entry.in_flight == 0

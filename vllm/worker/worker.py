@@ -1060,10 +1060,13 @@ class Worker(LocalOrDistributedWorkerBase):
         return events
 
     def _poll_host_cache_uses(self, virtual_engine: int) -> None:
+        completed = {}
         for key, pending in tuple(self._pending_h2d_transfers.items()):
             if key[0] != virtual_engine or pending.host_key is None:
                 continue
-            if pending.event.query():
+            if id(pending.event) not in completed:
+                completed[id(pending.event)] = pending.event.query()
+            if completed[id(pending.event)]:
                 self._host_kv_directory.finish_use(pending.host_key)
                 self._pending_h2d_transfers[key] = _PendingHostCopy(
                     pending.destination, pending.event, pending.prefetched)

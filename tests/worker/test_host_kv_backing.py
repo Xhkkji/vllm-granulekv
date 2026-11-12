@@ -1997,3 +1997,38 @@ def test_backup_keeps_sparse_holes_order_dirty_and_dma_refs(worker, monkeypatch)
     assert all(directory._entries[key].in_flight == 0 for key in expected_keys)
     assert directory._entries[worker._host_cache_key(0, 'r', 3)].in_flight == 1
     assert not worker._pending_gpu_to_host
+
+
+def test_h2d_poll_queries_each_event_once_and_releases_each_source(worker):
+    class CountedFence(Fence):
+        calls = 0
+
+        def query(self):
+            self.calls += 1
+            return super().query()
+
+    directory = worker._host_kv_directory = SharedHostKVDirectory(3)
+    delayed, ready = CountedFence(), CountedFence(ready=True)
+    for block, event in enumerate((delayed, delayed, ready)):
+        host_key = ("prefix", block)
+        directory.acquire(host_key, (0, "producer"))
+        directory.acquire(host_key, (0, "consumer"))
+        directory.begin_use(host_key)
+        worker._pending_h2d_transfers[0, "producer", 0, block] = (
+            module._PendingHostCopy(block, event, True, host_key))
+        # Shared waiters own no additional CPU source reference.
+        worker._pending_h2d_transfers[0, "consumer", 0, block] = (
+            module._PendingHostCopy(block, event, True))
+    directory.release_owner((0, "producer"))
+    worker._poll_host_cache_uses(0)
+    assert (delayed.calls, ready.calls) == (1, 1)
+    assert [directory._entries["prefix", b].in_flight for b in range(3)] == [1, 1, 0]
+    delayed.ready = True
+    worker._poll_host_cache_uses(0)
+    worker._poll_host_cache_uses(0)
+    assert (delayed.calls, ready.calls) == (2, 1)
+    assert all(entry.in_flight == 0 for entry in directory._entries.values())
+    assert all(copy.host_key is None for copy in worker._pending_h2d_transfers.values())
+    assert all(entry.owners == {(0, "consumer")} for entry in directory._entries.values())
+    directory.release_owner((0, "consumer"))
+    assert directory.acquire(("replacement", 0), (0, "next")) == 2

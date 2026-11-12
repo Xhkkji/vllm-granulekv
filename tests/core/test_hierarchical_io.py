@@ -1058,3 +1058,36 @@ def test_prediction_catalog_is_read_only_and_not_expanded():
     after = runtime.prediction_state(('seq-correction',), 0)
     assert before.correction_catalog[8191] == after.correction_catalog[8191]
     assert before.resident_prefix_blocks == after.resident_prefix_blocks
+
+
+@pytest.mark.parametrize("count", [2048, 8192])
+def test_host_initial_allocation_has_linear_slot_work(count):
+    class CountedSlots(dict):
+        probes = 0
+        writes = 0
+
+        def __contains__(self, key):
+            self.probes += 1
+            return super().__contains__(key)
+
+        def __setitem__(self, key, value):
+            self.writes += 1
+            return super().__setitem__(key, value)
+
+    directory = SharedHostKVDirectory(count)
+    directory._slots = CountedSlots()
+    owner = (0, "first")
+    for block in range(count):
+        assert directory.acquire(("prefix", block), owner) == block
+    assert directory._slots.probes <= count
+    assert directory._slots.writes == count
+    with pytest.raises(RuntimeError, match="no evictable slot"):
+        directory.acquire(("new", 0), (0, "next"))
+    directory.release_owner(owner)
+    directory.begin_load(("prefix", 0), (0,))
+    directory.begin_use(("prefix", 1))
+    assert directory.acquire(("new", 0), (0, "next")) == 2
+    directory.finish_load(("prefix", 0), (0,), success=True)
+    directory.finish_use(("prefix", 1))
+    assert set(directory._slots) == set(range(count))
+    assert directory.acquire(("prefix", 0), (0, "shared")) == 0
