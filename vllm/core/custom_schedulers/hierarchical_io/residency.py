@@ -11,6 +11,7 @@ Worker-local runtime 中，不改变 vLLM 原生 block table。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from vllm.core.block_reservation import BlockMapping, LogicalBlockKey
@@ -162,10 +163,9 @@ class SparseKVLayerPredictionState:
     num_prefix_blocks: int
     predicted_prefix_blocks: Tuple[int, ...]
     resident_prefix_blocks: Tuple[int, ...]
-    # Prefix-indexed (GPU physical block, SSD logical block) pairs. A negative
-    # pair denotes a block already owned by the resident allocation and is not
-    # a valid correction source.
-    correction_mapping_by_logical: Tuple[Tuple[int, int], ...]
+    # Read-only view of the existing correction catalog; absent entries denote
+    # resident allocations without an SSD correction source.
+    correction_catalog: Mapping[int, Tuple[Tuple[int, int], LogicalBlockKey]]
 
 
 @dataclass(frozen=True)
@@ -430,10 +430,7 @@ class PrefetchResidencyDirectory:
                 sorted(plan.predicted_by_layer[layer_index])),
             resident_prefix_blocks=tuple(
                 sorted(plan.resident_by_layer[layer_index])),
-            correction_mapping_by_logical=tuple(
-                tuple(plan.catalog[index][0]) if index in plan.catalog else
-                (-1, -1)
-                for index in range(plan.num_prefix_blocks)),
+            correction_catalog=MappingProxyType(plan.catalog),
         )
 
     def project_correction(

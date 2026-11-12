@@ -1028,3 +1028,33 @@ def test_sparse_consumer_blocks_are_forward_scoped():
     with activate_sparse_kv_blocks((1, 4, 7)):
         assert get_active_sparse_kv_blocks() == (1, 4, 7)
     assert get_active_sparse_kv_blocks() is None
+
+
+def test_prediction_catalog_is_read_only_and_not_expanded():
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    request = _correction_prefetch_request(0, first=True)
+    runtime.submit_or_stage(
+        0, request, request.block_mapping,
+        lambda current, mapping: AsyncKVTransferEvent(
+            current.request_id, AsyncKVTransferState.PENDING))
+    plan = runtime.residency._correction_plans[request.prefetch_plan_id]
+
+    class LookupOnly(dict):
+        def __iter__(self):
+            pytest.fail('prediction must not iterate the full catalog')
+
+        def __contains__(self, key):
+            pytest.fail('prediction must not enumerate the prefix index space')
+
+    plan.catalog = LookupOnly(plan.catalog)
+    plan.num_prefix_blocks = 8192
+    before = runtime.prediction_state(('seq-correction',), 0)
+    assert len(before.correction_catalog) == len(plan.catalog)
+    logical, value = next(iter(dict.items(plan.catalog)))
+    assert before.correction_catalog[logical] is value
+    with pytest.raises(TypeError):
+        before.correction_catalog[logical] = value
+    plan.catalog[8191] = ((700, 800), LogicalBlockKey(0, 8191))
+    after = runtime.prediction_state(('seq-correction',), 0)
+    assert before.correction_catalog[8191] == after.correction_catalog[8191]
+    assert before.resident_prefix_blocks == after.resident_prefix_blocks

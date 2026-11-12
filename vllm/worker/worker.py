@@ -1091,13 +1091,15 @@ class Worker(LocalOrDistributedWorkerBase):
         """Preserve GPU-only and newly computed KV before physical reuse."""
         cache_engine = self.cache_engine[virtual_engine]
         self._poll_gpu_to_host_backing(virtual_engine)
+        bounded_slots = self._uses_bounded_slots()
         for request_id in request_ids:
             forward = self._backing_forward.get((virtual_engine, request_id))
             if forward is None:
                 continue
-            table, computed, end, _ = forward
-            table = self._layer_block_table(virtual_engine, request_id,
-                                            layer_index, len(table))
+            forward_table, computed, end, _ = forward
+            prefix = (virtual_engine, request_id, layer_index)
+            table = (self._gpu_slot_mappings.get(prefix, {})
+                     if bounded_slots else forward_table)
             # Dirty token ranges come from scheduler CPU metadata, never a
             # CUDA .tolist().  Full-block copies also preserve partial tails.
             dirty = range(computed // self.cache_config.block_size,
@@ -1106,6 +1108,7 @@ class Worker(LocalOrDistributedWorkerBase):
             self._mark_gpu_blocks_ready(
                 virtual_engine, request_id, layer_index, tuple(dirty),
                 tuple((block, table[block]) for block in dirty))
+            resident = self._gpu_resident_blocks.get(prefix, {})
             candidates = {}
             from vllm.core.custom_schedulers.hierarchical_io.barrier import get_active_sparse_kv_selections
             selections = get_active_sparse_kv_selections()
@@ -1115,24 +1118,22 @@ class Worker(LocalOrDistributedWorkerBase):
             if not envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
                 candidate_blocks = dirty
             elif consumed is None:
-                candidate_blocks = range(len(table))
+                candidate_blocks = range(len(forward_table))
             else:
                 state = self._prefetch_runtime.prediction_state(
                     (request_id,), layer_index)
                 # Unused first-window predictions may still lack host backing.
                 predicted = () if state is None else state.predicted_prefix_blocks
-                resident = self._gpu_resident_blocks.get(
-                    (virtual_engine, request_id, layer_index), {})
                 candidate_blocks = sorted(set(consumed).union(dirty, predicted, resident))
             for block in candidate_blocks:
-                destination = table[block]
-                prefix = (virtual_engine, request_id, layer_index)
+                destination = (table.get(block, -1) if bounded_slots
+                               else table[block])
                 key = (*prefix, block)
                 owner = self._gpu_destination_owners.get(
                     self._gpu_slot_key(virtual_engine, layer_index, destination))
                 shared = self._shared_gpu_entry(
                     virtual_engine, request_id, layer_index, block, destination)
-                if (self._gpu_resident_blocks.get(prefix, {}).get(block) == destination
+                if (resident.get(block) == destination
                         and (owner == key or (shared is not None
                                               and shared.state == AsyncKVTransferState.READY))):
                     candidates[key] = destination
@@ -1389,6 +1390,13 @@ class Worker(LocalOrDistributedWorkerBase):
             self._bind_gpu_slot(prefix, block, destination)
             accepted.append(block)
         return tuple(accepted)
+
+    def _layer_block_mapping(self, virtual_engine: int, request_id: str,
+                             layer_index: int) -> Mapping[int, int] | Sequence[int]:
+        if self._uses_bounded_slots():
+            return self._gpu_slot_mappings.get(
+                (virtual_engine, request_id, layer_index), {})
+        return self._backing_forward[virtual_engine, request_id][0]
 
     def _layer_block_table(self, virtual_engine: int, request_id: str,
                             layer_index: int, length: int) -> Tuple[int, ...]:
@@ -2531,9 +2539,8 @@ class Worker(LocalOrDistributedWorkerBase):
         logical_blocks = tuple(source for source, _ in pairs)
         forward = self._backing_forward.get((virtual_engine, seq_group_id)) if (
             envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE) else None
-        table = (self._layer_block_table(virtual_engine, seq_group_id, layer_index,
-                                         len(forward[0])) if forward is not None
-                 else None)
+        table = (self._layer_block_mapping(virtual_engine, seq_group_id, layer_index)
+                 if forward is not None else None)
         for logical, destination in pairs:
             if (self._uses_bounded_slots() and self._gpu_slot_mappings.get(
                     (virtual_engine, seq_group_id, layer_index), {}).get(
@@ -2705,8 +2712,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 blocks = self._reserve_gpu_slots(
                     virtual_engine, state.seq_group_id, layer_index, blocks,
                     prediction=True)
-                table = self._layer_block_table(virtual_engine, state.seq_group_id,
-                                                layer_index, len(table))
+                table = self._layer_block_mapping(virtual_engine, state.seq_group_id,
+                                                  layer_index)
             if not blocks:
                 return
             mapping = tuple((block, table[block]) for block in blocks)
@@ -2793,38 +2800,32 @@ class Worker(LocalOrDistributedWorkerBase):
         self._backing_retired.difference_update((virtual_engine, rid) for rid in finished)
         for request_id in finished:
             self._release_shared_gpu_request(virtual_engine, request_id)
-            self._host_prefetch_windows.pop((virtual_engine, request_id), None)
             self._host_kv_directory.release_owner((virtual_engine, request_id))
             self._host_request_prefix_keys.pop(
                 (virtual_engine, request_id), None)
             self._host_request_prefix_limits.pop(
                 (virtual_engine, request_id), None)
         if self._uses_bounded_slots():
-            for request_id in finished:
-                for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
+            for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
+                released_slots = set()
+                for request_id in finished:
                     prefix = (virtual_engine, request_id, layer_index)
-                    mappings = self._gpu_slot_mappings.pop(prefix, {})
-                    occupied = self._gpu_reserved_slots.get(
-                        (virtual_engine, layer_index), set())
-                    for destination in mappings.values():
-                        if not any(destination in other.values()
-                                   for other_prefix, other in
-                                   self._gpu_slot_mappings.items()
-                                   if other_prefix[0] == virtual_engine
-                                   and other_prefix[2] == layer_index):
-                            occupied.discard(destination)
+                    released_slots.update(self._gpu_slot_mappings.pop(prefix, {}).values())
                     self._gpu_required_blocks.pop(prefix, None)
+                if released_slots:
+                    remaining_slots = {
+                        destination
+                        for prefix, mappings in self._gpu_slot_mappings.items()
+                        if prefix[0] == virtual_engine and prefix[2] == layer_index
+                        for destination in mappings.values()}
+                    self._gpu_reserved_slots.get((virtual_engine, layer_index), set()).difference_update(
+                        released_slots - remaining_slots)
         if uses_host_kv_writeback():
             for item in finished:
                 self._backing_forward.pop((virtual_engine, item), None)
         for key, record in tuple(self._host_async_kv_transfers.items()):
             if key[0] == virtual_engine and record[1] in finished:
                 self._discarded_host_transfers.add(key)
-        for collection in (self._host_ready_blocks, self._host_failed_blocks,
-                           self._host_staged_blocks):
-            collection.difference_update({
-                item for item in collection
-                if item[0] == virtual_engine and item[1] in finished})
         for key in tuple(self._pending_h2d_transfers):
             if key[0] == virtual_engine and key[1] in finished:
                 pending = self._pending_h2d_transfers[key]
@@ -2836,15 +2837,6 @@ class Worker(LocalOrDistributedWorkerBase):
                     pending = self._pending_h2d_transfers.pop(key, None)
                     if pending is not None and pending.host_key is not None:
                         self._host_kv_directory.finish_use(pending.host_key)
-        for request_id in finished:
-            for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
-                prefix = (virtual_engine, request_id, layer_index)
-                for logical_block, destination in self._gpu_resident_blocks.pop(
-                        prefix, {}).items():
-                    owner = (*prefix, logical_block)
-                    owner_key = self._gpu_slot_key(virtual_engine, layer_index, destination)
-                    if self._gpu_destination_owners.get(owner_key) == owner:
-                        self._gpu_destination_owners.pop(owner_key)
         for key in tuple(self._gpu_pending_transfers):
             if (key[0] == virtual_engine
                     and self._gpu_pending_transfers[key][0] in finished):
@@ -3001,8 +2993,9 @@ class Worker(LocalOrDistributedWorkerBase):
             envs.VLLM_GRANULEKV_SPARSE_GPU_RESIDENCY_REUSE_ENABLE)
         baseline_gpu_blocks = {
             block for block in state.resident_prefix_blocks
-            if (0 <= block < len(state.correction_mapping_by_logical)
-                and state.correction_mapping_by_logical[block][0] < 0)
+            if (0 <= block < state.num_prefix_blocks
+                and (block not in state.correction_catalog
+                     or state.correction_catalog[block][0][0] < 0))
         }
         gpu_ready_blocks = set(baseline_gpu_blocks)
         if envs.VLLM_GRANULEKV_HOST_BACKING_ENABLE:
@@ -3060,7 +3053,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     self._host_stats["cpu_to_gpu_bytes"] += (
                         len(ready_blocks) * layer_block_bytes)
                     host_to_gpu = tuple(
-                        (block, state.correction_mapping_by_logical[block][1])
+                        (block, state.correction_catalog[block][0][1])
                         for block in ready_blocks)
                     if envs.VLLM_GRANULEKV_HOST_TO_GPU_ASYNC_PREFETCH_ENABLE:
                         self.copy_host_blocks_to_gpu_async(
@@ -3073,7 +3066,7 @@ class Worker(LocalOrDistributedWorkerBase):
                             for block in ready_blocks:
                                 self._prepare_gpu_region_reuse(
                                     virtual_engine, layer_index,
-                                    state.correction_mapping_by_logical[block][1])
+                                    state.correction_catalog[block][0][1])
                         self.copy_host_blocks_to_gpu(
                             virtual_engine, state.seq_group_id, layer_index,
                             torch.tensor(
@@ -3211,7 +3204,7 @@ class Worker(LocalOrDistributedWorkerBase):
         current = tuple(range(computed // size, count))
         working = tuple(sorted(set(actual.history_blocks).union(current)))
         self._reserve_gpu_slots(virtual_engine, request_id, layer_index, working)
-        table = self._layer_block_table(virtual_engine, request_id, layer_index, count)
+        table = self._layer_block_mapping(virtual_engine, request_id, layer_index)
         self._restore_backing_blocks(virtual_engine, request_id, layer_index,
                                      table, actual.history_blocks)
         table = self._layer_block_table(virtual_engine, request_id, layer_index, count)
@@ -3337,8 +3330,8 @@ class Worker(LocalOrDistributedWorkerBase):
                                       (end + block_size - 1) // block_size))
                 self._gpu_required_blocks[virtual_engine, request_id, layer_index] = set(current)
                 self._reserve_gpu_slots(virtual_engine, request_id, layer_index, current)
-                table = self._layer_block_table(virtual_engine, request_id,
-                                                layer_index, len(table))
+                table = self._layer_block_mapping(virtual_engine, request_id,
+                                                  layer_index)
             # Sparse attention resolves its history after the query exists.
             # Only an existing partial tail needs preservation before writes.
             first = (0 if is_prompt and end - computed > 1 else
@@ -3365,7 +3358,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     stream.wait_event(fence)
 
     def _restore_backing_blocks(self, virtual_engine: int, request_id: str,
-                                layer_index: int, table: Sequence[int],
+                                layer_index: int, table: Mapping[int, int] | Sequence[int],
                                 blocks: Sequence[int], *, reason: str = "actual") -> None:
         self._consume_host_copies(virtual_engine, request_id, layer_index, blocks)
         hits = set(self.gpu_blocks_ready(

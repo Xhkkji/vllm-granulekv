@@ -1029,7 +1029,8 @@ def test_correction_restores_only_selected_history_not_whole_suffix(worker, monk
     state = SimpleNamespace(seq_group_id="r", num_prefix_blocks=2,
                             resident_prefix_blocks=(0, 1),
                             predicted_prefix_blocks=(0, 1),
-                            correction_mapping_by_logical=((-1, 8), (-1, 9)))
+                            correction_catalog={0: ((-1, 8), LogicalBlockKey(0, 0)),
+                                                1: ((-1, 9), LogicalBlockKey(0, 1))})
     worker._prefetch_runtime = SimpleNamespace(
         prediction_state=lambda *args: state, layer_gpu_ready=lambda *args: True)
     table = tuple(range(8, 15))
@@ -1859,3 +1860,140 @@ def test_host_membership_work_is_linear(worker, monkeypatch, size, state):
         expected = tuple(key for key in keys if partial and key[1] % 2)
         assert worker._host_transfer_pending_cache_keys.get((0, "read"), ()) == expected
         assert sum(operations.values()) <= 8 * size
+
+
+@pytest.mark.parametrize('order', [('a', 'b'), ('b', 'a')])
+def test_cleanup_collects_remaining_slots_once_per_layer(worker, monkeypatch, order):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    visits = defaultdict(int)
+
+    class CountedMapping(dict):
+        def values(self):
+            visits['values'] += 1
+            return super().values()
+
+    for layer in (0, 1):
+        for rid, mappings in (
+                ('a', {i: 2 * i for i in range(64)}),
+                ('b', {i: 2 * i for i in range(32)} | {100: 129})):
+            worker._gpu_slot_mappings[0, rid, layer] = CountedMapping(mappings)
+        worker._gpu_reserved_slots[0, layer] = set(range(0, 128, 2)) | {129}
+    # Another engine must neither retain nor lose this engine's slots.
+    worker._gpu_slot_mappings[1, 'other', 0] = CountedMapping({0: 126})
+    worker._gpu_reserved_slots[1, 0] = {126}
+    first, last = order
+    worker._forget_host_staging(0, (first,))
+    assert visits['values'] == 4
+    for layer in (0, 1):
+        assert worker._gpu_reserved_slots[0, layer] == set(
+            dict.values(worker._gpu_slot_mappings[0, last, layer]))
+    visits.clear()
+    worker._forget_host_staging(0, (last,))
+    assert visits['values'] == 2
+    assert all(not worker._gpu_reserved_slots[0, layer] for layer in (0, 1))
+    assert worker._gpu_reserved_slots[1, 0] == {126}
+
+
+@pytest.mark.parametrize('order', [('a', 'b'), ('b', 'a')])
+def test_correction_builds_table_after_shared_rebind_only(worker, monkeypatch, order):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 16
+    worker._prefetch_runtime.prediction_state = lambda *args: None
+    monkeypatch.setattr(module, 'select_actual_sparse_blocks_device',
+                        lambda *args: SimpleNamespace(history_blocks=(0, 2), attention=None))
+    table_calls = []
+    original_table = worker._layer_block_table
+
+    def build(ve, rid, layer, count):
+        table_calls.append((rid, layer))
+        return original_table(ve, rid, layer, count)
+
+    monkeypatch.setattr(worker, '_layer_block_table', build)
+
+    def restore(ve, rid, layer, mapping, blocks):
+        assert mapping is worker._gpu_slot_mappings[ve, rid, layer]
+        assert blocks == (0, 2)
+        # Simulate the existing READY/LOADING binding replacing provisional
+        # read slots, leaving the request's write slot private.
+        mapping[0], mapping[2] = 10 + layer, 12 + layer
+
+    monkeypatch.setattr(worker, '_restore_backing_blocks', restore)
+    for layer in (0, 1):
+        for rid in order:
+            worker._backing_forward[0, rid] = ((99,) * 4, 48, 49, False)
+            result = worker._correct_bounded_history(
+                0, (rid,), layer, torch.empty((1, 28, 128)))
+            expected = original_table(0, rid, layer, 4)
+            assert expected[1] == -1
+            assert expected[0] == 10 + layer and expected[2] == 12 + layer
+            assert result.block_table.tolist() == [list(expected)]
+            assert result.slot_mapping.tolist() == [expected[3] * 16]
+    assert table_calls == [(rid, layer) for layer in (0, 1) for rid in order]
+
+
+@pytest.mark.parametrize('count', [64, 8192])
+@pytest.mark.parametrize('bounded', [False, True])
+def test_backup_mode_and_resident_lookup_do_not_scale_with_blocks(
+        worker, monkeypatch, count, bounded):
+    calls = defaultdict(int)
+
+    def mode():
+        calls['mode'] += 1
+        return bounded
+
+    class ResidentDirectory(dict):
+        def get(self, key, default=None):
+            calls['resident'] += 1
+            return super().get(key, default)
+
+    monkeypatch.setattr(worker, '_uses_bounded_slots', mode)
+    worker._gpu_resident_blocks = ResidentDirectory()
+    for request in ('a', 'b'):
+        prefix = (0, request, 0)
+        worker._backing_forward[0, request] = (
+            tuple(range(count)), count * 16, count * 16, False)
+        worker._gpu_slot_mappings[prefix] = dict(enumerate(range(count)))
+        worker._gpu_resident_blocks[prefix] = dict(enumerate(range(count)))
+    worker._back_up_layer(0, ('a', 'b'), 0, Fence())
+    assert calls == {'mode': 1, 'resident': 2}
+
+
+def test_backup_keeps_sparse_holes_order_dirty_and_dma_refs(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    directory = SharedHostKVDirectory(8)
+    worker._host_kv_directory = directory
+    # One unmapped hole, non-contiguous physical slots, and a partial dirty tail.
+    worker._backing_forward[0, 'r'] = ((99,) * 5, 64, 65, False)
+    worker._gpu_slot_mappings[0, 'r', 0] = {0: 7, 2: 3, 3: 9, 4: 5}
+    resident = {0: 7, 2: 3, 3: 9}
+    worker._gpu_resident_blocks[0, 'r', 0] = resident
+    for block, slot in resident.items():
+        worker._gpu_destination_owners[0, 0, slot] = (0, 'r', 0, block)
+    # Existing READY and LOADING history must not acquire another writer.
+    for block in (0, 3):
+        key = worker._host_cache_key(0, 'r', block)
+        directory.acquire(key, (0, 'producer'))
+        directory.begin_load(key, (0,))
+    directory.finish_load(worker._host_cache_key(0, 'r', 0), (0,), True)
+    copies = []
+    released, completed = Fence(True), Fence()
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, events:
+        copies.append((layer, mapping.tolist(), events)) or completed)
+    worker._back_up_layer(0, ('r',), 0, released)
+    assert worker._gpu_resident_blocks[0, 'r', 0] is resident
+    assert resident[4] == 5  # The cached reference includes dirty publication.
+    expected_keys = [worker._host_cache_key(0, 'r', b) for b in (2, 4)]
+    assert copies == [(0, [[3, directory.lookup(expected_keys[0])],
+                           [5, directory.lookup(expected_keys[1])]], (released,))]
+    assert list(worker._pending_gpu_to_host) == [(0, 'r', 0, 2), (0, 'r', 0, 4)]
+    assert (0, 0, -1) not in worker._gpu_region_release_events
+    assert worker._gpu_region_release_events[0, 0, 7] == ('r', released)
+    for key in expected_keys:
+        assert directory._entries[key].in_flight == 1
+        assert directory._entries[key].owners == {(0, 'r')}
+    completed.ready = True
+    worker._poll_gpu_to_host_backing(0)
+    assert all(directory._entries[key].in_flight == 0 for key in expected_keys)
+    assert directory._entries[worker._host_cache_key(0, 'r', 3)].in_flight == 1
+    assert not worker._pending_gpu_to_host
