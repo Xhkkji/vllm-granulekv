@@ -33,6 +33,8 @@ class SparseKVLayerSelection:
     device_selection_required: bool = False
     block_table: Optional[Any] = None
     slot_mapping: Optional[Any] = None
+    # Compact CPU read row and original write slots, uploaded together by backend.
+    compact_kv_length: Optional[int] = None
 
 
 @dataclass(frozen=True)

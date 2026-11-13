@@ -1010,6 +1010,51 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         self.attn_type = attn_type
 
+    def _forward_compact_sparse(self, layer, query, key, value, kv_cache,
+                                attn_metadata, selections):
+        """Read sparse history as a batched packed sequence; writes stay absolute."""
+        ids = get_active_layer_request_ids()
+        rows = [selections[rid] for rid in ids]
+        if (query.dtype != torch.float16 or self.alibi_slopes is not None
+                or self.attn_type != AttentionType.DECODER
+                or attn_metadata.use_cuda_graph
+                or any(row.query_len != 1 for row in attn_metadata._sparse_request_metadata)):
+            raise ValueError("compact sparse attention requires FP16 single-query decoder rows without ALiBi or CUDA Graph")
+        width = max(len(row.block_indices) for row in rows)
+        tables = torch.tensor([
+            (*row.block_table[0], *((0,) * (width - len(row.block_indices))))
+            for row in rows], dtype=torch.int32, device=query.device)
+        lengths = [row.compact_kv_length for row in rows]
+        lens = torch.tensor(lengths, dtype=torch.int32, device=query.device)
+        slots = torch.tensor([row.slot_mapping[0] for row in rows],
+                             dtype=torch.int64, device=query.device)
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size)
+        PagedAttention.write_to_paged_cache(
+            key.view(-1, self.num_kv_heads, self.head_size),
+            value.view(-1, self.num_kv_heads, self.head_size),
+            key_cache, value_cache, slots, self.kv_cache_dtype,
+            layer._k_scale, layer._v_scale)
+        output = PagedAttention.forward_decode(
+            query.view(-1, self.num_heads, self.head_size), key_cache,
+            value_cache, tables, lens, max(lengths), self.kv_cache_dtype,
+            self.num_kv_heads, self.scale, None, layer._k_scale, layer._v_scale)
+        if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off":
+            policy = get_sparse_kv_policy()
+            layer_index = self._layer_index_from_name(layer.layer_name)
+            for index, (rid, row) in enumerate(zip(ids, rows)):
+                # The numerical recorder uses original logical coordinates.
+                # Materialize this only for validation, never for serving.
+                table = [-1] * (row.block_indices[-1] + 1)
+                for logical, physical in zip(row.block_indices, row.block_table[0]):
+                    table[logical] = physical
+                policy.record_validation_attention(
+                    rid, layer_index, key_cache, value_cache,
+                    torch.tensor([table], dtype=torch.int32, device=query.device),
+                    output[index:index + 1], sequence_length=
+                    attn_metadata._sparse_request_metadata[index].seq_len)
+        return output.view_as(query)
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -1075,10 +1120,15 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         if selections is not None:
             from dataclasses import replace
             from vllm.core.custom_schedulers.hierarchical_io.barrier import (
-                activate_sparse_kv_blocks)
+                activate_sparse_kv_blocks, SparseKVLayerSelection)
             request_metadata = attn_metadata._sparse_request_metadata
             if request_metadata is None:
                 raise RuntimeError("bounded sparse attention metadata was not prepared")
+            if all(isinstance(selection, SparseKVLayerSelection)
+                   and selection.compact_kv_length is not None
+                   for selection in selections.values()):
+                return self._forward_compact_sparse(
+                    layer, query, key, value, kv_cache, attn_metadata, selections)
             result = torch.empty_like(query)
             for index, request_id in enumerate(get_active_layer_request_ids()):
                 row_metadata = request_metadata[index]

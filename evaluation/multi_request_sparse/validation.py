@@ -249,6 +249,31 @@ class BatchReference:
                 get_active_sparse_kv_device_selection)
             from vllm.attention.ops.paged_attn import PagedAttention
             ids = get_active_layer_request_ids()
+            selections = get_active_sparse_kv_selections()
+            if (not self.reference_active and selections is not None
+                    and all(rid.startswith('batch-') for rid in ids)
+                    and all(selection.compact_kv_length is not None
+                            for selection in selections.values())):
+                from vllm.core.custom_schedulers.hierarchical_io.barrier import (
+                    activate_sparse_kv_blocks, SparseKVLayerSelection)
+                output = original(layer, query, key, value, cache, metadata, *args, **kwargs)
+                for index, rid in enumerate(ids):
+                    selected = selections[rid]
+                    table = [-1] * (selected.block_indices[-1] + 1)
+                    for logical, physical in zip(selected.block_indices, selected.block_table[0]):
+                        table[logical] = physical
+                    table = torch.tensor([table], device=query.device, dtype=torch.int32)
+                    slots = torch.tensor(selected.slot_mapping, device=query.device, dtype=torch.int64)
+                    row = SparseKVLayerSelection(selected.block_indices,
+                        selected.device_selection, True, table, slots)
+                    interval = self.current['intervals'][rid]
+                    # Check the actual batched result against the independent
+                    # logical source; do not execute a second attention kernel.
+                    check = self._observed_backend(lambda *a, **kw: output[interval])
+                    with activate_sparse_kv_blocks(row, request_id=rid):
+                        check(layer, query[interval], key[interval], value[interval],
+                              cache, metadata)
+                return output
             observe = (not self.reference_active and len(ids) == 1
                        and ids[0].startswith('batch-')
                        and get_active_sparse_kv_selections() is None)

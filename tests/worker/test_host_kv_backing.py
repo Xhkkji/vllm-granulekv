@@ -1940,7 +1940,9 @@ def test_correction_builds_table_after_shared_rebind_only(worker, monkeypatch, o
         # read slots, leaving the request's write slot private.
         mapping[0], mapping[2] = 10 + layer, 12 + layer
 
-    monkeypatch.setattr(worker, '_restore_backing_blocks', restore)
+    monkeypatch.setattr(worker, '_restore_backing_batch',
+                        lambda ve, layer, requests: [restore(ve, rid, layer, *values)
+                            for rid, values in requests.items()])
     for layer in (0, 1):
         for rid in order:
             worker._backing_forward[0, rid] = ((99,) * 4, 48, 49, False)
@@ -1949,9 +1951,9 @@ def test_correction_builds_table_after_shared_rebind_only(worker, monkeypatch, o
             expected = original_table(0, rid, layer, 4)
             assert expected[1] == -1
             assert expected[0] == 10 + layer and expected[2] == 12 + layer
-            assert result.block_table.tolist() == [list(expected)]
-            assert result.slot_mapping.tolist() == [expected[3] * 16]
-    assert table_calls == [(rid, layer) for layer in (0, 1) for rid in order]
+            assert result.block_table == (tuple(expected[b] for b in (0, 2, 3)),)
+            assert result.slot_mapping == (expected[3] * 16,)
+    assert table_calls == []  # No full logical table on the compact read path.
 
 
 @pytest.mark.parametrize('count', [64, 8192])
@@ -2341,3 +2343,82 @@ def test_exit_fence_cleanup_defers_only_request_with_pending_dma(worker):
     assert not worker._pending_h2d_transfers
     assert worker._gpu_region_release_events == {
         (0, 0, 2): ("pending", delayed)}
+
+
+@pytest.mark.parametrize('order', [('a', 'b'), ('b', 'a')])
+def test_batch_selects_before_restore_and_submits_one_h2d(worker, monkeypatch, order):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 4
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    history = ('same-prefix', 0)
+    worker._host_kv_directory.acquire(history, (0, 'source'))
+    worker._host_kv_directory.begin_load(history, (0,))
+    worker._host_kv_directory.finish_load(history, (0,), True)
+    selected, copies, waits = [], [], []
+    event = Fence()
+    for rid in order:
+        worker._host_request_prefix_keys[0, rid] = 'same-prefix'
+        worker._host_request_prefix_limits[0, rid] = 1
+        worker._backing_forward[0, rid] = ((99, 99), 16, 17, False)
+    monkeypatch.setattr(module, 'select_actual_sparse_blocks_device',
+                        lambda rid, *a: selected.append(rid) or
+                        SimpleNamespace(history_blocks=(0,), attention=None))
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: SimpleNamespace(
+        wait_event=lambda e: waits.append(e)))
+    def copy(layer, mapping, fences):
+        assert selected == list(order)
+        copies.append(mapping.tolist())
+        return event
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = copy
+    result = worker._correct_bounded_batch(0, order, 0, torch.empty(2, 28, 128))
+    assert copies == [[[0, 0]]]
+    assert waits == [event]
+    assert result.by_request[order[0]].block_table == ((0, 1),)
+    assert result.by_request[order[1]].block_table == ((0, 2),)
+    assert [result.by_request[r].slot_mapping for r in order] == [(16,), (32,)]
+    assert all(result.by_request[r].compact_kv_length == 17 for r in order)
+    assert worker._gpu_reserved_slots[0, 0] == {0, 1, 2}
+    assert worker._host_kv_directory._entries[history].in_flight == 1
+    worker._forget_host_staging(0, (order[0],))
+    assert worker._gpu_reserved_slots[0, 0] >= {0, 2}
+    event.ready = True
+    worker._poll_host_cache_uses(0)
+    worker._poll_host_cache_uses(0)
+    assert worker._host_kv_directory._entries[history].in_flight == 0
+    worker._forget_host_staging(0, order)
+    assert not worker._gpu_reserved_slots[0, 0]
+
+
+def test_batch_backup_queries_history_once_and_copies_private_tails(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker._host_kv_directory = SharedHostKVDirectory(4)
+    calls, copied = [], []
+    original = worker._host_kv_directory.ready
+    monkeypatch.setattr(worker._host_kv_directory, 'ready',
+                        lambda key, layers: calls.append(key) or original(key, layers))
+    event = Fence()
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, fences: copied.append(mapping.tolist()) or event)
+    for i, rid in enumerate(('a', 'b')):
+        worker._host_request_prefix_keys[0, rid] = 'same'
+        worker._host_request_prefix_limits[0, rid] = 1
+        worker._backing_forward[0, rid] = ((99, 99), 16, 17, False)
+        _set_gpu_slot(worker, (0, rid, 0, 0), 0)
+        _set_gpu_slot(worker, (0, rid, 0, 1), i + 1)
+    entry = module._SharedGPUBlock(0, '', 'a', state=AsyncKVTransferState.READY,
+                                    references={'a', 'b'})
+    worker._gpu_shared_blocks[worker._gpu_identity(0, 'a', 0, 0)] = entry
+    for rid in ('a', 'b'):
+        worker._attach_shared_gpu(0, rid, 0, 0, entry)
+    worker._back_up_layer(0, ('a', 'b'), 0, Fence(True))
+    assert calls == [('same', 0)]
+    assert copied == [[[0, 0], [1, 1], [2, 2]]]
+    assert worker._host_stats['gpu_to_host_submit_count'] == 1
+    assert worker._host_stats['gpu_to_host_blocks'] == 3
+    assert worker._host_kv_directory._entries['same', 0].owners == {(0, 'a'), (0, 'b')}
+    assert worker._gpu_region_release_events[0, 0, 0][1] is event
+    assert not worker._host_kv_directory.ready(('same', 0), (0,))
+    event.ready = True
+    worker._poll_gpu_to_host_backing(0)
+    assert worker._host_kv_directory.ready(('same', 0), (0,))
+    assert not worker._pending_gpu_to_host
