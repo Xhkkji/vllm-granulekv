@@ -145,3 +145,46 @@ class TestNaiveBlockAllocator:
         src_blocks[-1].append_token_ids([0] * (block_size - 1))
         assert allocator_dst.get_num_full_blocks_touched(
             src_blocks) == num_blocks
+
+
+@pytest.mark.parametrize("block_ids", [[0, 1, 2], [42, 7, 103]])
+@pytest.mark.parametrize("prefix_cache", [False, True])
+def test_physical_ids_stable_without_query_sort(monkeypatch, block_ids,
+                                              prefix_cache):
+    from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+
+    if prefix_cache:
+        allocator = PrefixCachingBlockAllocator(
+            num_blocks=3, block_size=2, block_ids=block_ids)
+    else:
+        allocator = NaiveBlockAllocator(
+            create_block=NaiveBlock, num_blocks=3, block_size=2,
+            block_ids=block_ids)
+    expected = {block: index for index, block in enumerate(sorted(block_ids))}
+
+    def check_ids():
+        # Querying must not reconstruct the sorted device numbering.
+        with monkeypatch.context() as patch:
+            patch.setattr("builtins.sorted", lambda *a, **kw: pytest.fail(
+                "physical ID query sorted the allocator"))
+            assert [allocator.get_physical_block_id(b) for b in block_ids] == [
+                expected[b] for b in block_ids]
+            with pytest.raises(ValueError):
+                allocator.get_physical_block_id(-1)
+
+    check_ids()
+    blocks = [allocator.allocate_immutable_block(None, [i, i + 1])
+              for i in range(3)]
+    assert [block.block_id for block in blocks] == block_ids
+    check_ids()
+    for block in blocks:
+        allocator.free(block)
+    check_ids()
+    # Prefix blocks now reside in the evictor; a mutable allocation reuses one.
+    if prefix_cache:
+        assert allocator.evictor.num_blocks == 3
+    replacement = allocator.allocate_mutable_block(None)
+    assert replacement.block_id in expected
+    check_ids()
+    allocator.free(replacement)
+    check_ids()

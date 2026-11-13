@@ -41,6 +41,10 @@ class NaiveBlockAllocator(BlockAllocator):
         self._free_block_indices: Deque[BlockId] = deque(block_ids)
         self._all_block_indices = frozenset(block_ids)
         assert len(self._all_block_indices) == num_blocks
+        self._physical_block_ids = {
+            block_id: index
+            for index, block_id in enumerate(sorted(self._all_block_indices))
+        }
 
         self._refcounter = RefCounter(
             all_block_indices=self._free_block_indices)
@@ -211,7 +215,10 @@ class NaiveBlockAllocator(BlockAllocator):
         Returns:
             int: The zero-offset block id on certain device.
         """
-        return sorted(self._all_block_indices).index(absolute_id)
+        try:
+            return self._physical_block_ids[absolute_id]
+        except KeyError:
+            raise ValueError(f"{absolute_id} is not in list") from None
 
     @property
     def refcounter(self):

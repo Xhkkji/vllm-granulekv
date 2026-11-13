@@ -908,6 +908,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._async_kv_transfer_ids.discard(key)
         # Targeted polls publish into the same runtime completion queue.
         self._poll_host_transfers(virtual_engine)
+        events.extend(self._prefetch_runtime._drain_events(virtual_engine))
         for event in events:
             self._observe_gpu_transfer(virtual_engine, event)
         self._log_prefetch_runtime_traces()
@@ -1061,7 +1062,7 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def _poll_host_cache_uses(self, virtual_engine: int) -> None:
         completed = {}
-        for key, pending in tuple(self._pending_h2d_transfers.items()):
+        for key, pending in self._pending_h2d_transfers.items():
             if key[0] != virtual_engine or pending.host_key is None:
                 continue
             if id(pending.event) not in completed:
@@ -2766,11 +2767,21 @@ class Worker(LocalOrDistributedWorkerBase):
                              request_ids: Sequence[str]) -> None:
         """Drop finished request metadata without cancelling active DMA."""
         finished = set(request_ids)
+        host_writeback = uses_host_kv_writeback()
+        pending_h2d = tuple(self._pending_h2d_transfers.items())
+        completed = {}
+
+        def copy_ready(event):
+            event_id = id(event)
+            if event_id not in completed:
+                completed[event_id] = event.query()
+            return completed[event_id]
+
         for request_id in finished:
             self._host_prefetch_windows.pop((virtual_engine, request_id), None)
         for collection in (self._host_ready_blocks, self._host_staged_blocks, self._host_failed_blocks):
-            collection.difference_update(key for key in tuple(collection)
-                                         if key[0] == virtual_engine and key[1] in finished)
+            collection.difference_update({key for key in collection
+                                          if key[0] == virtual_engine and key[1] in finished})
         for request_id in finished:
             for layer_index in range(self.cache_engine[virtual_engine].num_attention_layers):
                 prefix = (virtual_engine, request_id, layer_index)
@@ -2780,7 +2791,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     slot = self._gpu_slot_key(virtual_engine, layer_index, destination)
                     if self._gpu_destination_owners.get(slot) == owner:
                         self._gpu_destination_owners.pop(slot)
-        for key, pending_copy in tuple(self._pending_h2d_transfers.items()):
+        for key, pending_copy in pending_h2d:
             if key[0] == virtual_engine and key[1] in finished:
                 slot = self._gpu_slot_key(virtual_engine, key[2],
                                           pending_copy.destination)
@@ -2793,8 +2804,8 @@ class Worker(LocalOrDistributedWorkerBase):
                        or any(key[0] == virtual_engine and record[0] == request_id
                               for key, record in self._gpu_pending_transfers.items())
                        or any(key[:2] == owner for key in self._pending_gpu_to_host)
-                       or any(key[:2] == owner and not copy.event.query()
-                              for key, copy in self._pending_h2d_transfers.items()))
+                       or any(key[:2] == owner and not copy_ready(copy.event)
+                              for key, copy in pending_h2d))
             if pending:
                 self._backing_retired.add(owner)
                 finished.remove(request_id)
@@ -2823,20 +2834,18 @@ class Worker(LocalOrDistributedWorkerBase):
                         for destination in mappings.values()}
                     self._gpu_reserved_slots.get((virtual_engine, layer_index), set()).difference_update(
                         released_slots - remaining_slots)
-        if uses_host_kv_writeback():
+        if host_writeback:
             for item in finished:
                 self._backing_forward.pop((virtual_engine, item), None)
         for key, record in tuple(self._host_async_kv_transfers.items()):
             if key[0] == virtual_engine and record[1] in finished:
                 self._discarded_host_transfers.add(key)
-        for key in tuple(self._pending_h2d_transfers):
+        for key, pending in pending_h2d:
             if key[0] == virtual_engine and key[1] in finished:
-                pending = self._pending_h2d_transfers[key]
                 slot = self._gpu_slot_key(virtual_engine, key[2], pending.destination)
                 if self._gpu_destination_owners.get(slot) == key:
                     self._gpu_destination_owners.pop(slot)
-                if (not uses_host_kv_writeback()
-                        or pending.event.query()):
+                if not host_writeback or copy_ready(pending.event):
                     pending = self._pending_h2d_transfers.pop(key, None)
                     if pending is not None and pending.host_key is not None:
                         self._host_kv_directory.finish_use(pending.host_key)
@@ -2867,7 +2876,7 @@ class Worker(LocalOrDistributedWorkerBase):
             active_for_owner = any(
                 key[0] == virtual_engine and record[1] == owner[1]
                 for key, record in self._host_async_kv_transfers.items())
-            pending_backup = (uses_host_kv_writeback() and any(
+            pending_backup = (host_writeback and any(
                 key[:2] == owner for key in (
                     *self._pending_gpu_to_host, *self._pending_h2d_transfers)))
             if not active_for_owner and not pending_backup:

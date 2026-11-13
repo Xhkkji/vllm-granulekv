@@ -2032,3 +2032,121 @@ def test_h2d_poll_queries_each_event_once_and_releases_each_source(worker):
     assert all(entry.owners == {(0, "consumer")} for entry in directory._entries.values())
     directory.release_owner((0, "consumer"))
     assert directory.acquire(("replacement", 0), (0, "next")) == 2
+
+
+@pytest.mark.parametrize("first", ["producer", "consumer"])
+def test_exit_reuses_event_queries_but_rechecks_delayed_copies(
+        worker, monkeypatch, first):
+    class CountedFence(Fence):
+        calls = 0
+
+        def query(self):
+            self.calls += 1
+            return super().query()
+
+    mode_calls = []
+    monkeypatch.setattr(module, "uses_host_kv_writeback",
+                        lambda: mode_calls.append(True) or True)
+    directory = worker._host_kv_directory = SharedHostKVDirectory(3)
+    delayed, ready = CountedFence(), CountedFence(ready=True)
+    for block, event in enumerate((delayed, delayed, ready)):
+        host_key = ("prefix", block)
+        directory.acquire(host_key, (0, "producer"))
+        directory.acquire(host_key, (0, "consumer"))
+        directory.begin_use(host_key)
+        for rid in ("producer", "consumer"):
+            worker._pending_h2d_transfers[0, rid, 0, block] = (
+                module._PendingHostCopy(block, event, True,
+                    host_key if rid == "producer" else None))
+    unrelated = (0, "live", 0, 99)
+    for collection in (worker._host_ready_blocks, worker._host_staged_blocks,
+                       worker._host_failed_blocks):
+        collection.update({(0, first, 0, 0), unrelated})
+    worker._forget_host_staging(0, (first,))
+    assert delayed.calls == 1
+    assert (0, first) in worker._backing_retired
+    assert len(worker._pending_h2d_transfers) == 6
+    assert all(entry.in_flight == 1 for entry in directory._entries.values())
+    for collection in (worker._host_ready_blocks, worker._host_staged_blocks,
+                       worker._host_failed_blocks):
+        assert collection == {unrelated}
+    delayed.ready = True
+    worker._forget_host_staging(0, (first,))
+    assert (delayed.calls, ready.calls) == (2, 1)
+    assert len(worker._pending_h2d_transfers) == 3
+    other = "consumer" if first == "producer" else "producer"
+    assert all(entry.owners == {(0, other)} for entry in directory._entries.values())
+    assert all(entry.in_flight == int(first != "producer")
+               for entry in directory._entries.values())
+    worker._forget_host_staging(0, (other,))
+    assert (delayed.calls, ready.calls) == (3, 2)
+    assert not worker._pending_h2d_transfers
+    assert not worker._backing_retired
+    assert all(entry.in_flight == 0 and not entry.owners
+               for entry in directory._entries.values())
+    worker._forget_host_staging(0, (first, other))
+    assert (delayed.calls, ready.calls) == (3, 2)
+    assert len(mode_calls) == 4
+
+
+@pytest.mark.parametrize("late_state", [AsyncKVTransferState.PENDING,
+                                        AsyncKVTransferState.READY,
+                                        AsyncKVTransferState.ERROR])
+def test_poll_returns_late_host_ready_without_polling_again(
+        worker, monkeypatch, late_state):
+    runtime = worker._prefetch_runtime = module.RollingPrefetchRuntime(
+        module.RollingPrefetchConfig(enabled=True))
+    for rid in ("a", "b"):
+        request = AsyncKVTransferRequest(
+            request_id=rid, seq_group_id=rid, reservation_id=rid,
+            operation=AsyncKVTransferOperation.READ,
+            priority=AsyncKVTransferPriority.CRITICAL_READ,
+            block_mapping=((0, 0),), logical_blocks=(), layer_range=(0, 4),
+            prefetch_plan_id=rid, prefetch_unit_index=0,
+            destination="mixed", host_block_mapping=((1, 1),))
+        runtime.submit_or_stage(0, request, (), lambda req, mapping:
+            AsyncKVTransferEvent(req.request_id, AsyncKVTransferState.PENDING))
+    polls = []
+
+    def poll(ve, cache, rid):
+        polls.append(rid)
+        return AsyncKVTransferEvent(rid, AsyncKVTransferState.PENDING,
+                                    gpu_ready=(rid == "a"))
+
+    late = AsyncKVTransferEvent(
+        "b", late_state, error="read failed" if late_state == AsyncKVTransferState.ERROR else None,
+        gpu_ready=late_state != AsyncKVTransferState.ERROR,
+        host_ready=late_state == AsyncKVTransferState.READY)
+
+    def poll_host(ve):
+        runtime.complete_request(ve, late)
+        runtime.complete_request(ve, late)
+        # Terminal state cannot remove the plan before its event is reported.
+        assert (0, "b") in runtime._plans
+
+    monkeypatch.setattr(worker, "_poll_gpu_transfer", poll)
+    monkeypatch.setattr(worker, "_submit_gpu_transfer", lambda *a: pytest.fail(
+        "event draining must not activate work"))
+    monkeypatch.setattr(worker, "_poll_host_transfers", poll_host)
+    monkeypatch.setattr(worker, "_log_prefetch_runtime_traces", lambda: None)
+    observed = []
+    monkeypatch.setattr(worker, "_observe_gpu_transfer", lambda ve, e: observed.append(e))
+    events = worker.poll_async_kv_transfers(0)
+    assert polls == ["a", "b"]
+    assert [e.request_id for e in events] == ["a", "b"]
+    assert events[-1] == late
+    assert observed == events
+    assert not runtime._events
+    assert ((0, "b") in runtime._plans) == (late_state == AsyncKVTransferState.PENDING)
+    monkeypatch.setattr(worker, "_poll_host_transfers",
+                        lambda ve: runtime.complete_request(ve, late))
+    assert worker.poll_async_kv_transfers(0) == []
+    if late_state == AsyncKVTransferState.PENDING:
+        done = AsyncKVTransferEvent("b", AsyncKVTransferState.READY,
+                                    gpu_ready=True, host_ready=True)
+        runtime.complete_request(0, done)
+        runtime.complete_request(0, done)
+        assert (0, "b") in runtime._plans
+        assert runtime._drain_events(0) == (done,)
+        assert (0, "b") not in runtime._plans
+    assert runtime._drain_events(0) == ()

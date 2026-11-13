@@ -138,6 +138,12 @@ class RollingPrefetchRuntime:
             if first is not None and (first.terminal is not None or first.gpu_ready):
                 plan.activation_limit = max(plan.activation_limit, plan.lead_units)
             self._activate_until(plan, plan.activation_limit, None, submit, available_slots)
+        return self._drain_events(virtual_engine)
+
+    def _drain_events(
+        self, virtual_engine: int,
+    ) -> Tuple[AsyncKVTransferEvent, ...]:
+        """Collect queued notifications without polling or activating work."""
         events = tuple(self._events)
         self._events.clear()
         for plan_key, plan in tuple(self._plans.items()):

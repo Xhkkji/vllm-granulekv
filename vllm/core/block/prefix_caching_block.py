@@ -500,7 +500,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         Returns:
             int: The rzero-offset block id on certain device.
         """
-        return sorted(self.all_block_ids).index(absolute_id)
+        return self._hashless_allocator.get_physical_block_id(absolute_id)
 
     @property
     def all_block_ids(self) -> FrozenSet[int]:
