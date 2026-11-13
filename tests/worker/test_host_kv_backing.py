@@ -687,7 +687,11 @@ def test_late_host_ready_resumes_window_prefetch_once(worker, monkeypatch):
     worker._prefetch_runtime.prediction_state = lambda *args: SimpleNamespace(
         seq_group_id="r", predicted_prefix_blocks=(0, 2))
     worker._discarded_host_transfers = set()
-    record = ("read", "r", (0, 1, 2), (4, 8))
+    worker._host_kv_directory = SharedHostKVDirectory(3)
+    _, blocks = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="read", seq_group_id="r"),
+        ((0, 0), (1, 1), (2, 2)), (4, 8))
+    record = ("read", "r", blocks, (4, 8))
     worker._host_async_kv_transfers[0, "read"] = record
     state = AsyncKVTransferState.PENDING
     worker.cache_engine[0].poll_async_kv_transfer = lambda request: (
@@ -720,6 +724,10 @@ def test_late_host_ready_resumes_window_prefetch_once(worker, monkeypatch):
 def test_window_prefetch_survives_boundary_until_actual_selection(worker, monkeypatch):
     monkeypatch.setattr(module.envs,
                         "VLLM_GRANULEKV_HIERARCHICAL_WINDOW_LAYERS", 4)
+    worker._host_kv_directory = SharedHostKVDirectory(1)
+    worker._prepare_host_read(
+        0, SimpleNamespace(request_id="late", seq_group_id="r"),
+        ((0, 0),), (4, 8))
     worker._host_prefetch_windows[0, "r"] = (4, 8)
     copies = []
     worker._prefetch_next_layer = lambda *args, **kwargs: copies.append(args[2])
@@ -735,7 +743,10 @@ def test_window_prefetch_survives_boundary_until_actual_selection(worker, monkey
     assert worker._host_prefetch_windows[0, "r"] == (4, 12)
     monkeypatch.setattr(module.envs, "VLLM_GRANULEKV_SPARSE_DYNAMIC_RESTORE_ENABLE", False)
     worker._correct_hierarchical_layer(0, ("r",), 4, None)
-    worker._mark_host_ready(0, ("old", "r", (0,), (4, 8)))
+    worker._prepare_host_read(
+        0, SimpleNamespace(request_id="old", seq_group_id="r"),
+        ((0, 0),), (4, 8))
+    worker._mark_host_ready(0, ("old", "r", (), (4, 8)))
     assert copies == list(range(4, 12)) + [5, 6, 7]
     worker._correct_hierarchical_layer(0, ("r",), 11, None)
     assert (0, "r") not in worker._host_prefetch_windows
@@ -1194,7 +1205,11 @@ def test_mixed_union_capacity_rejected_before_mapping_or_io(worker, monkeypatch)
 @pytest.mark.parametrize("gpu_first", [True, False])
 def test_mixed_target_poll_retains_request_until_both_ready(worker, gpu_first):
     worker._discarded_host_transfers = set()
-    record = ("mixed", "r", (1,), (0, 4))
+    worker._host_kv_directory = SharedHostKVDirectory(1)
+    _, blocks = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="mixed", seq_group_id="r"),
+        ((1, 1),), (0, 4))
+    record = ("mixed", "r", blocks, (0, 4))
     worker._host_async_kv_transfers[0, "mixed"] = record
     worker._gpu_pending_transfers[0, "mixed"] = ("r", (0, 4), ((10, 0),), (0,))
     partial = AsyncKVTransferEvent("mixed", AsyncKVTransferState.PENDING,
@@ -1215,7 +1230,11 @@ def test_mixed_target_poll_retains_request_until_both_ready(worker, gpu_first):
 
 def test_actual_miss_waits_for_mixed_cpu_target(worker):
     worker._discarded_host_transfers = set()
-    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", (7,), (0, 4))
+    worker._host_kv_directory = SharedHostKVDirectory(1)
+    _, blocks = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="mixed", seq_group_id="r"),
+        ((7, 7),), (0, 4))
+    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", blocks, (0, 4))
     polls = []
 
     def poll(request_id):
@@ -1233,7 +1252,11 @@ def test_actual_miss_waits_for_mixed_cpu_target(worker):
 def test_aborted_mixed_request_drains_without_republishing_data(worker):
     worker._discarded_host_transfers = set()
     worker._host_staging_owner = (0, "r")
-    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", (7,), (0, 4))
+    worker._host_kv_directory = SharedHostKVDirectory(1)
+    _, blocks = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="mixed", seq_group_id="r"),
+        ((7, 7),), (0, 4))
+    worker._host_async_kv_transfers[0, "mixed"] = ("mixed", "r", blocks, (0, 4))
     worker._gpu_pending_transfers[0, "mixed"] = ("r", (0, 4), ((10, 0),), (0,))
     worker._forget_host_staging(0, ("r",))
     assert worker._host_staging_owner == (0, "r")
@@ -2150,3 +2173,171 @@ def test_poll_returns_late_host_ready_without_polling_again(
         assert runtime._drain_events(0) == (done,)
         assert (0, "b") not in runtime._plans
     assert runtime._drain_events(0) == ()
+
+
+@pytest.mark.parametrize("size", [2048, 8192])
+def test_empty_cleanup_does_not_visit_state(worker, monkeypatch, size):
+    class UnvisitedDict(dict):
+        def items(self):
+            pytest.fail("empty cleanup must not create an H2D snapshot")
+
+    class UnvisitedSet(set):
+        def __iter__(self):
+            pytest.fail("empty cleanup must not scan request state")
+
+    monkeypatch.setattr(module, "uses_host_kv_writeback", lambda: pytest.fail(
+        "empty cleanup must not read mode configuration"))
+    worker._pending_h2d_transfers = UnvisitedDict(
+        ((0, "live", 0, b), object()) for b in range(size))
+    for name in ("_host_ready_blocks", "_host_staged_blocks", "_host_failed_blocks"):
+        setattr(worker, name, UnvisitedSet((0, "live", 0, b) for b in range(size)))
+    worker._forget_host_staging(0, ())
+    assert len(worker._pending_h2d_transfers) == size
+    assert len(worker._host_ready_blocks) == size
+
+
+@pytest.mark.parametrize("size", [2048, 8192])
+@pytest.mark.parametrize("retired", [False, True])
+def test_ready_publication_is_incremental_with_pending_waiter(
+        worker, monkeypatch, size, retired):
+    class PublishedSet(set):
+        def __init__(self):
+            super().__init__()
+            self.published = []
+
+        def update(self, items):
+            items = tuple(items)
+            self.published.extend(items)
+            super().update(items)
+
+    worker._host_request_prefix_limits[0, "r"] = size + 1
+    directory = worker._host_kv_directory = SharedHostKVDirectory(size + 1)
+    waiter = ("prefix", size)
+    directory.acquire(waiter, (0, "other"))
+    directory.begin_load(waiter, (0, 1))
+    monkeypatch.setattr(worker, "_shared_gpu_entry", lambda *args: None)
+    # Waiter first in the request; publication must still put producers first.
+    pairs = ((size, size),) + tuple((b, b) for b in range(size))
+    _, blocks = worker._prepare_host_read(
+        0, SimpleNamespace(request_id="read", seq_group_id="r"), pairs, (0, 2))
+    assert blocks == tuple(range(size))
+    record = ("read", "r", blocks, (0, 2))
+    published = worker._host_ready_blocks = PublishedSet()
+    reads = []
+    monkeypatch.setattr(worker, "_record_ssd_reads", lambda *a, **kw: reads.append(a[3]))
+    window_calls = []
+    worker._host_prefetch_windows[0, "r"] = (0, 2)
+    monkeypatch.setattr(worker, "_prefetch_next_layer", lambda ve, ids, layer, **kw:
+                        window_calls.append(layer))
+    if retired:
+        worker._backing_retired.add((0, "r"))
+    worker._mark_host_ready(0, record)
+    expected = [(0, "r", layer, b) for layer in (0, 1) for b in range(size)]
+    assert published.published == ([] if retired else expected)
+    assert reads == [blocks]
+    assert all(directory._entries["prefix", b].in_flight == 0 for b in range(size))
+    assert directory._entries[waiter].in_flight == 1
+    queries = []
+    original_ready = directory.ready
+    monkeypatch.setattr(directory, "ready", lambda key, layers:
+                        queries.append(key) or original_ready(key, layers))
+    # Native host completion repeats while the GPU / shared producer is pending.
+    for _ in range(3):
+        worker._mark_host_ready(0, record)
+    assert queries == [waiter] * 3
+    assert published.published == ([] if retired else expected)
+    assert reads == [blocks]
+    assert worker._host_stats["cpu_cache_ready_blocks"] == size
+    # Producer publication must not release the other producer's source ref.
+    directory.finish_load(waiter, (0, 1), True)
+    worker._mark_host_ready(0, record)
+    assert published.published == ([] if retired else expected + [
+        (0, "r", layer, size) for layer in (0, 1)])
+    assert not worker._host_transfer_pending_cache_keys
+    assert all(entry.in_flight == 0 for entry in directory._entries.values())
+    worker._mark_host_ready(0, record)
+    assert len(queries) == 4
+    assert reads == [blocks]
+    assert window_calls == ([] if retired else [0, 1] * 6)
+
+
+@pytest.mark.parametrize("size,transfers", [(2048, 7), (8192, 32)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_exit_scans_fences_once_and_preserves_unrelated_owners(
+        worker, size, transfers, reverse):
+    class CountedFences(dict):
+        scans = 0
+        visited = 0
+
+        def items(self):
+            self.scans += 1
+            for item in super().items():
+                self.visited += 1
+                yield item
+
+    ids = [f"io-{n}" for n in range(transfers)]
+    if reverse:
+        ids.reverse()
+    worker._gpu_transfer_regions.update(
+        ((0, tid), ("r", (0, 4), ())) for tid in ids)
+    worker._gpu_transfer_regions[0, "live-io"] = ("live", (0, 4), ())
+    worker._gpu_transfer_regions[1, ids[0]] = ("r", (0, 4), ())
+    worker._gpu_completed_transfer_events.update(
+        (key, Fence()) for key in worker._gpu_transfer_regions)
+    # Request-owned fences and another engine's identically named transfer
+    # must survive, just as they did in the per-transfer cleanup.
+    fences = {(0, 0, n): (ids[n % transfers], Fence()) for n in range(size)}
+    fences.update({(0, 1, 0): ("r", Fence()),
+                   (0, 1, 1): ("live-io", Fence()),
+                   (1, 0, 0): (ids[0], Fence())})
+    expected = dict(fences)
+    for tid in ids:
+        for slot, (owner, _) in tuple(expected.items()):
+            if slot[0] == 0 and owner == tid:
+                del expected[slot]
+    counted = worker._gpu_region_release_events = CountedFences(fences)
+    other_events = {key: event for key, event in
+                    worker._gpu_completed_transfer_events.items()
+                    if key[0] != 0 or key[1] not in ids}
+    worker._forget_host_staging(0, ("r",))
+    assert (counted.scans, counted.visited) == (1, size + 3)
+    assert counted == expected
+    assert worker._gpu_completed_transfer_events == other_events
+    assert set(worker._gpu_transfer_regions) == set(other_events)
+    # No matching transfers remain, so repeated nonempty cleanup must not
+    # scan unrelated fences or remove request-owned protection.
+    worker._forget_host_staging(0, ("r",))
+    assert (counted.scans, counted.visited) == (1, size + 3)
+    assert counted == expected
+
+
+def test_exit_fence_cleanup_defers_only_request_with_pending_dma(worker):
+    delayed = Fence()
+    ready = Fence(ready=True)
+    for tid, rid, event in (("pending-io", "pending", delayed),
+                            ("done-io", "done", ready)):
+        worker._gpu_transfer_regions[0, tid] = (rid, (0, 4), ())
+        worker._gpu_completed_transfer_events[0, tid] = event
+    pending_key = (0, "pending", 0, 0)
+    worker._pending_h2d_transfers[pending_key] = module._PendingHostCopy(
+        0, delayed, False)
+    worker._gpu_region_release_events.update({
+        (0, 0, 0): ("pending-io", delayed),
+        (0, 0, 1): ("done-io", ready),
+        (0, 0, 2): ("pending", delayed)})
+    worker._forget_host_staging(0, ("pending", "done"))
+    assert worker._backing_retired == {(0, "pending")}
+    assert set(worker._gpu_transfer_regions) == {(0, "pending-io")}
+    assert worker._gpu_completed_transfer_events == {(0, "pending-io"): delayed}
+    assert worker._gpu_region_release_events == {
+        (0, 0, 0): ("pending-io", delayed),
+        (0, 0, 2): ("pending", delayed)}
+    assert pending_key in worker._pending_h2d_transfers
+    delayed.ready = True
+    worker._forget_host_staging(0, ("pending",))
+    assert not worker._backing_retired
+    assert not worker._gpu_transfer_regions
+    assert not worker._gpu_completed_transfer_events
+    assert not worker._pending_h2d_transfers
+    assert worker._gpu_region_release_events == {
+        (0, 0, 2): ("pending", delayed)}

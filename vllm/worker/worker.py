@@ -1266,7 +1266,8 @@ class Worker(LocalOrDistributedWorkerBase):
             self._host_transfer_pending_cache_keys[transfer_key] = remaining
         else:
             self._host_transfer_pending_cache_keys.pop(transfer_key, None)
-        published_blocks = tuple(dict.fromkeys((*blocks, *(key[1] for key in ready_keys))))
+        published_blocks = tuple(dict.fromkeys(
+            key[1] for key in (*cache_keys, *ready_keys)))
         self._host_stats["cpu_cache_ready_blocks"] += sum(
             (virtual_engine, seq_group_id, layer_range[0], block) not in self._host_ready_blocks
             for block in published_blocks)
@@ -2766,6 +2767,8 @@ class Worker(LocalOrDistributedWorkerBase):
     def _forget_host_staging(self, virtual_engine: int,
                              request_ids: Sequence[str]) -> None:
         """Drop finished request metadata without cancelling active DMA."""
+        if not request_ids:
+            return
         finished = set(request_ids)
         host_writeback = uses_host_kv_writeback()
         pending_h2d = tuple(self._pending_h2d_transfers.items())
@@ -2856,17 +2859,21 @@ class Worker(LocalOrDistributedWorkerBase):
         for key in tuple(getattr(self, "_gpu_shared_waits", {})):
             if key[0] == virtual_engine and key[1] in finished:
                 self._gpu_shared_waits.pop(key, None)
-        for key in tuple(self._gpu_transfer_regions):
-            if (key[0] == virtual_engine
-                    and self._gpu_transfer_regions[key][0] in finished):
-                transfer_id = key[1]
+        finished_transfers = tuple(
+            key[1] for key, record in self._gpu_transfer_regions.items()
+            if key[0] == virtual_engine and record[0] in finished)
+        if finished_transfers:
+            transfer_ids = set(finished_transfers)
+            for transfer_id in finished_transfers:
                 self._gpu_completed_transfer_events.pop(
                     (virtual_engine, transfer_id), None)
-                for slot, (owner, _) in tuple(
-                        self._gpu_region_release_events.items()):
-                    if slot[0] == virtual_engine and owner == transfer_id:
-                        self._gpu_region_release_events.pop(slot)
-                self._gpu_transfer_regions.pop(key, None)
+            released_fences = [
+                slot for slot, (owner, _) in self._gpu_region_release_events.items()
+                if slot[0] == virtual_engine and owner in transfer_ids]
+            for slot in released_fences:
+                self._gpu_region_release_events.pop(slot)
+            for transfer_id in finished_transfers:
+                self._gpu_transfer_regions.pop((virtual_engine, transfer_id), None)
         self._ssd_read_blocks.difference_update({
             key for key in self._ssd_read_blocks
             if key[0] == virtual_engine and key[1] in finished})
