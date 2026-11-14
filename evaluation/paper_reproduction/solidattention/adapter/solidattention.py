@@ -697,6 +697,11 @@ class SolidAttentionPolicy:
         record["_snapshots"]["logits"] = self._validation_snapshot(logits)
         record["_ready"] = self._validation_event(logits)
 
+    def validation_captures_layer_data(self, request_id: str) -> bool:
+        state = self._validation_states.get(request_id)
+        return bool(state is not None and state.mode != "off"
+                    and state.metadata.get("capture_layer_data", False))
+
     def validation_requires_dense_reference(self, request_id: str) -> bool:
         state = self._validation_states.get(request_id)
         return bool(state is not None
@@ -1037,13 +1042,17 @@ class SolidAttentionPolicy:
                                 key_cache: torch.Tensor,
                                 physical_block_ids: torch.Tensor,
                                 prefix_count: int,
-                                device: torch.device) -> torch.Tensor:
+                                device: torch.device,
+                                logical_start: int = 0) -> torch.Tensor:
         cached_count, representatives = self._representatives[request_id].get(
             layer_index, (0, None))
         if cached_count > prefix_count:
             cached_count, representatives = 0, None
         if cached_count < prefix_count:
-            new_ids = physical_block_ids[cached_count:prefix_count]
+            if cached_count < logical_start:
+                raise RuntimeError("history sealing mapping has a logical gap")
+            new_ids = physical_block_ids[cached_count - logical_start:
+                                         prefix_count - logical_start]
             new_representatives = build_page_representatives_from_paged_key_cache(
                 key_cache, new_ids, output_device=device)
             representatives = (new_representatives
@@ -1064,12 +1073,14 @@ class SolidAttentionPolicy:
     def update_history_representatives(
         self, request_id: str, layer_index: int, key_cache: torch.Tensor,
         physical_blocks: torch.Tensor, sequence_length: int, block_size: int,
+        *, logical_start: int = 0,
     ) -> None:
         """Seal new request-local pages while their GPU contents are valid."""
         complete = sequence_length // block_size
         previous = self._representatives[request_id].get(layer_index)
         self._cached_representatives(request_id, layer_index, key_cache,
-                                     physical_blocks, complete, key_cache.device)
+                                     physical_blocks, complete, key_cache.device,
+                                     logical_start)
         if self._representatives[request_id].get(layer_index) is not previous:
             self._actual_metadata.pop((request_id, layer_index), None)
 

@@ -2422,3 +2422,112 @@ def test_batch_backup_queries_history_once_and_copies_private_tails(worker, monk
     worker._poll_gpu_to_host_backing(0)
     assert worker._host_kv_directory.ready(('same', 0), (0,))
     assert not worker._pending_gpu_to_host
+
+
+@pytest.mark.parametrize('protection', ['none', 'required', 'outside', 'dma', 'generation'])
+def test_batch_reclaim_shared_history_keeps_real_consumers(worker, monkeypatch, protection):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 3
+    worker._host_kv_directory = SharedHostKVDirectory(3)
+    for rid in ('a', 'b', 'outside'):
+        worker._host_request_prefix_keys[0, rid] = 'same'
+        worker._host_request_prefix_limits[0, rid] = 1
+    host = ('same', 0)
+    worker._host_kv_directory.acquire(host, (0, 'a'))
+    worker._host_kv_directory.begin_load(host, (0,))
+    worker._host_kv_directory.finish_load(host, (0,), True)
+    event = Fence(protection != 'dma')
+    entry = module._SharedGPUBlock(0, '', 'a', state=AsyncKVTransferState.READY,
+                                   references={'a', 'b'}, h2d_event=event)
+    worker._gpu_shared_blocks[worker._gpu_identity(0, 'a', 0, 0)] = entry
+    for rid in ('a', 'b'):
+        worker._attach_shared_gpu(0, rid, 0, 0, entry)
+    worker._host_kv_directory.begin_use(host)
+    worker._pending_h2d_transfers[0, 'a', 0, 0] = module._PendingHostCopy(0, event, False, host)
+    if protection == 'outside':
+        worker._attach_shared_gpu(0, 'outside', 0, 0, entry)
+    if protection == 'generation':
+        entry.h2d_event = Fence(True)
+    worker._bind_gpu_slot((0, 'a', 0), 1, 1)
+    worker._bind_gpu_slot((0, 'b', 0), 2, 2)
+    required = {'a': (1, 3), 'b': (0, 2) if protection == 'required' else (2,)}
+    for rid, blocks in required.items():
+        worker._gpu_required_blocks[0, rid, 0] = set(blocks)
+    fence = Fence(False)
+    worker._gpu_region_release_events[0, 0, 0] = ('a', fence)
+    if protection != 'none':
+        with pytest.raises(RuntimeError, match='no safely reusable'):
+            worker._reserve_gpu_slots(0, 'a', 0, (1, 3), batch_required=required)
+        assert worker._host_kv_directory._entries[host].in_flight == 1
+        assert worker._gpu_slot_mappings[0, 'b', 0][0] == 0
+        return
+    assert worker._reserve_gpu_slots(0, 'a', 0, (1, 3), batch_required=required) == (1, 3)
+    assert worker._gpu_slot_mappings[0, 'a', 0] == {1: 1, 3: 0}
+    assert worker._gpu_slot_mappings[0, 'b', 0] == {2: 2}
+    assert worker._host_kv_directory._entries[host].in_flight == 0
+    assert not worker._pending_h2d_transfers
+    assert not worker._gpu_shared_blocks
+    assert worker._gpu_region_release_events[0, 0, 0][1] is fence
+    assert worker._host_stats['gpu_slot_evictions'] == 1
+    worker._poll_host_cache_uses(0)
+    assert worker._host_kv_directory._entries[host].in_flight == 0
+
+@pytest.mark.parametrize('count', [64, 8192])
+@pytest.mark.parametrize('order', [('a', 'b'), ('b', 'a')])
+def test_batch_ready_bindings_are_reused_without_reservation(worker, monkeypatch, count, order):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = count + 2
+    for i, rid in enumerate(('a', 'b')):
+        worker._host_request_prefix_keys[0, rid] = 'same'
+        worker._host_request_prefix_limits[0, rid] = count
+        worker._backing_forward[0, rid] = ((99,) * (count + 1), count * 16, count * 16 + 1, False)
+        worker._bind_gpu_slot((0, rid, 0), count, count + i)
+    for block in range(count):
+        entry = module._SharedGPUBlock(block, '', 'a', state=AsyncKVTransferState.READY,
+                                      references={'a', 'b'})
+        worker._gpu_shared_blocks[worker._gpu_identity(0, 'a', 0, block)] = entry
+        for rid in ('a', 'b'):
+            worker._attach_shared_gpu(0, rid, 0, block, entry)
+        worker._gpu_destination_owners[worker._gpu_slot_key(0, 0, block)] = (0, 'a', 0, block)
+    monkeypatch.setattr(module, 'select_actual_sparse_blocks_device', lambda *a:
+                        SimpleNamespace(history_blocks=tuple(range(count)), attention=None))
+    identities = []
+    original = worker._gpu_identity
+    monkeypatch.setattr(worker, '_gpu_identity', lambda *a: identities.append(a) or original(*a))
+    monkeypatch.setattr(worker, '_reserve_gpu_slots', lambda *a, **k: pytest.fail('READY batch must not reserve'))
+    monkeypatch.setattr(worker, '_attach_shared_gpu', lambda *a: pytest.fail('existing READY consumer must not rebind'))
+    # Isolate preparation counts; exercise the real restore independently below.
+    monkeypatch.setattr(worker, '_restore_backing_batch', lambda *a: None)
+    result = worker._correct_bounded_batch(0, order, 0, torch.empty(2, 28, 128))
+    assert len(identities) == 2 * (count + 1)
+    for rid in order:
+        private_slot = count + ('ab'.index(rid))
+        assert result.by_request[rid].block_table == (tuple(range(count)) + (private_slot,),)
+        assert result.by_request[rid].slot_mapping == (private_slot * 16,)
+    assert worker._gpu_reserved_slots[0, 0] == set(range(count + 2))
+
+
+def test_restore_all_ready_consumes_once_without_rebinding(worker, monkeypatch):
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    worker.cache_engine[0].num_gpu_blocks = 2
+    for rid in ('a', 'b'):
+        worker._host_request_prefix_keys[0, rid] = 'same'
+        worker._host_request_prefix_limits[0, rid] = 1
+    event = Fence(True)
+    entry = module._SharedGPUBlock(0, '', 'a', state=AsyncKVTransferState.READY,
+                                  references={'a', 'b'}, h2d_event=event)
+    worker._gpu_shared_blocks[worker._gpu_identity(0, 'a', 0, 0)] = entry
+    for rid in ('a', 'b'):
+        worker._attach_shared_gpu(0, rid, 0, 0, entry)
+    worker._gpu_destination_owners[0, 0, 0] = (0, 'a', 0, 0)
+    calls = []
+    consume = worker._consume_host_copies
+    monkeypatch.setattr(worker, '_consume_host_copies', lambda ve, rid, layer, blocks, **kw:
+                        calls.append((rid, tuple(blocks))) or consume(ve, rid, layer, blocks, **kw))
+    monkeypatch.setattr(worker, '_attach_shared_gpu', lambda *a: pytest.fail('READY consumer already bound'))
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = lambda *a: pytest.fail('READY must not copy')
+    worker._restore_backing_batch(0, 0, {rid: ({0: 0}, (0,)) for rid in ('a', 'b')})
+    assert calls == [('a', (0,)), ('b', (0,))]
+    assert len(worker._pending_h2d_transfers) == 2
+    assert entry.references == {'a', 'b'}
+    assert worker._host_stats['host_gpu_copy_blocks'] == 0

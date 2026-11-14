@@ -380,66 +380,80 @@ class RollingPrefetchRuntime:
         sleep_seconds: float = 0.0001,
         poll_correction_only: bool = False,
     ) -> SparseKVCorrectionResult:
-        """Synchronously close one layer gap through the async lifecycle."""
+        return self.correct_layers(
+            virtual_engine, ((state, missing_blocks),), layer_index,
+            prepare_mapping, submit, poll, cancel, available_slots=available_slots,
+            timeout_seconds=timeout_seconds, sleep_seconds=sleep_seconds,
+            poll_correction_only=poll_correction_only)[0]
+
+    def correct_layers(
+        self, virtual_engine: int,
+        demands: Sequence[Tuple[SparseKVLayerPredictionState, Sequence[int]]],
+        layer_index: int, prepare_mapping: Callable[[Any], Any],
+        submit: SubmitCallback, poll: PollCallback,
+        cancel: Optional[CancelCallback] = None, *,
+        available_slots: Callable[[], int], timeout_seconds: float,
+        sleep_seconds: float = 0.0001, poll_correction_only: bool = False,
+        progress_sources: Optional[Callable[[], None]] = None,
+    ) -> Tuple[SparseKVCorrectionResult, ...]:
+        """Submit available same-layer requests before waiting on any producer."""
         if self.config.working_set_enabled and not uses_bounded_gpu_slots():
-            raise RuntimeError(
-                "sparse correction does not support layer working-set mode")
+            raise RuntimeError("sparse correction does not support layer working-set mode")
         if timeout_seconds <= 0:
             raise ValueError("invalid sparse correction runtime limits")
-        projection = self.residency.project_correction(
-            state, layer_index, missing_blocks)
-        request_id = (
-            f"{projection.plan_id}-correction-{layer_index}-"
-            f"{next(self._correction_counter)}")
-        request = AsyncKVTransferRequest(
-            request_id=request_id,
-            seq_group_id=projection.seq_group_id,
-            reservation_id=projection.reservation_id,
-            operation=AsyncKVTransferOperation.READ,
-            block_mapping=projection.block_mapping,
-            logical_blocks=projection.logical_blocks,
-            priority=AsyncKVTransferPriority.CRITICAL_READ,
-            layer_range=(layer_index, layer_index + 1),
-        )
-        mapping = prepare_mapping(projection.block_mapping)
-        total_started = time.perf_counter()
+        queued = []
+        for state, missing_blocks in demands:
+            projection = self.residency.project_correction(state, layer_index, missing_blocks)
+            request_id = (f"{projection.plan_id}-correction-{layer_index}-"
+                          f"{next(self._correction_counter)}")
+            request = AsyncKVTransferRequest(
+                request_id=request_id, seq_group_id=projection.seq_group_id,
+                reservation_id=projection.reservation_id,
+                operation=AsyncKVTransferOperation.READ,
+                block_mapping=projection.block_mapping,
+                logical_blocks=projection.logical_blocks,
+                priority=AsyncKVTransferPriority.CRITICAL_READ,
+                layer_range=(layer_index, layer_index + 1))
+            queued.append((projection, request, prepare_mapping(projection.block_mapping)))
+        started = time.perf_counter()
         deadline = time.monotonic() + timeout_seconds
-        while available_slots() <= 0:
-            self._progress(virtual_engine, poll)
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    "timed out waiting for a GranuleKV correction slot")
-            time.sleep(sleep_seconds)
-
-        submit_started = time.perf_counter()
-        event = submit(request, mapping)
-        submit_ms = (time.perf_counter() - submit_started) * 1000.0
-        wait_started = time.perf_counter()
-        while event.state == AsyncKVTransferState.PENDING:
-            if not poll_correction_only:
+        active, results = {}, {}
+        next_request = 0
+        while next_request < len(queued) or active:
+            while next_request < len(queued) and available_slots() > 0:
+                projection, request, mapping = queued[next_request]
+                before = time.perf_counter()
+                event = submit(request, mapping)
+                after = time.perf_counter()
+                active[next_request] = (event, (after - before) * 1000, after)
+                next_request += 1
+            if progress_sources is not None:
+                progress_sources()
+            if not poll_correction_only or (not active and next_request < len(queued)):
                 self._progress(virtual_engine, poll)
-            event = poll(request)
-            if event.state == AsyncKVTransferState.PENDING:
+            for index, (event, submit_ms, wait_started) in tuple(active.items()):
+                projection, request, _ = queued[index]
+                if event.state == AsyncKVTransferState.PENDING:
+                    event = poll(request)
+                if event.state == AsyncKVTransferState.PENDING:
+                    continue
+                if event.state != AsyncKVTransferState.READY:
+                    raise RuntimeError(f"sparse correction failed: request={request.request_id} error={event.error}")
+                self.residency.mark_corrected(projection)
+                now = time.perf_counter()
+                results[index] = SparseKVCorrectionResult(
+                    request_id=request.request_id, block_count=len(projection.logical_blocks),
+                    submit_ms=submit_ms, wait_ms=(now - wait_started) * 1000,
+                    total_ms=(now - started) * 1000)
+                del active[index]
+            if next_request < len(queued) or active:
                 if time.monotonic() >= deadline:
                     if cancel is not None:
-                        cancel(request)
-                    raise TimeoutError(
-                        f"timed out waiting for correction {request_id}")
+                        for index in active:
+                            cancel(queued[index][1])
+                    raise TimeoutError("timed out waiting for GranuleKV layer corrections")
                 time.sleep(sleep_seconds)
-        wait_ms = (time.perf_counter() - wait_started) * 1000.0
-        if event.state != AsyncKVTransferState.READY:
-            raise RuntimeError(
-                f"sparse correction failed: request={request_id} "
-                f"error={event.error}")
-        self.residency.mark_corrected(projection)
-        total_ms = (time.perf_counter() - total_started) * 1000.0
-        return SparseKVCorrectionResult(
-            request_id=request_id,
-            block_count=len(projection.logical_blocks),
-            submit_ms=submit_ms,
-            wait_ms=wait_ms,
-            total_ms=total_ms,
-        )
+        return tuple(results[index] for index in range(len(queued)))
 
     def forget_seq_groups(self, seq_group_ids: Sequence[str]) -> None:
         """在 vLLM 通知 request finished/abort 时回收 residency 元数据。"""

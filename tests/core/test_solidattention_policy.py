@@ -1133,3 +1133,26 @@ def test_validation_mapping_error_reports_physical_block():
         "decode_step": 0, "layer_index": 0,
         "page_identity": metadata["page_identity"],
         "logical_block": 0, "physical_block": 1}
+
+@pytest.mark.parametrize('order', [('a', 'b'), ('b', 'a')])
+def test_history_seal_from_private_tail_mapping(order):
+    policy = SolidAttentionPolicy(1, 1)
+    key = torch.randn(7, 2, 16, 2)
+    initial = _representatives(3)
+    for rid in order:
+        policy._representatives[rid][0] = (3, initial.clone())
+        policy._actual_metadata[rid, 0] = object()
+        physical = torch.tensor([5 if rid == 'a' else 6])
+        policy.update_history_representatives(rid, 0, key, physical, 64, 16,
+                                               logical_start=3)
+        count, reps = policy._representatives[rid][0]
+        assert count == 4
+        torch.testing.assert_close(reps[:3], initial)
+        assert (rid, 0) not in policy._actual_metadata
+        saved = reps
+        policy.update_history_representatives(rid, 0, key, physical, 64, 16,
+                                               logical_start=3)
+        assert policy._representatives[rid][0][1] is saved
+        policy.select_actual_blocks_device(rid, 0, torch.ones(2, 2), 3, 64, 65, 16, 1)
+    assert not torch.equal(policy._representatives['a'][0][1][-1],
+                           policy._representatives['b'][0][1][-1])

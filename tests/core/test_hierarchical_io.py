@@ -1091,3 +1091,38 @@ def test_host_initial_allocation_has_linear_slot_work(count):
     directory.finish_use(("prefix", 1))
     assert set(directory._slots) == set(range(count))
     assert directory.acquire(("prefix", 0), (0, "shared")) == 0
+
+
+@pytest.mark.parametrize('capacity', [1, 2])
+def test_layer_corrections_submit_before_waiting_and_preserve_order(capacity):
+    from dataclasses import replace
+    runtime = RollingPrefetchRuntime(RollingPrefetchConfig())
+    states = []
+    for rid in ('a', 'b'):
+        request = replace(_correction_prefetch_request(0, first=True),
+                          request_id=rid, seq_group_id=rid,
+                          reservation_id=rid, prefetch_plan_id=rid)
+        runtime.submit_or_stage(0, request, request.block_mapping,
+            lambda current, _: AsyncKVTransferEvent(current.request_id, AsyncKVTransferState.READY))
+        states.append(runtime.prediction_state((rid,), 0))
+    active, actions = set(), []
+    def submit(request, mapping):
+        actions.append(('submit', request.seq_group_id))
+        active.add(request.request_id)
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.PENDING)
+    def poll(request):
+        actions.append(('poll', request.seq_group_id))
+        active.remove(request.request_id)
+        return AsyncKVTransferEvent(request.request_id, AsyncKVTransferState.READY)
+    results = runtime.correct_layers(0, [(state, (1,)) for state in states],
+        0, tuple, submit, poll, available_slots=lambda: capacity-len(active),
+        timeout_seconds=1., poll_correction_only=True,
+        progress_sources=lambda: actions.append(('host', None)))
+    assert [r.block_count for r in results] == [1, 1]
+    assert [r.request_id.split('-')[0] for r in results] == ['a', 'b']
+    if capacity == 2:
+        assert actions[:3] == [('submit', 'a'), ('submit', 'b'), ('host', None)]
+    else:
+        assert actions.index(('poll', 'a')) < actions.index(('submit', 'b'))
+    assert all(runtime.prediction_state((rid,), 0).resident_prefix_blocks == (0, 1, 3)
+               for rid in ('a', 'b'))

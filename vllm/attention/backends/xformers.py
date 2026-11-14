@@ -1039,10 +1039,22 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             query.view(-1, self.num_heads, self.head_size), key_cache,
             value_cache, tables, lens, max(lengths), self.kv_cache_dtype,
             self.num_kv_heads, self.scale, None, layer._k_scale, layer._v_scale)
-        if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off":
-            policy = get_sparse_kv_policy()
+        policy = get_sparse_kv_policy()
+        if policy is not None:
             layer_index = self._layer_index_from_name(layer.layer_name)
             for index, (rid, row) in enumerate(zip(ids, rows)):
+                sequence_length = attn_metadata._sparse_request_metadata[index].seq_len
+                block_size = int(value_cache.shape[-1])
+                if sequence_length % block_size == 0:
+                    # Single-query execution can complete only the last block.
+                    # Seal it in original logical coordinates before reuse.
+                    policy.update_history_representatives(
+                        rid, layer_index, key_cache,
+                        tables[index, len(row.block_indices) - 1:len(row.block_indices)],
+                        sequence_length, block_size,
+                        logical_start=sequence_length // block_size - 1)
+                if not policy.validation_captures_layer_data(rid):
+                    continue
                 # The numerical recorder uses original logical coordinates.
                 # Materialize this only for validation, never for serving.
                 table = [-1] * (row.block_indices[-1] + 1)
