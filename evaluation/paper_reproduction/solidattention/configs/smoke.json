@@ -1,9 +1,0 @@
-{
-  "strategy": "solidattention",
-  "layers": 32,
-  "prefix_blocks": 128,
-  "block_budget": 32,
-  "window_layers": 4,
-  "speculative_prefetch": true,
-  "correction_read": true
-}

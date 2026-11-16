@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from evaluation.paper_reproduction.solidattention.adapter import (
+from vllm.granulekv.sparse_policy import (
     SolidAttentionPolicy, )
-from evaluation.paper_reproduction.solidattention.adapter.reference import (
+from tests.core.solidattention_reference import (
     reference_solidattention_selection, )
 from vllm.core.custom_schedulers.hierarchical_io import (
     build_sparse_restore_plan_feedback, configure_sparse_kv_policy,
@@ -52,7 +52,7 @@ def test_complete_history_chunk_one_matches_single_query_reference(heads, comple
 
 
 def test_history_metadata_seals_only_new_full_blocks_and_is_request_local(monkeypatch):
-    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+    import vllm.granulekv.sparse_policy.solidattention as module
     policy = SolidAttentionPolicy(1, 1)
     source = _representatives(4)
     policy.register_page_representatives("page", 0, source)
@@ -225,7 +225,7 @@ def test_prefill_score_workspace_preserves_selection(
         monkeypatch, envelope, device, dtype, query_limit, expected_chunks):
     import weakref
 
-    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+    import vllm.granulekv.sparse_policy.solidattention as module
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -273,7 +273,7 @@ def test_prefill_score_workspace_preserves_selection(
 
 
 def test_prefill_score_workspace_preserves_ties_and_nan(monkeypatch):
-    import evaluation.paper_reproduction.solidattention.adapter.solidattention as module
+    import vllm.granulekv.sparse_policy.solidattention as module
 
     query = torch.ones(7, 8, 2)
     reps = _representatives(12)

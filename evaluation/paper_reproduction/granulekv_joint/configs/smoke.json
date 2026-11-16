@@ -1,9 +1,0 @@
-{
-  "strategy": "granulekv_joint",
-  "selector": "quest",
-  "prefetcher": "layer_wise",
-  "scheduler": "fcfs",
-  "layers": 32,
-  "prefix_blocks": 128,
-  "window_layers": 4
-}

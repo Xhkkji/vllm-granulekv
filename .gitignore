@@ -245,3 +245,11 @@ evaluation/20260802baseline/**/*.safetensors
 evaluation/20260802baseline/**/*.safetensors.metadata
 evaluation/20260802baseline/**/lmcache_local_disk/
 evaluation/20260802baseline/**/lmcache_gds/
+
+# Code distribution branch: research material stays on GPU_CPU.
+/docs/
+/evaluation/
+/file:/
+*.md
+*.rst
+*.nsys-rep

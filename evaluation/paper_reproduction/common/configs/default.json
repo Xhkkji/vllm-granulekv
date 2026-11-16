@@ -1,9 +1,0 @@
-{
-  "model": "meta-llama/Llama-2-7b-hf",
-  "layers": 32,
-  "prefix_blocks": 128,
-  "block_size": 16,
-  "hbm_working_set": "fixed",
-  "backend": "granulekv",
-  "max_runs_per_strategy": 2
-}
