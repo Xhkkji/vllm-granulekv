@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=/home/xhk/llm-inference
-VLLM_ROOT=${ROOT}/vllm-granulekv
+VLLM_ROOT=${REAL_SOURCE_ROOT:-${ROOT}/vllm-granulekv}
 GKV_ROOT=${ROOT}/GranuleKV
 PYTHON=/home/xhk/miniconda3/envs/pytorch-vllm/bin/python
 PREFIX=${1:-1024}
@@ -9,7 +9,7 @@ SUFFIX=${2:-0}
 CASE=${3:-same}
 RUN_DIR=${4:?provide a new absolute result directory}
 if [[ ${EUID} -ne 0 ]]; then
-    exec sudo -n /usr/bin/bash "$0" "$@"
+    exec sudo -n --preserve-env=REAL_SOURCE_ROOT /usr/bin/bash "$0" "$@"
 fi
 [[ ! -e ${RUN_DIR} ]] || { echo "Result directory already exists" >&2; exit 2; }
 mkdir -p "${RUN_DIR}/control"
@@ -57,8 +57,11 @@ for ((i=0; i<300; i++)); do
 done
 [[ -f ${RUN_DIR}/control/control.slot ]] || { echo 'Daemon startup timed out'; exit 1; }
 cd "${VLLM_ROOT}"
-cp evaluation/multi_request_sparse/benchmark.py "${RUN_DIR}/benchmark.py"
-cp evaluation/multi_request_sparse/validation.py "${RUN_DIR}/validation.py"
+cp "${ROOT}/vllm-granulekv/evaluation/multi_request_sparse/benchmark.py" "${RUN_DIR}/benchmark.py"
+cp "${ROOT}/vllm-granulekv/evaluation/multi_request_sparse/validation.py" "${RUN_DIR}/validation.py"
+cp "${VLLM_ROOT}/evaluation/multi_request_sparse/real_documents.py" "${RUN_DIR}/real_documents.py"
+cp "${VLLM_ROOT}/evaluation/multi_request_sparse/long_decode_checks.py" "${RUN_DIR}/long_decode_checks.py"
+sha256sum "${RUN_DIR}/benchmark.py" "${RUN_DIR}/validation.py" "${RUN_DIR}/real_documents.py" "${RUN_DIR}/long_decode_checks.py" > "${RUN_DIR}/test_sources.sha256"
 git diff --binary > "${RUN_DIR}/source.diff"
 git rev-parse HEAD > "${RUN_DIR}/vllm_commit.txt"
 git -C "${GKV_ROOT}" rev-parse HEAD > "${RUN_DIR}/granulekv_commit.txt"

@@ -219,3 +219,31 @@ def test_nonfinite_model_kv_is_not_misclassified_as_transfer_corruption():
     kc[3, 0, 0, 0, 0] = float('nan')
     with pytest.raises(ValueError, match='non-finite KV'):
         check_cache_contents(kc, vc, table, [0, 1, 2], 33, logical)
+
+
+def test_populate_recorder_allocates_full_reference_only_once_per_layer(monkeypatch, tmp_path):
+    from types import SimpleNamespace as NS
+    from evaluation.multi_request_sparse.validation import BatchReference
+    reference = BatchReference.__new__(BatchReference)
+    reference.reference_active = False
+    reference.prefixes = [list(range(32)),list(range(32))]
+    reference.populate_sources, reference.sources = {}, {}
+    reference.directory, reference.layers = tmp_path,[None]
+    rid = 'populate-0-0-0'
+    layer = NS(num_kv_heads=1,head_size=8,layer_name='layer0',
+               impl=NS(_layer_index_from_name=lambda _:0))
+    allocations = []
+    zeros = torch.zeros
+    def counted_zeros(*args, **kwargs):
+        allocations.append(args)
+        return zeros(*args,**kwargs)
+    monkeypatch.setattr(torch,'zeros',counted_zeros)
+    for start in (0,16):
+        reference.current = {'ids':[rid],'positions':torch.arange(start,start+16),
+                             'intervals':{rid:slice(0,16)}}
+        kv = torch.full((16,8),float(start))
+        reference._capture_inputs(layer,(kv,kv,kv))
+    assert len(allocations) == 3  # K, V, coverage; independent of chunk count.
+    reference.seal_populate(rid,0)
+    assert (reference.sources[0,0][0][:16] == 0).all()
+    assert (reference.sources[0,0][0][16:] == 16).all()

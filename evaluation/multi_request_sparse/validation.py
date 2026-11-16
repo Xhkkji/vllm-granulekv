@@ -186,7 +186,8 @@ class BatchReference:
                  'seq_lens': list(model_input.seq_lens), 'positions': positions,
                  'input_tokens': model_input.input_tokens.detach().clone(),
                  'intervals': intervals, 'metadata': copy(meta),
-                 'sampling_indices': sampling_indices}
+                 'sampling_indices': sampling_indices,
+                 'sampling_request_ids': [rid for rid,group in zip(ids,groups) if group.do_sample]}
         self.current = frame
         self.shared_slots = {}
         if ids and all(r.startswith('batch-') for r in ids):
@@ -223,9 +224,11 @@ class BatchReference:
             if not valid.any():
                 continue
             shape = (len(self.prefixes[prefix]), layer.num_kv_heads, layer.head_size)
-            source = self.populate_sources.setdefault((rid, index), (
-                torch.zeros(shape, dtype=key.dtype), torch.zeros(shape, dtype=value.dtype),
-                torch.zeros(shape[0], dtype=torch.bool)))
+            if (rid, index) not in self.populate_sources:
+                self.populate_sources[rid, index] = (
+                    torch.zeros(shape, dtype=key.dtype), torch.zeros(shape, dtype=value.dtype),
+                    torch.zeros(shape[0], dtype=torch.bool))
+            source = self.populate_sources[rid, index]
             pos = positions[valid]
             source[0][pos] = key[interval].reshape(-1, *shape[1:]).detach().cpu()[valid]
             source[1][pos] = value[interval].reshape(-1, *shape[1:]).detach().cpu()[valid]
@@ -252,7 +255,7 @@ class BatchReference:
             selections = get_active_sparse_kv_selections()
             if (not self.reference_active and selections is not None
                     and all(rid.startswith('batch-') for rid in ids)
-                    and all(selection.compact_kv_length is not None
+                    and all(getattr(selection, "compact_kv_length", None) is not None
                             for selection in selections.values())):
                 from vllm.core.custom_schedulers.hierarchical_io.barrier import (
                     activate_sparse_kv_blocks, SparseKVLayerSelection)
@@ -300,7 +303,9 @@ class BatchReference:
                 prior = self.shared_slots.setdefault((index, slot), identity)
                 if prior != identity:
                     raise ValueError('physical slot shared by incompatible requests')
-            logical = self.actual_live.setdefault((rid, index), tuple(x.clone() for x in self._source(rid, index)))
+            if (rid, index) not in self.actual_live:
+                self.actual_live[rid, index] = tuple(x.clone() for x in self._source(rid, index))
+            logical = self.actual_live[rid, index]
             logical = update_logical(logical, key.reshape(n, layer.num_kv_heads, layer.head_size),
                                      value.reshape(n, layer.num_kv_heads, layer.head_size), int(positions[0]))
             self.actual_live[rid, index] = logical
@@ -386,9 +391,10 @@ class BatchReference:
                                                 positions=frame['positions'].to(frame['input_tokens'].device))
                             logits = self.model.logits_processor(self.model.lm_head,
                                         hidden.index_select(0, frame['sampling_indices'].long()), None)
-                        if logits.shape[0] != len(ids):
+                        sampling_ids = frame['sampling_request_ids']
+                        if logits.shape[0] != len(sampling_ids):
                             raise ValueError('reference logits/request coverage differs')
-                        for row, rid in enumerate(ids):
+                        for row, rid in enumerate(sampling_ids):
                             policy.record_validation_logits(rid, logits[row:row + 1])
                             tokens[rid].append(int(logits[row].argmax()))
             reports = {rid: policy.validation_report(rid) for rid in rids}
@@ -412,7 +418,9 @@ class BatchReference:
             interval = frame['intervals'][rid]
             positions = frame['positions'][interval]
             start, end, n = int(positions[0]), int(positions[-1]) + 1, len(positions)
-            logical = self.reference_live.setdefault((rid, index), tuple(x.clone() for x in self._source(rid, index)))
+            if (rid, index) not in self.reference_live:
+                self.reference_live[rid, index] = tuple(x.clone() for x in self._source(rid, index))
+            logical = self.reference_live[rid, index]
             total = (end + BLOCK_SIZE - 1) // BLOCK_SIZE
             table = torch.arange(total - 1, -1, -1, dtype=torch.int32, device=query.device)[None, :]
             cache = torch.zeros(PagedAttention.get_kv_cache_shape(total, BLOCK_SIZE, layer.num_kv_heads, layer.head_size), dtype=key.dtype, device=query.device)

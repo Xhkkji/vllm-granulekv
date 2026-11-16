@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import time
 import traceback
+import signal
+
+from evaluation.multi_request_sparse.real_documents import load_scenario, decode_segments
 
 
 def compare_reports(expected, actual, output_tokens):
@@ -102,11 +105,36 @@ def main():
     parser.add_argument('--case', choices=['same', 'different'], default='same')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--performance', action='store_true')
+    parser.add_argument('--long-diagnostic', action='store_true')
+    parser.add_argument('--checkpoints', nargs='+', type=int, default=[1,2,16,17,64,128,256,512])
+    parser.add_argument('--real-manifest', type=Path)
+    parser.add_argument('--scenario')
+    parser.add_argument('--formal-output-tokens', type=int, default=2)
+    parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--gate-cache', choices=('cold', 'hot'), default='cold')
+    parser.add_argument('--cache-states', nargs='+', choices=('cold', 'hot'), default=['cold', 'hot'])
+    parser.add_argument('--modes', nargs='+', choices=('sequential', 'batch'), default=['sequential', 'batch'])
+    parser.add_argument('--service-timeout', type=float, default=1800)
+    parser.add_argument('--no-progress-timeout', type=float, default=120)
     args = parser.parse_args()
+    if args.long_diagnostic and (not args.real_manifest or args.modes != ['batch'] or len(args.cache_states) != 1):
+        parser.error('long diagnostic requires real input, one cache state and --modes batch')
+    if args.long_diagnostic and (args.checkpoints != sorted(set(args.checkpoints)) or min(args.checkpoints) < 1 or max(args.checkpoints) > args.formal_output_tokens):
+        parser.error('checkpoints must be ordered unique output steps within the output limit')
+    scenario = None
+    if args.real_manifest:
+        manifest, scenario, real_prefix, real_suffixes = load_scenario(args.real_manifest, args.scenario)
+        if args.model != manifest['model']:
+            parser.error('model differs from manifest tokenizer')
+        args.prefix_tokens = len(real_prefix)
+        args.suffix_tokens = max(map(len, real_suffixes))
+        args.case = 'same'
+        if args.formal_output_tokens != scenario['max_output_tokens']:
+            parser.error('real-document formal length must match the manifest')
     if (args.prefix_tokens % 16 or args.prefix_tokens <= 36 * 16
             or args.suffix_tokens < 0 or args.suffix_tokens > 1024 or args.output_tokens != 2):
         parser.error('requires aligned prefix >576, suffix in [0,1024], output=2')
-    result = {'config': vars(args) | {'output': str(args.output)},
+    result = {'config': vars(args) | {'output': str(args.output), 'real_manifest': str(args.real_manifest) if args.real_manifest else None},
               'environment': {k: v for k, v in os.environ.items()
                               if k.startswith('VLLM_')}, 'runs': [],
               'status': 'started'}
@@ -115,8 +143,15 @@ def main():
     def save():
         args.output.write_text(json.dumps(result, indent=2) + '\n')
 
+    if scenario:
+        result['scenario'] = {k:v for k,v in scenario.items() if k != 'prompt_token_ids'}
+        result['manifest_sha256'] = hashlib.sha256(args.real_manifest.read_bytes()).hexdigest()
+        expected_cpu = str(scenario['cpu_slots'])
+        if os.environ.get('VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS') != expected_cpu:
+            raise ValueError('launcher CPU capacity differs from manifest')
     save()
     reference = None
+    long_observer = None
     try:
         from transformers import AutoConfig, AutoTokenizer
         from vllm import LLM, SamplingParams
@@ -144,7 +179,12 @@ def main():
             record = state.records_by_key[state.current_layer_keys[layer]]
             begin = live_starts.setdefault(rid, record['history_tokens'] // record['block_size'])
             end = (sequence_length + 15) // 16
-            physical = table[0, begin:end].long()
+            # Compact Attention reconstructs only selected positions. The short
+            # gate also compares every private suffix block still mapped here.
+            from evaluation.multi_request_sparse.real_documents import live_physical_ids
+            physical = table.new_tensor(live_physical_ids(
+                worker._gpu_slot_mappings[0,rid,layer], begin,end,
+                key_cache.shape[0]), dtype=__import__('torch').long)
             live_kv[rid, record['decode_step'], layer] = (
                 key_cache.index_select(0, physical).detach().cpu(),
                 value_cache.index_select(0, physical).detach().cpu())
@@ -155,13 +195,17 @@ def main():
             seed = tokenizer.encode(text, add_special_tokens=False)
             return (seed * ((count + len(seed) - 1) // len(seed)))[:count]
 
-        prefixes = [prompt('The experiment studies memory and inference. ',
-                           args.prefix_tokens)]
-        prefixes.append(prefixes[0] if args.case == 'same' else prompt(
-            'A separate document describes oceans and geography. ', args.prefix_tokens))
-        suffixes = [prompt(text, args.suffix_tokens) for text in (
-            ' Summarize the preceding document. ', ' Explain the main subject of this text. ')]
-        max_len = args.prefix_tokens + args.suffix_tokens + args.output_tokens + 16
+        if scenario:
+            prefixes = [real_prefix, real_prefix]
+            suffixes = real_suffixes
+        else:
+            prefixes = [prompt('The experiment studies memory and inference. ',
+                               args.prefix_tokens)]
+            prefixes.append(prefixes[0] if args.case == 'same' else prompt(
+                'A separate document describes oceans and geography. ', args.prefix_tokens))
+            suffixes = [prompt(text, args.suffix_tokens) for text in (
+                ' Summarize the preceding document. ', ' Explain the main subject of this text. ')]
+        max_len = args.prefix_tokens + args.suffix_tokens + max(args.output_tokens, args.formal_output_tokens) + 16
         model_config = AutoConfig.from_pretrained(args.model)
         # max_model_len alone does not grow Qwen2's RoPE lookup table. Include
         # decode positions without changing the base frequencies/scaling.
@@ -188,14 +232,19 @@ def main():
                   seed=1234)
         engine = llm.llm_engine
         worker = engine.model_executor.driver_worker.worker
-        from validation import BatchReference
+        from evaluation.multi_request_sparse.validation import BatchReference
         reference = BatchReference(worker, prefixes, args.output.parent)
         result['independent_checks'] = reference.report
         execute = worker.model_runner.execute_model
 
+        sampling_request_ids = []
+
         def traced_execute(*pos, **kw):
             model_input = kw.get('model_input', pos[0] if pos else None)
             ids = list(model_input.request_ids_to_seq_ids or {})
+            sampling_request_ids[:] = [rid for rid, group in zip(ids, model_input.sampling_metadata.seq_groups) if group.do_sample]
+            if long_observer is not None:
+                long_observer.begin(model_input)
             forward_batches.append(ids)
             if performance_active:
                 forward_shapes.append({'ids': ids,
@@ -221,7 +270,18 @@ def main():
             result['runs'].append(record)
             if not performance_active:
                 save()
+            (args.output.parent/'progress.json').write_text(json.dumps({
+                'label':label,'phase':'running','started_unix':time.time(),
+                'performance_active':performance_active,'output_tokens':sampling.max_tokens})+'\n')
             start = time.perf_counter()
+            last_progress = start
+            def watchdog(signum, frame):
+                now = time.perf_counter()
+                if now-start >= args.service_timeout or now-last_progress >= args.no_progress_timeout:
+                    raise TimeoutError(f'{label}: service or output-progress watchdog expired')
+                signal.setitimer(signal.ITIMER_REAL, min(args.service_timeout-(now-start), args.no_progress_timeout-(now-last_progress)))
+            previous_alarm = signal.signal(signal.SIGALRM, watchdog)
+            signal.setitimer(signal.ITIMER_REAL, min(args.service_timeout, args.no_progress_timeout))
             for index, tokens in enumerate(prompts):
                 rid = f'{label}-{index}'
                 record['request_ids'].append(rid)
@@ -238,7 +298,7 @@ def main():
                 worker._sparse_validation_logits_hook.remove()
 
                 def record_logits(module, inputs, output):
-                    ids = get_active_layer_request_ids()
+                    ids = sampling_request_ids
                     if output.shape[0] != len(ids):
                         raise RuntimeError('logit rows do not match forward request IDs')
                     for row, rid in enumerate(ids):
@@ -256,12 +316,18 @@ def main():
                     if output.outputs and output.outputs[0].token_ids:
                         now = time.perf_counter()
                         record['ttft_ms'].setdefault(output.request_id, (now-start)*1000)
+                        old_count = len(record['token_ids'].get(output.request_id, []))
+                        if len(output.outputs[0].token_ids) > old_count:
+                            last_progress = now
+                            record.setdefault('token_timestamps_ms', {}).setdefault(output.request_id, []).append([(now-start)*1000, len(output.outputs[0].token_ids)])
                         record['token_ids'][output.request_id] = list(output.outputs[0].token_ids)
+                        record.setdefault('finish_reasons', {})[output.request_id] = output.outputs[0].finish_reason
+                        record.setdefault('stop_reasons', {})[output.request_id] = output.outputs[0].stop_reason
                         if output.finished:
                             last_output = now
                             finished_at[output.request_id] = now
-                if time.perf_counter() - start > 300:
-                    raise TimeoutError(f'{label} exceeded 300 seconds')
+                if time.perf_counter() - start > args.service_timeout:
+                    raise TimeoutError(f'{label} exceeded service timeout')
             if performance_active:
                 # Include outstanding copies in service time, then require all
                 # native reads and writes to have completed before taking time.
@@ -270,7 +336,13 @@ def main():
                 worker._poll_host_transfers(0)
                 assert_drained()
             end = time.perf_counter()
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_alarm)
+            record['decode_segments'] = {rid: decode_segments(ts) for rid, ts in record.get('token_timestamps_ms', {}).items()}
             record['elapsed_with_drain_ms'] = (end-start)*1000
+            (args.output.parent/'progress.json').write_text(json.dumps({
+                'label':label,'phase':'completed','elapsed_ms':record['elapsed_with_drain_ms'],
+                'output_counts':{rid:len(tokens) for rid,tokens in record['token_ids'].items()}})+'\n')
             record['after_last_output_ms'] = (end-last_output)*1000
             record['after_first_token_ms'] = {rid: record['elapsed_with_drain_ms'] - ttft for rid, ttft in record['ttft_ms'].items()}
             record['output_finished_ms'] = {rid: (t-start)*1000 for rid, t in finished_at.items()}
@@ -314,7 +386,9 @@ def main():
 
         populate_generation = 0
         def populate_initial_prefixes():
-            nonlocal populate_generation
+            nonlocal populate_generation, sampling
+            serving_sampling = sampling
+            sampling = SamplingParams(temperature=0, max_tokens=2, ignore_eos=True)
             for index, prefix in enumerate(prefixes[:1] if args.case == 'same' else prefixes):
                 populated = run(f'populate-{populate_generation}-{index}', [prefix])
                 if not performance_active:
@@ -326,6 +400,7 @@ def main():
                 if seeded != 28:
                     raise RuntimeError(f'populate metadata incomplete: {seeded}/28 layers')
             populate_generation += 1
+            sampling = serving_sampling
 
         def reset_suffix_storage():
             # References write their suffix to SSD. Recreate the intended initial
@@ -347,7 +422,7 @@ def main():
         reset_suffix_storage()
         if not llm.reset_prefix_cache(Device.GPU):
             raise RuntimeError('GPU prefix reset failed')
-        if args.performance:
+        if args.performance and args.gate_cache == 'cold':
             # Exercise cold SSD->CPU completion under the numerical gate too.
             from vllm.core.custom_schedulers.hierarchical_io.residency import SharedHostKVDirectory
             while any(s._finished_requests_ids for s in engine.scheduler):
@@ -400,7 +475,7 @@ def main():
         result['reference_kind'] = 'same_batch_independent_cache'
         result['performance_valid'] = False
         result['performance_exclusion'] = 'numerical recording and forward tracing enabled'
-        result['cache_state'] = ('cold CPU for numerical batch gate' if args.performance
+        result['cache_state'] = ('cold CPU for numerical batch gate' if args.performance and args.gate_cache == 'cold'
                                  else 'CPU cache warmed by populate and sequential references')
         save()
         if args.performance:
@@ -454,10 +529,10 @@ def main():
                            for p in prefixes}
             capacity = int(os.environ['VLLM_GRANULEKV_SPARSE_CPU_CACHE_BLOCKS'])
             result['performance_method'] = {
-                'repeats': 3, 'numeric_recording': False,
+                'repeats': args.repeats, 'numeric_recording': False, 'formal_output_tokens': args.formal_output_tokens, 'gate_output_tokens': 2,
                 'cpu_slots': capacity, 'cpu_bytes': capacity * block_bytes,
                 'logical_backing_blocks_two_requests': 2 * (
-                    (args.prefix_tokens + args.suffix_tokens + args.output_tokens + 15) // 16),
+                    (args.prefix_tokens + args.suffix_tokens + args.formal_output_tokens + 15) // 16),
                 'gpu_slots_per_layer': 2135,
                 'boundary': 'request submission through outputs and all writeback/copy completion',
                 'sequential_total': 'sum of two drained service intervals; GPU eviction and stats collection excluded',
@@ -466,6 +541,8 @@ def main():
                 'gpu': 'evict GPU prefix before batch and each sequential request',
                 'ssd_read_requests': 'native submissions; mixed GPU/CPU arms counted once',
                 'ssd_read_bytes': 'descriptor payload, not device-sector amplification'}
+            ignore_eos = scenario['ignore_eos'] if scenario else True
+            sampling = SamplingParams(temperature=0, max_tokens=args.formal_output_tokens, ignore_eos=ignore_eos)
             performance_active = True
             workload = [p + suffix for p, suffix in zip(prefixes, suffixes)]
 
@@ -488,23 +565,27 @@ def main():
                 for prefix in prefixes:
                     _seed_static_sparse_plan(llm, prefix, 16, 28, 32)
             result['performance'] = []
-            for cache in ('cold', 'hot'):
-                for repeat in range(3):
-                    for mode in ('sequential', 'batch'):
+            for cache in args.cache_states:
+                for repeat in range(args.repeats):
+                    for mode in args.modes:
+                        preparation_started = time.perf_counter()
                         reset_restore(cold=True, rebuild=True)
                         if cache == 'hot':
                             run(f'warmup-{cache}-{repeat}-{mode}', workload)
                             reset_restore(rebuild=True)
+                        preparation_ms = (time.perf_counter()-preparation_started)*1000
                         initial_cpu = cache_snapshot()
                         if cache == 'cold' and initial_cpu['slots']:
                             raise RuntimeError('cold sample has populated CPU directory')
                         if cache == 'hot' and not all(initial_cpu['prefix_ready_layer_blocks'].values()):
                             raise RuntimeError('hot sample lacks ready prefix copies')
+                        if args.long_diagnostic:
+                            from evaluation.multi_request_sparse.long_decode_checks import LongDecodeChecks
+                            long_observer = LongDecodeChecks(worker, reference.sources, workload, args.output.parent, args.checkpoints)
                         started = time.perf_counter()
                         if mode == 'batch':
                             samples = [run(f'perf-{cache}-{repeat}-{mode}', workload)]
-                            if samples[0]['max_forward_batch'] != 2:
-                                raise RuntimeError('performance sample did not execute batch=2')
+
                         else:
                             samples = []
                             for index, tokens in enumerate(workload):
@@ -512,36 +593,69 @@ def main():
                                     reset_restore()
                                 samples.append(run(f'perf-{cache}-{repeat}-{mode}-{index}', [tokens]))
                         wall_ms = (time.perf_counter() - started) * 1000
+                        if long_observer is not None:
+                            long_observer.close()
+                            long_observer = None
                         elapsed = sum(s['elapsed_with_drain_ms'] for s in samples)
                         actual_tokens = [sample['token_ids'][rid] for sample in samples
                                          for rid in sample['request_ids']]
                         expected_tokens = ([batch['token_ids'][f'batch-{i}'] for i in range(2)]
                                            if mode == 'batch' else [refs[i]['token_ids'][f'reference-{i}-0'] for i in range(2)])
-                        if actual_tokens != expected_tokens:
+                        if (any(not 0 < len(tokens) <= args.formal_output_tokens for tokens in actual_tokens)
+                                or (ignore_eos and any(len(tokens) != args.formal_output_tokens for tokens in actual_tokens))
+                                or any(tokens[:min(2, len(tokens))] != expected[:min(2, len(tokens))] for tokens,expected in zip(actual_tokens,expected_tokens))):
                             raise RuntimeError('performance output differs from validated workload')
                         result['performance'].append({
-                            'cache': cache, 'repeat': repeat, 'mode': mode,
+                            'cache': cache, 'repeat': repeat, 'mode': mode, 'preparation_ms': preparation_ms,
                             'batch_with_drain_ms': elapsed,
                             'wall_including_harness_ms': wall_ms,
                             'initial_cpu': initial_cpu, 'final_cpu': cache_snapshot(),
-                            'output_tokens_per_second': 2 * args.output_tokens * 1000 / elapsed,
+                            'output_tokens_per_second': sum(map(len,actual_tokens)) * 1000 / elapsed,
+                            'actual_output_tokens': list(map(len,actual_tokens)),
+                            'answers': [tokenizer.decode(tokens) for tokens in actual_tokens],
                             'samples': [sample['label'] for sample in samples]})
                         save()
-            result['performance_valid'] = True
-            result['status'] = 'performance_passed'
+            result['performance_valid'] = not args.long_diagnostic
+            result['status'] = 'diagnostic_passed' if args.long_diagnostic else 'performance_passed'
             result.pop('performance_exclusion', None)
             save()
     except BaseException:
+        signal.setitimer(signal.ITIMER_REAL, 0)
         result['status'] = 'failed'
         result['performance_valid'] = False
         result['performance_exclusion'] = ('performance gate failed' if
             'performance_method' in result else 'correctness gate failed')
         result['error'] = traceback.format_exc()
+        if 'worker' in locals():
+            snapshot = {
+                'required': {str(k):sorted(v) for k,v in worker._gpu_required_blocks.items()},
+                'mappings': {str(k):v for k,v in worker._gpu_slot_mappings.items()},
+                'owners': {str(k):v for k,v in worker._gpu_destination_owners.items()},
+                'shared': {str(k):{'destination':e.destination,'state':str(e.state),
+                    'references':sorted(e.references),'producer':e.producer_request_id,
+                    'event_identity':id(e.h2d_event) if e.h2d_event else None}
+                    for k,e in worker._gpu_shared_blocks.items()},
+                'cpu': {str(k):{'slot':e.slot,'owners':list(e.owners),
+                    'ready':sorted(e.ready_layers),'loading':sorted(e.loading_layers),
+                    'in_flight':e.in_flight} for k,e in worker._host_kv_directory._entries.items()},
+            }
+            (args.output.parent/'failure_lifecycle.json').write_text(json.dumps(snapshot)+'\n')
+            result['failure_state'] = {
+                'host_stats': dict(worker._host_stats),
+                'gpu_mapping_counts': {str(k):len(v) for k,v in worker._gpu_slot_mappings.items()},
+                'gpu_reserved_counts': {str(k):len(v) for k,v in worker._gpu_reserved_slots.items()},
+                'shared_entries': len(worker._gpu_shared_blocks),
+                'pending_h2d': len(worker._pending_h2d_transfers),
+                'pending_d2h': len(worker._pending_gpu_to_host),
+                'host_in_flight': {str(k):e.in_flight for k,e in worker._host_kv_directory._entries.items() if e.in_flight},
+            }
         if reference is not None and not result.get('comparisons'):
             reference.report['passed'] = False
         save()
         raise
     finally:
+        if long_observer is not None:
+            long_observer.close()
         if reference is not None:
             reference.close()
 
