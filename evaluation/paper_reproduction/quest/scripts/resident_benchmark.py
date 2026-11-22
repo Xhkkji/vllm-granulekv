@@ -64,7 +64,7 @@ def _configure(args: argparse.Namespace, block_budget: int) -> None:
         policy_modules = {
             "quest": "evaluation.paper_reproduction.quest.adapter.policy:QuestPolicy",
             "solidattention": (
-                "evaluation.paper_reproduction.solidattention.adapter:"
+                "vllm.granulekv.sparse_policy:"
                 "SolidAttentionPolicy"),
         }
         os.environ["VLLM_GRANULEKV_SPARSE_POLICY_MODULE"] = policy_modules[

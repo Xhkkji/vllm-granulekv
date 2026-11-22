@@ -8,7 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/xhk/miniconda3/envs/pytorch-vllm/bin/python}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RESULT_ROOT="${RUN_DIR:-${VLLM_ROOT}/evaluation/paper_reproduction/solidattention/results/${RUN_ID}_dynamic_ablation}"
 MODEL_PATH="${MODEL_PATH:-/home/xhk/llm-inference/models/Qwen2.5-7B-Instruct}"
-POLICY="evaluation.paper_reproduction.solidattention.adapter.solidattention:SolidAttentionPolicy"
+POLICY="vllm.granulekv.sparse_policy.solidattention:SolidAttentionPolicy"
 COMMON_ARGS="--prefix-tokens 8192 --suffix-tokens 16 --decode-tokens 64 --max-model-len 8448 --gpu-memory-utilization 0.85 --block-budget 32 --warmup-iterations 2 --iterations 5"
 
 if [[ -e "${RESULT_ROOT}" ]]; then

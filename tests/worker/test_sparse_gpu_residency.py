@@ -133,6 +133,7 @@ def test_finish_cleans_owner_and_release_fence_without_waiting():
     worker._host_failed_blocks = set()
     worker._host_staged_blocks = set()
     worker._pending_h2d_transfers = {}
+    worker._inflight_h2d_sources = []
     worker._host_staging_owner = None
     slot = worker._gpu_slot_key(0, 0, 3)
     owner = (0, "request", 0, 7)

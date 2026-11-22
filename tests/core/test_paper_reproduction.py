@@ -9,7 +9,7 @@ from evaluation.paper_reproduction.common.plans import (
     enqueue_plan_requests)
 from evaluation.paper_reproduction.common.schedulers import (
     DiskHRRNScheduler, FCFSScheduler)
-from evaluation.paper_reproduction.common.selectors import (
+from vllm.granulekv.sparse_policy.selectors import (
     DenseSelector, ExplicitSelector)
 
 

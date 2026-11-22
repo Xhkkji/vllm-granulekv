@@ -9,7 +9,7 @@ from evaluation.multi_request_sparse.validation import (
     BLOCK_SIZE, cache_tokens, check_cache_contents, check_mapping,
     logical_attention, numerical_error, request_slices, update_logical,
 )
-from evaluation.paper_reproduction.solidattention.adapter.solidattention import SolidAttentionPolicy
+from vllm.granulekv.sparse_policy.solidattention import SolidAttentionPolicy
 
 
 def report():

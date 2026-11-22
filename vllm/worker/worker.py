@@ -60,7 +60,6 @@ class _PendingHostCopy:
     destination: int
     event: object
     prefetched: bool
-    host_key: Optional[HostKVBlockKey] = None
 
 
 @dataclass
@@ -169,6 +168,10 @@ class Worker(LocalOrDistributedWorkerBase):
             Tuple[int, int, int], Tuple[str, object]] = {}
         self._pending_h2d_transfers: Dict[
             Tuple[int, str, int, int], _PendingHostCopy] = {}
+        # Actual DMA submissions own source leases; consumer records above
+        # retain only their GPU dependency and generation checks.
+        self._inflight_h2d_sources: List[
+            Tuple[int, object, Tuple[HostKVBlockKey, ...]]] = []
         self._gpu_transfer_regions: Dict[
             Tuple[int, str], Tuple[str, Tuple[int, int],
                                    Tuple[Tuple[int, int], ...]]] = {}
@@ -1060,17 +1063,25 @@ class Worker(LocalOrDistributedWorkerBase):
             self._forget_host_staging(virtual_engine, retired)
         return events
 
-    def _poll_host_cache_uses(self, virtual_engine: int) -> None:
-        completed = {}
-        for key, pending in self._pending_h2d_transfers.items():
-            if key[0] != virtual_engine or pending.host_key is None:
+    def _poll_host_cache_uses(self, virtual_engine: int,
+                              completed: Optional[Dict[int, bool]] = None) -> None:
+        if completed is None:
+            completed = {}
+        index = 0
+        while index < len(self._inflight_h2d_sources):
+            ve, event, sources = self._inflight_h2d_sources[index]
+            if ve != virtual_engine:
+                index += 1
                 continue
-            if id(pending.event) not in completed:
-                completed[id(pending.event)] = pending.event.query()
-            if completed[id(pending.event)]:
-                self._host_kv_directory.finish_use(pending.host_key)
-                self._pending_h2d_transfers[key] = _PendingHostCopy(
-                    pending.destination, pending.event, pending.prefetched)
+            event_id = id(event)
+            if event_id not in completed:
+                completed[event_id] = event.query()
+            if not completed[event_id]:
+                index += 1
+                continue
+            for source in sources:
+                self._host_kv_directory.finish_use(source)
+            del self._inflight_h2d_sources[index]
 
     def _poll_gpu_to_host_backing(self, virtual_engine: int) -> None:
         completed = {}
@@ -1131,15 +1142,27 @@ class Worker(LocalOrDistributedWorkerBase):
                     (request_id,), layer_index)
                 # Unused first-window predictions may still lack host backing.
                 predicted = () if state is None else state.predicted_prefix_blocks
-                candidate_blocks = sorted(set(consumed).union(dirty, predicted, resident))
+                candidate_blocks = set(consumed).union(dirty, predicted, resident)
+            used = (set(candidate_blocks) if consumed is None else
+                    set(consumed).union(dirty))
+            # Request-level backing state is pinned by its owner. Historical
+            # hits need no repeated canonical lookup; current users still
+            # publish their physical usage fence below.
+            candidate_blocks = sorted(
+                block for block in candidate_blocks
+                if block in used or not (
+                    (*prefix, block) not in self._host_failed_blocks and (
+                        (*prefix, block) in self._host_ready_blocks
+                        or (*prefix, block) in self._host_staged_blocks
+                        or (*prefix, block) in self._pending_gpu_to_host)))
             for block in candidate_blocks:
                 destination = (table.get(block, -1) if bounded_slots
                                else table[block])
                 key = (*prefix, block)
                 owner = self._gpu_destination_owners.get(
                     self._gpu_slot_key(virtual_engine, layer_index, destination))
-                shared = self._shared_gpu_entry(
-                    virtual_engine, request_id, layer_index, block, destination)
+                shared = (None if owner == key else self._shared_gpu_entry(
+                    virtual_engine, request_id, layer_index, block, destination))
                 if (resident.get(block) == destination
                         and (owner == key or (shared is not None
                                               and shared.state == AsyncKVTransferState.READY))):
@@ -1147,8 +1170,14 @@ class Worker(LocalOrDistributedWorkerBase):
             if not candidates:
                 continue
             for key, destination in candidates.items():
-                self._gpu_region_release_events[self._gpu_slot_key(
-                    virtual_engine, layer_index, destination)] = (request_id, released)
+                if key[3] in used:
+                    self._gpu_region_release_events[self._gpu_slot_key(
+                        virtual_engine, layer_index, destination)] = (request_id, released)
+                if key[3] not in dirty and key not in self._host_failed_blocks and (
+                        key in self._host_ready_blocks
+                        or key in self._host_staged_blocks
+                        or key in self._pending_gpu_to_host):
+                    continue
                 host_key = self._host_cache_key(virtual_engine, request_id, key[3])
                 consumers.setdefault(host_key, set()).add((virtual_engine, request_id))
                 if key[3] in dirty:
@@ -1174,7 +1203,14 @@ class Worker(LocalOrDistributedWorkerBase):
                 raise RuntimeError("host staging failed before KV backing")
         mapping_pairs = []
         cache_keys = {}
+        release_events = [released]
+        seen_events = {id(released)}
         for host_key, (key, destination) in to_copy.items():
+            fence = self._gpu_region_release_events.get(self._gpu_slot_key(
+                virtual_engine, layer_index, destination))
+            if fence is not None and id(fence[1]) not in seen_events:
+                release_events.append(fence[1])
+                seen_events.add(id(fence[1]))
             for owner in consumers[host_key]:
                 host_slot = self._host_kv_directory.acquire(host_key, owner)
             self._host_kv_directory.begin_load(host_key, (layer_index,))
@@ -1184,7 +1220,7 @@ class Worker(LocalOrDistributedWorkerBase):
                                device="cpu")
         submit_started = time.perf_counter()
         ready = cache_engine.copy_gpu_blocks_to_host_async(
-            layer_index, mapping, (released,))
+            layer_index, mapping, tuple(release_events))
         self._host_stats["gpu_to_host_submit_ms"] += (
             time.perf_counter() - submit_started) * 1000
         block_bytes = (CacheEngine.get_cache_block_size(
@@ -1219,15 +1255,13 @@ class Worker(LocalOrDistributedWorkerBase):
             if request_ids:
                 self._poll_host_transfers(virtual_engine, request_ids)
             if uses_host_kv_writeback():
+                self._poll_host_cache_uses(virtual_engine)
                 self._poll_gpu_to_host_backing(virtual_engine)
                 pending_copies = False
                 for key, pending in tuple(self._pending_h2d_transfers.items()):
                     if key[:2] != (virtual_engine, seq_group_id):
                         continue
                     if pending.event.query():
-                        if pending.host_key is not None:
-                            self._host_kv_directory.finish_use(
-                                pending.host_key)
                         del self._pending_h2d_transfers[key]
                     else:
                         pending_copies = True
@@ -1411,12 +1445,11 @@ class Worker(LocalOrDistributedWorkerBase):
                         self._gpu_slot_key(virtual_engine, layer_index, slot))
                     if fence is None:
                         continue
+                    self._poll_host_cache_uses(virtual_engine)
                     # Preserve the physical fence for the next copy or write.
                     for key, pending in pending_copies:
                         if pending is not None:
                             del self._pending_h2d_transfers[key]
-                            if pending.host_key is not None:
-                                self._host_kv_directory.finish_use(pending.host_key)
                         self._pop_gpu_resident(key)
                         self._unbind_gpu_slot(key[:3], key[3])
                         if envs.VLLM_GRANULEKV_SPARSE_VALIDATION_MODE != "off":
@@ -2640,6 +2673,8 @@ class Worker(LocalOrDistributedWorkerBase):
                 if entry is not None:
                     entry.state = AsyncKVTransferState.ERROR
             raise
+        self._inflight_h2d_sources.append(
+            (virtual_engine, ready, tuple(host_keys.values())))
         self._host_stats["host_gpu_submit_count"] += 1
         self._host_stats["host_gpu_copy_blocks"] += len(copies)
         block_bytes = (CacheEngine.get_cache_block_size(
@@ -2654,7 +2689,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 self._retire_gpu_replica(old, destination)
             self._gpu_destination_owners[slot] = key
             self._pending_h2d_transfers[key] = _PendingHostCopy(
-                destination, ready, reason == "prefetch", host_keys[identity])
+                destination, ready, reason == "prefetch")
             if bounded and (identity in self._gpu_shared_blocks or key[3] <
                     self._host_request_prefix_limits.get((virtual_engine, key[1]), 0)):
                 entry = self._gpu_shared_blocks.get(identity)
@@ -2704,8 +2739,7 @@ class Worker(LocalOrDistributedWorkerBase):
             if pending.prefetched:
                 self._host_stats["host_gpu_prefetch_hits"] += 1
                 self._pending_h2d_transfers[key] = _PendingHostCopy(
-                    pending.destination, pending.event, False,
-                    pending.host_key)
+                    pending.destination, pending.event, False)
         self._mark_gpu_blocks_ready(virtual_engine, request_id, layer_index,
                                    ready_blocks, mapping)
         for block in ready_blocks:
@@ -2821,6 +2855,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 completed[event_id] = event.query()
             return completed[event_id]
 
+        self._poll_host_cache_uses(virtual_engine, completed)
         for request_id in finished:
             self._host_prefetch_windows.pop((virtual_engine, request_id), None)
         for collection in (self._host_ready_blocks, self._host_staged_blocks, self._host_failed_blocks):
@@ -2890,9 +2925,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 if self._gpu_destination_owners.get(slot) == key:
                     self._gpu_destination_owners.pop(slot)
                 if not host_writeback or copy_ready(pending.event):
-                    pending = self._pending_h2d_transfers.pop(key, None)
-                    if pending is not None and pending.host_key is not None:
-                        self._host_kv_directory.finish_use(pending.host_key)
+                    self._pending_h2d_transfers.pop(key, None)
         for key in tuple(self._gpu_pending_transfers):
             if (key[0] == virtual_engine
                     and self._gpu_pending_transfers[key][0] in finished):

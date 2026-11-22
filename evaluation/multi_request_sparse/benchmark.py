@@ -18,7 +18,7 @@ def compare_reports(expected, actual, output_tokens):
     tolerance (rtol=atol=0.02). Missing records never count as a pass.
     """
     import torch
-    from evaluation.paper_reproduction.solidattention.adapter.solidattention import (
+    from vllm.granulekv.sparse_policy.solidattention import (
         SolidAttentionPolicy)
 
     checks = {'rtol': 0.02, 'atol': 0.02, 'kv_comparison': 'immutable exact SHA256; recomputed/new KV FP16 tolerance',

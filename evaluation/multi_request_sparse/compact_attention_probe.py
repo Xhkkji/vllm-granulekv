@@ -58,7 +58,7 @@ for tokens in (33,512,513,8192,8193):
             torch.testing.assert_close(out[j].float(),ref,rtol=.02,atol=.02)
         results.append({'tokens':tokens,'order':order,'passed':True, 'calls':dict(calls)})
 # Exercise the epilogue across a real logical block boundary, including BA.
-from evaluation.paper_reproduction.solidattention.adapter.solidattention import SolidAttentionPolicy
+from vllm.granulekv.sparse_policy.solidattention import SolidAttentionPolicy
 from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import configure_sparse_kv_policy
 layer.layer_name = "model.layers.0.self_attn.attn"
 for order in ((0, 1), (1, 0), (0,)):

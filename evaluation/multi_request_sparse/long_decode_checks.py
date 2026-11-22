@@ -20,7 +20,7 @@ class LongDecodeChecks:
     def __init__(self, worker, sources, prompts, directory, checkpoints=CHECKPOINTS):
         from vllm.attention.layer import Attention
         from vllm.attention.ops.paged_attn import PagedAttention
-        from evaluation.paper_reproduction.solidattention.adapter.solidattention import SolidAttentionPolicy
+        from vllm.granulekv.sparse_policy.solidattention import SolidAttentionPolicy
         from vllm.core.custom_schedulers.hierarchical_io import get_sparse_kv_policy
         self.worker, self.sources, self.prompts = worker, sources, prompts
         self.checkpoints = tuple(checkpoints)

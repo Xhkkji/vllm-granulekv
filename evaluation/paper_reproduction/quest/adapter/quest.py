@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from ...common.selectors import ExplicitSelector, TailSelector
+from vllm.granulekv.sparse_policy.selectors import ExplicitSelector, TailSelector
 from vllm.core.custom_schedulers.hierarchical_io.plan import SparseKVAccessPlan
 
 from .selector import QuestPageSelector

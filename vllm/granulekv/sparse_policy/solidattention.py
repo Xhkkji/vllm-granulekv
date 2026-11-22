@@ -21,7 +21,7 @@ from vllm.attention.ops.sparse_kv import (
 from vllm.core.custom_schedulers.hierarchical_io.sparse_policy import (
     SparseKVActualSelection, )
 
-from ...common.selectors import ExplicitSelector, TailSelector
+from .selectors import ExplicitSelector, TailSelector
 
 _SCORE_TABLE_BYTES = 256 * 1024 * 1024
 

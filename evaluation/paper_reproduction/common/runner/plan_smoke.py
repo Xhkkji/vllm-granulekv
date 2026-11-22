@@ -8,11 +8,11 @@ from pathlib import Path
 
 from ..plans import ImmediatePrefetcher, LayerWisePrefetcher, compose_plan
 from ..schedulers import DiskHRRNScheduler, FCFSScheduler
-from ..selectors import DenseSelector
+from vllm.granulekv.sparse_policy.selectors import DenseSelector
 from ...bidaw.adapter.bidaw import BidawScheduler
 from ...hisparse.adapter.hisparse import HiSparseSelector
 from ...quest.adapter.quest import QuestSelector
-from ...solidattention.adapter.solidattention import SolidAttentionSelector
+from vllm.granulekv.sparse_policy.solidattention import SolidAttentionSelector
 
 
 def build_plan(name: str, layers: int, blocks: int, window: int,

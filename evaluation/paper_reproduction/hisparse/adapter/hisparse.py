@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from ...common.selectors import ExplicitSelector, TailSelector
+from vllm.granulekv.sparse_policy.selectors import ExplicitSelector, TailSelector
 
 
 class HiSparseSelector:

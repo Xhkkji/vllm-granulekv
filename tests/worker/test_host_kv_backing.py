@@ -85,6 +85,7 @@ def worker(monkeypatch):
                  "_gpu_pending_transfers", "_gpu_completed_transfer_events",
                  "_pending_h2d_transfers"):
         setattr(result, name, {})
+    result._inflight_h2d_sources = []
     result._gpu_shared_blocks = {}
     result._gpu_shared_waits = {}
     result._gpu_transfer_children = {}
@@ -2040,7 +2041,8 @@ def test_h2d_poll_queries_each_event_once_and_releases_each_source(worker):
         directory.acquire(host_key, (0, "consumer"))
         directory.begin_use(host_key)
         worker._pending_h2d_transfers[0, "producer", 0, block] = (
-            module._PendingHostCopy(block, event, True, host_key))
+            module._PendingHostCopy(block, event, True))
+        worker._inflight_h2d_sources.append((0, event, (host_key,)))
         # Shared waiters own no additional CPU source reference.
         worker._pending_h2d_transfers[0, "consumer", 0, block] = (
             module._PendingHostCopy(block, event, True))
@@ -2053,7 +2055,7 @@ def test_h2d_poll_queries_each_event_once_and_releases_each_source(worker):
     worker._poll_host_cache_uses(0)
     assert (delayed.calls, ready.calls) == (2, 1)
     assert all(entry.in_flight == 0 for entry in directory._entries.values())
-    assert all(copy.host_key is None for copy in worker._pending_h2d_transfers.values())
+    assert not worker._inflight_h2d_sources
     assert all(entry.owners == {(0, "consumer")} for entry in directory._entries.values())
     directory.release_owner((0, "consumer"))
     assert directory.acquire(("replacement", 0), (0, "next")) == 2
@@ -2079,10 +2081,10 @@ def test_exit_reuses_event_queries_but_rechecks_delayed_copies(
         directory.acquire(host_key, (0, "producer"))
         directory.acquire(host_key, (0, "consumer"))
         directory.begin_use(host_key)
+        worker._inflight_h2d_sources.append((0, event, (host_key,)))
         for rid in ("producer", "consumer"):
             worker._pending_h2d_transfers[0, rid, 0, block] = (
-                module._PendingHostCopy(block, event, True,
-                    host_key if rid == "producer" else None))
+                module._PendingHostCopy(block, event, True))
     unrelated = (0, "live", 0, 99)
     for collection in (worker._host_ready_blocks, worker._host_staged_blocks,
                        worker._host_failed_blocks):
@@ -2091,26 +2093,25 @@ def test_exit_reuses_event_queries_but_rechecks_delayed_copies(
     assert delayed.calls == 1
     assert (0, first) in worker._backing_retired
     assert len(worker._pending_h2d_transfers) == 6
-    assert all(entry.in_flight == 1 for entry in directory._entries.values())
+    assert [directory._entries['prefix', b].in_flight for b in range(3)] == [1, 1, 0]
     for collection in (worker._host_ready_blocks, worker._host_staged_blocks,
                        worker._host_failed_blocks):
         assert collection == {unrelated}
     delayed.ready = True
     worker._forget_host_staging(0, (first,))
-    assert (delayed.calls, ready.calls) == (2, 1)
+    assert (delayed.calls, ready.calls) == (2, 2)
     assert len(worker._pending_h2d_transfers) == 3
     other = "consumer" if first == "producer" else "producer"
     assert all(entry.owners == {(0, other)} for entry in directory._entries.values())
-    assert all(entry.in_flight == int(first != "producer")
-               for entry in directory._entries.values())
+    assert all(entry.in_flight == 0 for entry in directory._entries.values())
     worker._forget_host_staging(0, (other,))
-    assert (delayed.calls, ready.calls) == (3, 2)
+    assert (delayed.calls, ready.calls) == (3, 3)
     assert not worker._pending_h2d_transfers
     assert not worker._backing_retired
     assert all(entry.in_flight == 0 and not entry.owners
                for entry in directory._entries.values())
     worker._forget_host_staging(0, (first, other))
-    assert (delayed.calls, ready.calls) == (3, 2)
+    assert (delayed.calls, ready.calls) == (3, 3)
     assert len(mode_calls) == 4
 
 
@@ -2443,7 +2444,8 @@ def test_batch_reclaim_shared_history_keeps_real_consumers(worker, monkeypatch, 
     for rid in ('a', 'b'):
         worker._attach_shared_gpu(0, rid, 0, 0, entry)
     worker._host_kv_directory.begin_use(host)
-    worker._pending_h2d_transfers[0, 'a', 0, 0] = module._PendingHostCopy(0, event, False, host)
+    worker._pending_h2d_transfers[0, 'a', 0, 0] = module._PendingHostCopy(0, event, False)
+    worker._inflight_h2d_sources.append((0, event, (host,)))
     if protection == 'outside':
         worker._attach_shared_gpu(0, 'outside', 0, 0, entry)
     if protection == 'generation':
@@ -2531,3 +2533,130 @@ def test_restore_all_ready_consumes_once_without_rebinding(worker, monkeypatch):
     assert len(worker._pending_h2d_transfers) == 2
     assert entry.references == {'a', 'b'}
     assert worker._host_stats['host_gpu_copy_blocks'] == 0
+
+@pytest.mark.parametrize('count', [2048, 8192])
+def test_backup_skips_backed_history_but_keeps_gpu_only_and_usage_fences(worker, monkeypatch, count):
+    import vllm.core.custom_schedulers.hierarchical_io.barrier as barrier
+    monkeypatch.setattr(worker, '_uses_bounded_slots', lambda: True)
+    monkeypatch.setattr(module, 'get_active_sparse_kv_blocks', lambda: (0,))
+    monkeypatch.setattr(barrier, 'get_active_sparse_kv_selections', lambda: None)
+    prefix = (0, 'r', 0)
+    worker._backing_forward[0, 'r'] = ((99,) * count, count * 16, count * 16, False)
+    old, released, copied = Fence(True), Fence(True), []
+    for b in range(count):
+        _set_gpu_slot(worker, (*prefix, b), b)
+        worker._gpu_resident_blocks.setdefault(prefix, {})[b] = b
+        worker._gpu_destination_owners[0, 0, b] = (*prefix, b)
+        worker._gpu_region_release_events[0, 0, b] = ('r', old)
+        worker._host_ready_blocks.add((*prefix, b))
+    # An unused first-window GPU-only block still needs backing.
+    worker._host_ready_blocks.remove((*prefix, count - 1))
+    worker._host_kv_directory = SharedHostKVDirectory(count)
+    calls = []
+    original = worker._host_cache_key
+    monkeypatch.setattr(worker, '_host_cache_key', lambda *args: calls.append(args) or original(*args))
+    worker.cache_engine[0].copy_gpu_blocks_to_host_async = (
+        lambda layer, mapping, fences: copied.append((mapping.tolist(), fences)) or Fence())
+    worker._back_up_layer(0, ('r',), 0, released)
+    assert len(calls) == 1
+    assert copied[0][0][0][0] == count - 1
+    assert copied[0][1] == (released, old)
+    assert worker._gpu_region_release_events[0, 0, 0] == ('r', released)
+    assert worker._gpu_region_release_events[0, 0, 1] == ('r', old)
+    assert worker._host_stats['gpu_to_host_blocks'] == 1
+
+@pytest.mark.parametrize('count', [2048, 8192])
+def test_h2d_source_poll_never_visits_historical_consumers(worker, count):
+    class NoScan(dict):
+        def items(self):
+            pytest.fail('source completion must not scan consumer records')
+    worker._pending_h2d_transfers = NoScan({(0, 'r', 0, b):
+        module._PendingHostCopy(b, Fence(True), False) for b in range(count)})
+    calls = []
+    worker._host_kv_directory.finish_use = calls.append
+    events = [Fence(False), Fence(True)]
+    worker._inflight_h2d_sources = [(0, e, (('p', i),)) for i, e in enumerate(events)]
+    worker._poll_host_cache_uses(0)
+    assert calls == [('p', 1)]
+    assert len(worker._inflight_h2d_sources) == 1
+    events[0].ready = True
+    worker._poll_host_cache_uses(0)
+    worker._poll_host_cache_uses(0)
+    assert calls == [('p', 1), ('p', 0)]
+    assert not worker._inflight_h2d_sources
+    assert len(worker._pending_h2d_transfers) == count
+
+
+def test_h2d_source_poll_error_preserves_remaining_leases(worker):
+    class BrokenFence(Fence):
+        def query(self):
+            raise RuntimeError('event failed')
+    calls = []
+    worker._host_kv_directory.finish_use = calls.append
+    worker._inflight_h2d_sources = [(0, Fence(True), (('p', 0),)),
+                                    (0, BrokenFence(), (('p', 1),)),
+                                    (1, Fence(True), (('p', 2),))]
+    with pytest.raises(RuntimeError, match='event failed'):
+        worker._poll_host_cache_uses(0)
+    assert calls == [('p', 0)]
+    assert len(worker._inflight_h2d_sources) == 2
+    with pytest.raises(RuntimeError, match='event failed'):
+        worker._poll_host_cache_uses(0)
+    assert calls == [('p', 0)]
+    worker._poll_host_cache_uses(1)
+    assert calls == [('p', 0), ('p', 2)]
+
+
+def test_h2d_source_lease_outlives_consumer_record(worker):
+    host = ('prefix', 0)
+    directory = worker._host_kv_directory = SharedHostKVDirectory(1)
+    directory.acquire(host, (0, 'r'))
+    directory.begin_load(host, (0,))
+    directory.finish_load(host, (0,), True)
+    event = Fence()
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = lambda *args: event
+    worker.copy_host_blocks_to_gpu_async(0, 'r', 0, ((0, 3),))
+    worker._pending_h2d_transfers.clear()
+    directory.release_owner((0, 'r'))
+    worker._poll_host_cache_uses(0)
+    with pytest.raises(RuntimeError, match='no evictable'):
+        directory.acquire(('new', 0), (0, 'next'))
+    event.ready = True
+    worker._poll_host_cache_uses(0)
+    assert directory.acquire(('new', 0), (0, 'next')) == 0
+    worker._poll_host_cache_uses(0)
+
+
+def test_h2d_failed_submit_rolls_back_without_queue_record(worker):
+    host = ('prefix', 0)
+    directory = worker._host_kv_directory = SharedHostKVDirectory(1)
+    directory.acquire(host, (0, 'r'))
+    directory.begin_load(host, (0,))
+    directory.finish_load(host, (0,), True)
+    def fail(*args):
+        raise RuntimeError('submit failed')
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = fail
+    with pytest.raises(RuntimeError, match='submit failed'):
+        worker.copy_host_blocks_to_gpu_async(0, 'r', 0, ((0, 3),))
+    assert directory._entries[host].in_flight == 0
+    assert not worker._inflight_h2d_sources
+    assert not worker._pending_h2d_transfers
+
+
+def test_h2d_two_actual_copies_of_one_source_release_twice(worker):
+    host = ('prefix', 0)
+    directory = worker._host_kv_directory = SharedHostKVDirectory(1)
+    directory.acquire(host, (0, 'r'))
+    directory.begin_load(host, (0, 1))
+    directory.finish_load(host, (0, 1), True)
+    events = [Fence(False), Fence(True)]
+    worker.cache_engine[0].copy_host_blocks_to_gpu_async = lambda layer, *args: events[layer]
+    for layer in range(2):
+        worker.copy_host_blocks_to_gpu_async(0, 'r', layer, ((0, 3),))
+    assert directory._entries[host].in_flight == 2
+    worker._poll_host_cache_uses(0)
+    assert directory._entries[host].in_flight == 1
+    events[0].ready = True
+    worker._poll_host_cache_uses(0)
+    worker._poll_host_cache_uses(0)
+    assert directory._entries[host].in_flight == 0

@@ -20,7 +20,7 @@ from vllm.attention.ops.sparse_kv import (
     sparse_kv_stats,
 )
 
-from evaluation.paper_reproduction.solidattention.adapter import (
+from vllm.granulekv.sparse_policy import (
     SolidAttentionPolicy, )
 
 

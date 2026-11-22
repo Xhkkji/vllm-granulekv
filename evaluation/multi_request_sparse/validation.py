@@ -350,7 +350,7 @@ class BatchReference:
         return forward
 
     def run(self):
-        from evaluation.paper_reproduction.solidattention.adapter.solidattention import SolidAttentionPolicy
+        from vllm.granulekv.sparse_policy.solidattention import SolidAttentionPolicy
         from vllm.core.custom_schedulers.hierarchical_io import configure_sparse_kv_policy, get_sparse_kv_policy
         from vllm.core.custom_schedulers.hierarchical_io.barrier import activate_layer_barrier
         from vllm.forward_context import set_forward_context
